@@ -61,18 +61,22 @@ standard Redis 7.4+ commands.
   rejected with `CROSSSLOT`.
 - **Keyspace notifications.** `notify-keyspace-events` drives keyspace / keyevent Pub/Sub messages
   (including `expired` / `evicted`); disabled by default so the write hot path pays nothing.
-- **DUMP is STRING-only; RESTORE also accepts SET, HASH, and ZSET.** `DUMP` (encode) currently emits
-  the **STRING type ONLY** (a HyperLogLog counts, since an HLL is stored as a string); a `DUMP` of a
-  list, hash, set, or zset returns an error. `RESTORE` (decode) accepts the **STRING type, the
+- **DUMP is STRING-only; RESTORE also accepts SET, HASH, ZSET, and LIST.** `DUMP` (encode) currently
+  emits the **STRING type ONLY** (a HyperLogLog counts, since an HLL is stored as a string); a `DUMP`
+  of a list, hash, set, or zset returns an error. `RESTORE` (decode) accepts the **STRING type, the
   SET type in all three RDB encodings** (`intset`, `listpack`, and the plain length-prefixed set),
   **the HASH type in its two non-field-TTL encodings** (`listpack` and the plain length-prefixed
-  hash), **and the ZSET type in all three encodings** (`RDB_TYPE_ZSET_2` binary-double scores, the
-  legacy `RDB_TYPE_ZSET` ASCII scores, and `listpack`), so a set, a (non-field-TTL) hash, OR a sorted
-  set `DUMP`ed by a real Redis `RESTORE`s here with identical members/fields/scores (a NaN score is
-  refused, matching `ZADD`; +inf/-inf are preserved). A HASH with per-field TTLs (Redis 7.4+
-  `listpack_ex` / `metadata` encodings) and `RESTORE` of a list are still refused as bad data, so do
-  NOT assume full-fidelity `MIGRATE` across all types yet. The remaining per-type codecs (hash
-  field-TTLs, list) and `DUMP` of the aggregate types are tracked in #612.
+  hash), **the ZSET type in all three encodings** (`RDB_TYPE_ZSET_2` binary-double scores, the
+  legacy `RDB_TYPE_ZSET` ASCII scores, and `listpack`), **and the LIST type in the modern
+  `RDB_TYPE_LIST_QUICKLIST_2` encoding** (the quicklist of listpack + plain nodes that Redis 7.x
+  DUMPs, insertion order preserved across nodes) **plus the trivial legacy `RDB_TYPE_LIST`**, so a
+  set, a (non-field-TTL) hash, a sorted set, OR a list `DUMP`ed by a real Redis `RESTORE`s here with
+  identical members/fields/scores/order (a NaN score is refused, matching `ZADD`; +inf/-inf are
+  preserved). A HASH with per-field TTLs (Redis 7.4+ `listpack_ex` / `metadata` encodings) and the
+  legacy ziplist-based list encodings (`RDB_TYPE_LIST_QUICKLIST` / `RDB_TYPE_LIST_ZIPLIST`, which
+  modern Redis never DUMPs) are still refused as bad data, so do NOT assume full-fidelity `MIGRATE`
+  across all types yet. The remaining per-type codecs (hash field-TTLs, the ziplist-based list forms)
+  and `DUMP` of the aggregate types are tracked in #612.
 
 For the full type-by-type feature list see the [README](../README.md); for the byte-for-byte
 parity story see [docs/design/DIFFERENTIAL_TESTING.md](design/DIFFERENTIAL_TESTING.md).

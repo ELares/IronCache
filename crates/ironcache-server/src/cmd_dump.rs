@@ -25,11 +25,15 @@
 //! sorted set DUMPed by a real redis RESTOREs here with identical members/fields/scores (#612 phase;
 //! DUMP of an aggregate stays deferred). A NaN score is refused as bad data in every zset encoding
 //! (parity with our ZADD guard + Redis's post-load isnan check); a +inf/-inf score is a legitimate
-//! value and is preserved. The field-TTL hash encodings (`RDB_TYPE_HASH_LISTPACK_EX`,
+//! value and is preserved. RESTORE also accepts the LIST type in the modern `RDB_TYPE_LIST_QUICKLIST_2`
+//! encoding (the quicklist of listpack + plain nodes that Redis 7.x DUMPs) and the trivial legacy
+//! `RDB_TYPE_LIST`, preserving element INSERTION ORDER across nodes, so a list DUMPed by a real redis
+//! RESTOREs here with identical order. The field-TTL hash encodings (`RDB_TYPE_HASH_LISTPACK_EX`,
 //! `RDB_TYPE_HASH_METADATA`, and their pre-GA forms) are a tracked follow-up (#612 PR4) and are
 //! refused as bad data for now rather than half-decoded (a field TTL is never silently dropped). The
-//! remaining aggregate type (list) RESTORE is the tracked follow-up; a type we do not yet decode is
-//! refused as bad data, never mis-decoded.
+//! ziplist-based list encodings (`RDB_TYPE_LIST_QUICKLIST` / `RDB_TYPE_LIST_ZIPLIST`, which modern
+//! redis never DUMPs) are likewise a tracked follow-up, refused as bad data rather than mis-decoded;
+//! a type we do not yet decode is refused as bad data, never mis-decoded.
 //!
 //! The reusable RDB codec substrate (the CRC-64 footer, the RDB length + string encodings, and the
 //! container element iterators the aggregate types build on) lives in [`crate::rdb`]; this slice is
@@ -52,12 +56,15 @@ use ironcache_storage::{
 };
 
 use crate::rdb::{
-    DECODE_PREALLOC_CAP, DUMP_RDB_VERSION, LpElem, RDB_TYPE_HASH, RDB_TYPE_HASH_LISTPACK,
+    DECODE_PREALLOC_CAP, DUMP_RDB_VERSION, LpElem, QUICKLIST_NODE_CONTAINER_PACKED,
+    QUICKLIST_NODE_CONTAINER_PLAIN, RDB_TYPE_HASH, RDB_TYPE_HASH_LISTPACK,
     RDB_TYPE_HASH_LISTPACK_EX, RDB_TYPE_HASH_LISTPACK_EX_PRE_GA, RDB_TYPE_HASH_METADATA,
-    RDB_TYPE_HASH_METADATA_PRE_GA, RDB_TYPE_SET, RDB_TYPE_SET_INTSET, RDB_TYPE_SET_LISTPACK,
-    RDB_TYPE_STRING, RDB_TYPE_ZSET, RDB_TYPE_ZSET_2, RDB_TYPE_ZSET_LISTPACK, RestoreParseError,
-    crc64, intset_iter, listpack_iter, parse_ascii_double, read_rdb_ascii_double,
-    read_rdb_binary_double, read_rdb_len, read_rdb_string, verify_footer, write_rdb_len,
+    RDB_TYPE_HASH_METADATA_PRE_GA, RDB_TYPE_LIST, RDB_TYPE_LIST_QUICKLIST,
+    RDB_TYPE_LIST_QUICKLIST_2, RDB_TYPE_LIST_ZIPLIST, RDB_TYPE_SET, RDB_TYPE_SET_INTSET,
+    RDB_TYPE_SET_LISTPACK, RDB_TYPE_STRING, RDB_TYPE_ZSET, RDB_TYPE_ZSET_2, RDB_TYPE_ZSET_LISTPACK,
+    RestoreParseError, crc64, intset_iter, listpack_iter, parse_ascii_double,
+    read_rdb_ascii_double, read_rdb_binary_double, read_rdb_len, read_rdb_string, verify_footer,
+    write_rdb_len,
 };
 
 /// A decoded hash's `(field, value)` pairs in stream order (a repeated field is resolved last-wins by
@@ -398,6 +405,123 @@ fn deserialize_zset(blob: &[u8]) -> Result<ZSetPairs, RestoreParseError> {
     }
 }
 
+/// Parse a DUMP blob (footer-verified) into the LIST elements in head-to-tail order, ready for
+/// [`NewValueOwned::List`] (which builds the concrete list value and applies the
+/// listpack/quicklist encoding ladder). UNLIKE a set/hash/zset, a list preserves INSERTION ORDER,
+/// so elements are appended in node order, and within a node in element order. Handles the modern
+/// quicklist-2 encoding and the trivial legacy plain list:
+///
+/// * `RDB_TYPE_LIST_QUICKLIST_2` (18, the encoding modern Redis 7.x DUMPs): an RDB length = the
+///   NODE count, then each node is a container tag (an RDB length: `QUICKLIST_NODE_CONTAINER_PLAIN`
+///   = a single raw element read as an [`read_rdb_string`], or `QUICKLIST_NODE_CONTAINER_PACKED` =
+///   a listpack -- itself stored AS an RDB string, so redis may LZF- or raw-encode it -- whose
+///   [`listpack_iter`] elements are the list elements). A packed [`LpElem::Int`] renders as its
+///   DECIMAL ASCII text (redis's `lpAppend` int-encodes a numeric string, so an element that was the
+///   string "123" comes back as `Int(123)` and MUST render back to "123") and an [`LpElem::Str`] is
+///   the raw bytes. Any other container tag is a corrupt/hostile blob -> [`RestoreParseError::BadData`].
+/// * `RDB_TYPE_LIST` (1, legacy plain): an RDB length = the element count, then that many RDB strings,
+///   each one element in order.
+///
+/// The legacy ziplist-based list encodings -- `RDB_TYPE_LIST_QUICKLIST` (14) and
+/// `RDB_TYPE_LIST_ZIPLIST` (10) -- wrap a ZIPLIST, which the shared `rdb` codec has no decoder for
+/// yet (only [`listpack_iter`]); they are refused as [`RestoreParseError::BadData`] here (a tracked
+/// follow-up), never mis-decoded. Modern Redis never emits either on DUMP, so this is not a
+/// migration gap in practice.
+///
+/// Every declared length is bounds-checked before a slice or allocation (the shared `rdb` discipline),
+/// so a hostile blob is a clean [`RestoreParseError::BadData`], never a panic or an over-allocation.
+fn deserialize_list(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
+    let payload = verify_footer(blob)?;
+    let mut pos = 0usize;
+    let ty = *payload.get(pos).ok_or(RestoreParseError::BadData)?;
+    pos += 1;
+    match ty {
+        RDB_TYPE_LIST_QUICKLIST_2 => {
+            let (nodes, is_encoded) = read_rdb_len(payload, &mut pos)?;
+            if is_encoded {
+                // A node count is never one of the RDB_ENCVAL special encodings.
+                return Err(RestoreParseError::BadData);
+            }
+            let nodes = usize::try_from(nodes).map_err(|_| RestoreParseError::BadData)?;
+            // Bound the declared node count against the bytes still available BEFORE the
+            // pre-allocation: each node is at least a 1-byte container tag + a 1-byte RDB string
+            // length, so `nodes * 2` larger than the remaining bytes is a lie -> BadData.
+            // `checked_mul` guards the doubling; `read_rdb_string` / `listpack_iter` re-validate each
+            // node's own declared lengths.
+            let min_bytes = nodes.checked_mul(2).ok_or(RestoreParseError::BadData)?;
+            if min_bytes > payload.len().saturating_sub(pos) {
+                return Err(RestoreParseError::BadData);
+            }
+            // Pre-allocate against the NODE count (an under-estimate of the element count, since a
+            // packed node holds many elements), capped so a hostile header cannot force a huge
+            // up-front buffer; the vec grows naturally as elements are appended.
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(nodes.min(DECODE_PREALLOC_CAP));
+            for _ in 0..nodes {
+                let (container, is_encoded) = read_rdb_len(payload, &mut pos)?;
+                if is_encoded {
+                    // A container tag is never one of the RDB_ENCVAL special encodings.
+                    return Err(RestoreParseError::BadData);
+                }
+                match container {
+                    QUICKLIST_NODE_CONTAINER_PLAIN => {
+                        // A PLAIN node is a single raw element, stored AS an RDB string.
+                        out.push(read_rdb_string(payload, &mut pos)?);
+                    }
+                    QUICKLIST_NODE_CONTAINER_PACKED => {
+                        // A PACKED node is a listpack, itself stored AS an RDB string (LZF handled
+                        // for free); each listpack element is a list element in order. An int renders
+                        // as decimal ASCII (redis int-encodes a numeric string), a string is the raw
+                        // bytes.
+                        let body = read_rdb_string(payload, &mut pos)?;
+                        for e in listpack_iter(&body)? {
+                            out.push(match e {
+                                LpElem::Int(n) => n.to_string().into_bytes(),
+                                LpElem::Str(b) => b.into_vec(),
+                            });
+                        }
+                    }
+                    // Any other container tag is a corrupt/hostile blob (redis writes only PLAIN /
+                    // PACKED); refuse it rather than guess.
+                    _ => return Err(RestoreParseError::BadData),
+                }
+            }
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes: malformed
+            }
+            Ok(out)
+        }
+        RDB_TYPE_LIST => {
+            let (count, is_encoded) = read_rdb_len(payload, &mut pos)?;
+            if is_encoded {
+                // An element count is never one of the RDB_ENCVAL special encodings.
+                return Err(RestoreParseError::BadData);
+            }
+            let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
+            // Bound the declared count against the remaining bytes: the smallest element is a single
+            // length byte (a zero-length string), so a count larger than the remaining bytes is a lie
+            // -> BadData BEFORE the pre-allocation. `read_rdb_string` re-validates each element.
+            if count > payload.len().saturating_sub(pos) {
+                return Err(RestoreParseError::BadData);
+            }
+            let mut out = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
+            for _ in 0..count {
+                out.push(read_rdb_string(payload, &mut pos)?);
+            }
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes: malformed
+            }
+            Ok(out)
+        }
+        // The legacy ziplist-based list encodings (`RDB_TYPE_LIST_QUICKLIST` = 14 and
+        // `RDB_TYPE_LIST_ZIPLIST` = 10) wrap a ziplist the shared codec cannot decode yet, so they
+        // are refused as BadData (a tracked follow-up), never mis-decoded. Any OTHER type reaching
+        // here is a routing bug (the caller dispatches the decodable types elsewhere); it is likewise
+        // BadData, since the value cannot be reconstructed. The cases share a body, so they collapse
+        // into one wildcard arm.
+        _ => Err(RestoreParseError::BadData),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The commands.
 // ---------------------------------------------------------------------------
@@ -497,13 +621,14 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         }
         // Route on the RDB type byte, which is `blob[0]` (the first payload byte, before the footer)
         // and is CRC-covered, so `verify_footer` inside the chosen decoder still authenticates it: a
-        // SET type reconstructs a `NewValueOwned::Set`, a HASH type a `NewValueOwned::Hash`, and a ZSET
-        // type a `NewValueOwned::ZSet` (the store dedups + applies the encoding ladder), everything
-        // else falls to the STRING decoder (which rejects a non-STRING type as BadData). The four
-        // field-TTL hash type bytes route to `deserialize_hash` too, which cleanly refuses them as
-        // BadData (PR4), so no key is created. All paths install through the same `RmwAction::Replace`
-        // used by the string RESTORE -- only the value construction differs, so REPLACE / ttl / ABSTTL
-        // / IDLETIME / FREQ all hold.
+        // SET type reconstructs a `NewValueOwned::Set`, a HASH type a `NewValueOwned::Hash`, a ZSET
+        // type a `NewValueOwned::ZSet`, and a LIST type a `NewValueOwned::List` (the store dedups
+        // where applicable + applies the encoding ladder), everything else falls to the STRING decoder
+        // (which rejects a non-STRING type as BadData). The four field-TTL hash type bytes route to
+        // `deserialize_hash` too, and the two ziplist-based list type bytes to `deserialize_list`,
+        // both of which cleanly refuse them as BadData (a tracked follow-up), so no key is created.
+        // All paths install through the same `RmwAction::Replace` used by the string RESTORE -- only
+        // the value construction differs, so REPLACE / ttl / ABSTTL / IDLETIME / FREQ all hold.
         let decoded = match blob.first() {
             Some(&RDB_TYPE_SET | &RDB_TYPE_SET_INTSET | &RDB_TYPE_SET_LISTPACK) => {
                 deserialize_set(blob).map(NewValueOwned::Set)
@@ -519,6 +644,12 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
             Some(&RDB_TYPE_ZSET_2 | &RDB_TYPE_ZSET | &RDB_TYPE_ZSET_LISTPACK) => {
                 deserialize_zset(blob).map(NewValueOwned::ZSet)
             }
+            Some(
+                &RDB_TYPE_LIST
+                | &RDB_TYPE_LIST_QUICKLIST_2
+                | &RDB_TYPE_LIST_QUICKLIST
+                | &RDB_TYPE_LIST_ZIPLIST,
+            ) => deserialize_list(blob).map(NewValueOwned::List),
             _ => deserialize_string(blob).map(|v| NewValueOwned::Bytes(Bytes::from(v))),
         };
         match decoded {
@@ -1744,5 +1875,328 @@ mod tests {
             s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
             Some(UnixMillis(NOW.0 + 40_000))
         );
+    }
+
+    // ---- LIST RESTORE (#612 phase 6): the quicklist-2 + legacy plain encodings. ----
+
+    /// Append a quicklist-2 PACKED node: the container tag (a plain RDB length = 2) then the listpack
+    /// stored AS an RDB string, mirroring how redis wraps a packed node in a `RDB_TYPE_LIST_QUICKLIST_2`
+    /// body.
+    fn push_packed_node(out: &mut Vec<u8>, listpack: &[u8]) {
+        write_rdb_len(out, 2); // QUICKLIST_NODE_CONTAINER_PACKED
+        push_rdb_string(out, listpack);
+    }
+
+    /// Append a quicklist-2 PLAIN node: the container tag (a plain RDB length = 1) then the single raw
+    /// element stored AS an RDB string.
+    fn push_plain_node(out: &mut Vec<u8>, elem: &[u8]) {
+        write_rdb_len(out, 1); // QUICKLIST_NODE_CONTAINER_PLAIN
+        push_rdb_string(out, elem);
+    }
+
+    /// The LRANGE 0 -1 snapshot of `key` (head-to-tail order), empty if absent / not a list, read
+    /// through the typed `ListValue` view for an order-preserving assertion.
+    fn list_all(store: &mut TestStore, key: &[u8]) -> Vec<Vec<u8>> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let items = match entry {
+                RmwEntry::OccupiedMut(mut o) => {
+                    o.as_list_mut().map(|l| l.range(0, -1)).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: items,
+            }
+        })
+    }
+
+    /// LLEN through the typed `ListValue` view.
+    fn list_len(store: &mut TestStore, key: &[u8]) -> usize {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let n = match entry {
+                RmwEntry::OccupiedMut(mut o) => o.as_list_mut().map_or(0, |l| l.len()),
+                _ => 0,
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: n,
+            }
+        })
+    }
+
+    /// LINDEX through the typed `ListValue` view.
+    fn list_index(store: &mut TestStore, key: &[u8], index: i64) -> Option<Vec<u8>> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let elem = match entry {
+                RmwEntry::OccupiedMut(mut o) => o.as_list_mut().and_then(|l| l.get(index)),
+                _ => None,
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: elem,
+            }
+        })
+    }
+
+    #[test]
+    fn restore_quicklist2_single_packed_node() {
+        // The modern encoding redis 7.x DUMPs a small list as: one PACKED node whose listpack holds
+        // the elements in head-to-tail order. RESTORE must preserve that exact order (LRANGE) and
+        // report the right LLEN / LINDEX.
+        let mut s = test_store();
+        let lp = build_listpack(&[lp_str6(b"a"), lp_str6(b"b"), lp_str6(b"c")]);
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1); // one node
+        push_packed_node(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"l", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            list_all(&mut s, b"l"),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(list_len(&mut s, b"l"), 3); // LLEN
+        assert_eq!(list_index(&mut s, b"l", 0), Some(b"a".to_vec())); // LINDEX head
+        assert_eq!(list_index(&mut s, b"l", -1), Some(b"c".to_vec())); // LINDEX tail
+        assert_eq!(list_index(&mut s, b"l", 5), None); // out of range
+    }
+
+    #[test]
+    fn restore_quicklist2_multiple_nodes_preserves_cross_node_order() {
+        // A list split across THREE nodes (two packed + one plain in the middle): RESTORE must
+        // concatenate them in node order, and elements within a node in element order, so the full
+        // LRANGE is the flat head-to-tail sequence.
+        let mut s = test_store();
+        let lp1 = build_listpack(&[lp_str6(b"n1a"), lp_str6(b"n1b")]);
+        let lp2 = build_listpack(&[lp_str6(b"n3a"), lp_str6(b"n3b"), lp_str6(b"n3c")]);
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3); // three nodes
+        push_packed_node(&mut body, &lp1);
+        push_plain_node(&mut body, b"middle"); // a raw single-element node between the packed ones
+        push_packed_node(&mut body, &lp2);
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"l", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            list_all(&mut s, b"l"),
+            vec![
+                b"n1a".to_vec(),
+                b"n1b".to_vec(),
+                b"middle".to_vec(),
+                b"n3a".to_vec(),
+                b"n3b".to_vec(),
+                b"n3c".to_vec(),
+            ]
+        );
+        assert_eq!(list_len(&mut s, b"l"), 6);
+        assert_eq!(list_index(&mut s, b"l", 2), Some(b"middle".to_vec()));
+    }
+
+    #[test]
+    fn restore_quicklist2_plain_node_is_a_single_raw_element() {
+        // A PLAIN node carries ONE raw element (redis stores an element larger than the node budget
+        // this way). A long (> 64 byte) element exercises the raw path end to end.
+        let mut s = test_store();
+        let big = vec![b'z'; 100];
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        push_plain_node(&mut body, &big);
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"l", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(list_all(&mut s, b"l"), vec![big.clone()]);
+        assert_eq!(list_index(&mut s, b"l", 0), Some(big));
+    }
+
+    #[test]
+    fn restore_quicklist2_int_element_renders_decimal_ascii() {
+        // Redis's `lpAppend` int-encodes a numeric string, so an element that was the string "123"
+        // comes back as a listpack Int(123); the decoder MUST render it back to the decimal ASCII
+        // "123" (load-bearing: the restored list must read identically to the source).
+        let mut s = test_store();
+        let lp = build_listpack(&[lp_str6(b"x"), lp_int16(123), lp_int16(-7)]);
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        push_packed_node(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"l", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            list_all(&mut s, b"l"),
+            vec![b"x".to_vec(), b"123".to_vec(), b"-7".to_vec()]
+        );
+    }
+
+    #[test]
+    fn restore_legacy_plain_list_round_trips() {
+        // The trivial legacy RDB_TYPE_LIST: an element count then that many RDB strings, in order.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3);
+        push_rdb_string(&mut body, b"first");
+        push_rdb_string(&mut body, b"second");
+        push_rdb_string(&mut body, b"third");
+        let blob = set_blob(RDB_TYPE_LIST, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"l", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            list_all(&mut s, b"l"),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+        assert_eq!(list_len(&mut s, b"l"), 3);
+    }
+
+    #[test]
+    fn restore_list_honors_replace_and_ttl() {
+        let mut s = test_store();
+        // Restore a quicklist-2 list with no ttl.
+        let lp = build_listpack(&[lp_str6(b"a"), lp_str6(b"b")]);
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        push_packed_node(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])),
+            Value::ok()
+        );
+        // Without REPLACE -> BUSYKEY (value untouched).
+        assert_eq!(
+            match cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])) {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-BUSYKEY Target key name already exists."
+        );
+        // REPLACE + a relative ttl: a legacy plain list overwrites the value and the deadline is
+        // now + ttl.
+        let mut body2 = Vec::new();
+        write_rdb_len(&mut body2, 1);
+        push_rdb_string(&mut body2, b"only");
+        let blob2 = set_blob(RDB_TYPE_LIST, &body2);
+        assert_eq!(
+            cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"k", b"35000", &blob2, b"REPLACE"])
+            ),
+            Value::ok()
+        );
+        assert_eq!(list_all(&mut s, b"k"), vec![b"only".to_vec()]);
+        assert_eq!(
+            s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
+            Some(UnixMillis(NOW.0 + 35_000))
+        );
+    }
+
+    #[test]
+    fn deserialize_list_rejects_a_huge_node_count_without_allocating() {
+        // A quicklist-2 whose declared node count (~4 billion) dwarfs the tiny body: the
+        // node-count*2-vs-remaining bound rejects BEFORE the pre-allocation, no over-alloc, no panic.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff);
+        push_packed_node(&mut body, &build_listpack(&[lp_str6(b"only")]));
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(deserialize_list(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_list_rejects_a_truncated_node_string() {
+        // A node count of 1 and a PACKED container, but the node's RDB string declares more bytes than
+        // are present: `read_rdb_string` rejects the short tail as BadData, no over-read.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        write_rdb_len(&mut body, 2); // QUICKLIST_NODE_CONTAINER_PACKED
+        write_rdb_len(&mut body, 50); // claim a 50-byte listpack string ...
+        body.extend_from_slice(b"short"); // ... but only 5 bytes follow
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(deserialize_list(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_list_rejects_a_listpack_length_past_the_end() {
+        // A packed node whose listpack header total_bytes lies far past the real slice must be BadData
+        // with no over-read (the listpack decoder's exact-length gate).
+        let mut lp = build_listpack(&[lp_str6(b"a")]);
+        lp[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        push_packed_node(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(deserialize_list(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_list_rejects_an_unknown_container_tag() {
+        // A container tag of 3 is neither PLAIN (1) nor PACKED (2): a corrupt/hostile blob, refused as
+        // BadData rather than guessed.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        write_rdb_len(&mut body, 3); // unknown container tag
+        push_rdb_string(&mut body, b"whatever");
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        assert_eq!(deserialize_list(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_list_rejects_the_ziplist_based_encodings() {
+        // The ziplist-based list encodings (RDB_TYPE_LIST_QUICKLIST=14, RDB_TYPE_LIST_ZIPLIST=10) are
+        // a tracked follow-up (no ziplist decoder yet): each must be a clean BadData, never a
+        // mis-decode. Any plausible body is refused on the type byte before decode.
+        for &ty in &[RDB_TYPE_LIST_QUICKLIST, RDB_TYPE_LIST_ZIPLIST] {
+            let blob = set_blob(ty, &[0x00, 0x01, 0x02]);
+            assert_eq!(
+                deserialize_list(&blob),
+                Err(RestoreParseError::BadData),
+                "ziplist-based list type {ty} must be refused as bad data"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_a_hostile_list_blob_errors_and_creates_no_key() {
+        // End-to-end: a hostile quicklist-2 blob returns the bad-data error and leaves NO key behind
+        // (no panic, no partial write). Also covers the ziplist-based type through the full command
+        // path (a clean error, no key).
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff); // absurd node count
+        push_packed_node(&mut body, &build_listpack(&[lp_str6(b"x")]));
+        let blob = set_blob(RDB_TYPE_LIST_QUICKLIST_2, &body);
+        let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob]));
+        assert_eq!(
+            match err {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-ERR Bad data format"
+        );
+        assert!(s.read(0, b"h", NOW).is_none(), "no key must be created");
+
+        // A ziplist-based list type is likewise refused end to end with no key.
+        let zbl = set_blob(RDB_TYPE_LIST_QUICKLIST, &[0x00, 0x01]);
+        let err2 = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"z", b"0", &zbl]));
+        assert_eq!(
+            match err2 {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-ERR Bad data format"
+        );
+        assert!(s.read(0, b"z", NOW).is_none(), "no key must be created");
     }
 }

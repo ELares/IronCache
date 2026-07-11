@@ -70,6 +70,22 @@ pub(crate) const RDB_TYPE_HASH_METADATA: u8 = 24;
 pub(crate) const RDB_TYPE_HASH_LISTPACK_EX: u8 = 25;
 
 // ---------------------------------------------------------------------------
+// Quicklist node container tags (Redis `src/quicklist.h`). Inside a `RDB_TYPE_LIST_QUICKLIST_2`
+// body, each node is prefixed by an RDB length whose value is one of these two container tags: a
+// PLAIN node holds a single raw element, a PACKED node holds a listpack of elements. They are RDB
+// lengths (read with [`read_rdb_len`]), so they are typed `u64` to compare against that reader's
+// return directly.
+// ---------------------------------------------------------------------------
+
+/// A quicklist-2 node holding a SINGLE raw element, stored unpacked
+/// (`QUICKLIST_NODE_CONTAINER_PLAIN`). The node body is that one element's bytes, read as an RDB
+/// string.
+pub(crate) const QUICKLIST_NODE_CONTAINER_PLAIN: u64 = 1;
+/// A quicklist-2 node holding a LISTPACK of elements (`QUICKLIST_NODE_CONTAINER_PACKED`). The node
+/// body is a listpack (itself stored AS an RDB string) decoded by [`listpack_iter`].
+pub(crate) const QUICKLIST_NODE_CONTAINER_PACKED: u64 = 2;
+
+// ---------------------------------------------------------------------------
 // Footer / bound constants.
 // ---------------------------------------------------------------------------
 
