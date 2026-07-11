@@ -76,6 +76,12 @@ is specified here as the canonical serializer so #39/#40 (intset/HLL/OBJECT
 ENCODING) have one blob format to target, validated against the oracle
 [valkey-resp-identical]. The 512 MB value bound [bulk-string-max-512mb] applies.
 
+> **LOUD NOTE (current reality): DUMP/RESTORE is STRING-only.** As implemented today,
+> `DUMP`/`RESTORE` round-trips the **STRING type ONLY** (a HyperLogLog counts, since an HLL is
+> stored as a string). A `DUMP` of a list, hash, set, or zset returns an error and cannot be
+> `RESTORE`d, so full multi-type `MIGRATE` compatibility does NOT hold yet. The remaining
+> per-type codecs (and thus full multi-type `MIGRATE`) are tracked in #612.
+
 ## Open questions
 
 - The exact cursor encoding bit-split (slot id, full-hash, and the equal-hash

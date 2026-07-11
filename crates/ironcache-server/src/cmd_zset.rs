@@ -3198,6 +3198,46 @@ mod tests {
         assert!(matches!(s2, Value::Double(d) if d.is_infinite() && d < 0.0));
     }
 
+    // ---- Competitor-regression lock-in: ZADD/ZINCRBY reject NaN scores (input and result). ----
+
+    #[test]
+    fn zadd_and_zincrby_reject_nan_scores() {
+        // Class of bug: a competitor accepted a NaN score (parsed as INPUT, or produced by
+        // ARITHMETIC) and then CRASHED converting the zset to a skiplist, since NaN breaks the
+        // total score order the skiplist relies on. Our defense: `parse_f64` rejects a NaN
+        // INPUT (`value is not a valid float`), and a NaN ARITHMETIC RESULT (e.g. +inf
+        // incremented by -inf) is rejected with `resulting score is not a number (NaN)` WITHOUT
+        // mutating, so a NaN never reaches the ordered structure.
+        let mut s = test_store();
+        // A NaN input score is rejected at parse time (never stored).
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"nan", b"m"])),
+            "-ERR value is not a valid float"
+        );
+        // A ZINCRBY whose result would be NaN (+inf then -inf) is rejected; member unchanged.
+        zadd(&mut s, &[b"ZADD", b"z", b"inf", b"m"]);
+        assert_eq!(
+            err_line(&cmd_zincrby(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINCRBY", b"z", b"-inf", b"m"])
+            )),
+            "-ERR resulting score is not a number (NaN)"
+        );
+        // The member keeps its +inf score (no NaN was stored).
+        assert!(matches!(
+            cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"m"])),
+            Value::Double(d) if d.is_infinite() && d > 0.0
+        ));
+        // A normal finite score still works.
+        assert_eq!(int(&zadd(&mut s, &[b"ZADD", b"z2", b"1.5", b"m"])), 1);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z2", b"m"]))),
+            Some("1.5".to_owned())
+        );
+    }
+
     // ---- Aggregate NaN -> 0 coercion (SUM of +inf/-inf; WEIGHTS 0 * inf). ----
 
     #[test]

@@ -1789,6 +1789,48 @@ mod tests {
         );
     }
 
+    // ---- Competitor-regression lock-in: SINTERCARD numkeys must be > 0 (no zero-key crash). ----
+
+    #[test]
+    fn sintercard_rejects_nonpositive_numkeys_without_panicking() {
+        // Class of bug: a competitor CRASHED on `SINTERCARD 0 ...` (a zero/negative numkeys
+        // reached the intersection machinery and indexed/divided by an empty key set). Our
+        // defense: `cmd_sintercard` rejects `numkeys <= 0` UP FRONT with
+        // `-ERR numkeys should be greater than 0`, so a zero-key intersection is never run.
+        let mut s = test_store();
+        cmd_sadd(&mut s, 0, NOW, &req(&[b"SADD", b"a", b"1", b"2", b"3"]));
+        cmd_sadd(&mut s, 0, NOW, &req(&[b"SADD", b"b", b"2", b"3", b"4"]));
+        // numkeys == 0 and numkeys < 0 are both the specific error (no panic).
+        assert_eq!(
+            err_line(&cmd_sintercard(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SINTERCARD", b"0", b"a"])
+            )),
+            "-ERR numkeys should be greater than 0"
+        );
+        assert_eq!(
+            err_line(&cmd_sintercard(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SINTERCARD", b"-1", b"a", b"b"])
+            )),
+            "-ERR numkeys should be greater than 0"
+        );
+        // A valid numkeys still computes the intersection cardinality ({2,3} -> 2).
+        assert_eq!(
+            int(&cmd_sintercard(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SINTERCARD", b"2", b"a", b"b"])
+            )),
+            2
+        );
+    }
+
     // ---- SINTERSTORE / SUNIONSTORE / SDIFFSTORE incl. empty-result-deletes-dest. ----
 
     #[test]

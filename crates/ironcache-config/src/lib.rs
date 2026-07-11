@@ -3832,6 +3832,33 @@ mod tests {
         assert!(parse_human_size("18446744073709551616").is_err()); // u64::MAX + 1
     }
 
+    // ---- Competitor-regression lock-in: maxmemory unit-multiply overflow. ----
+
+    #[test]
+    fn human_size_unit_multiply_overflow_is_a_hard_error_not_a_wrap() {
+        // Class of bug: a competitor's human-size parser OVERFLOWED the unit multiply
+        // (value * unit_multiplier) and WRAPPED a huge configured size down to a tiny byte
+        // count, so `CONFIG SET maxmemory <huge>` silently became a near-zero cap. Our defense:
+        // `parse_human_size` (the exact function `CONFIG SET maxmemory` calls) uses
+        // `checked_mul`, so an overflowing size is a hard `ConfigError::Size("too large ...")`,
+        // never a wrapped small number.
+        for huge in [
+            "18014398509481985kb", // (2^54 + 1) * 1024 overflows u64
+            "18446744073709552gb", // ~u64::MAX * 2^30 overflows u64
+            "18014398509481985mb", // (2^54 + 1) * 2^20 overflows u64
+        ] {
+            match parse_human_size(huge) {
+                Err(ConfigError::Size(_, reason)) => assert!(
+                    reason.contains("too large") || reason.contains("overflow"),
+                    "expected an overflow error for {huge:?}, got reason {reason:?}"
+                ),
+                other => panic!("expected a too-large Size error for {huge:?}, got {other:?}"),
+            }
+        }
+        // A normal size still parses to the EXACT byte count (no false positives, no wrap).
+        assert_eq!(parse_human_size("100mb").unwrap(), 100 * 1024 * 1024);
+    }
+
     #[test]
     fn validate_rejects_zero_shards() {
         let c = Config {
