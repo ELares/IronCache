@@ -721,6 +721,25 @@ fn bulk_bytes(r: &Resp) -> Option<Vec<u8>> {
     }
 }
 
+/// Extract the members of a `SMEMBERS` reply as a SORTED list of byte-vectors (order-independent
+/// membership comparison), or `None` if the reply is not an array of bulk strings.
+fn sorted_members(r: &Resp) -> Option<Vec<Vec<u8>>> {
+    match r {
+        Resp::Array(Some(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    Resp::Bulk(Some(b)) => out.push(b.clone()),
+                    _ => return None,
+                }
+            }
+            out.sort();
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Prove the DUMP serialization blob interoperates in BOTH directions: `SET`/`PFADD` a value on the
 /// SOURCE server, `DUMP` it, `RESTORE` the blob on the DESTINATION server, and read it back -- it must
 /// equal the source value. Runs for plain / integer-looking (redis int-encodes) / binary / long
@@ -835,6 +854,90 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
         }
     }
 
+    // SET values are a SEPARATE helper (below): DUMP of a set is not yet implemented on IronCache, so
+    // the set parity check is one-directional (redis DUMP -> IronCache RESTORE) and does not fit the
+    // bidirectional loop above.
+    compared += set_dump_restore_interop(iron, rds, div);
+
+    compared
+}
+
+/// The SET half of the DUMP/RESTORE parity check (#612 SET RESTORE). ONE-DIRECTIONAL (r2i only): DUMP
+/// of a set is not yet implemented on IronCache (still a typed "unsupported" error), so we exercise
+/// the real-Redis DUMP -> IronCache RESTORE direction, which is exactly the migration path that
+/// matters. We force each of redis's three set encodings and assert the RESTOREd members match. When
+/// DUMP(set) lands (a later #612 phase) the i2r direction can be added here too. Returns the number of
+/// comparisons made; a mismatch is pushed onto `div`.
+fn set_dump_restore_interop(
+    iron: &mut Client,
+    rds: &mut Client,
+    div: &mut Vec<Divergence>,
+) -> usize {
+    let mut compared = 0usize;
+    let set_cases: Vec<(&str, Vec<Vec<u8>>)> = vec![
+        // All-integer, small -> redis `intset` encoding; RESTORE must render decimal-string members.
+        (
+            "intset",
+            vec![
+                b"1".to_vec(),
+                b"2".to_vec(),
+                b"3".to_vec(),
+                b"-5".to_vec(),
+                b"300".to_vec(),
+            ],
+        ),
+        // Mixed string + int, small -> redis `listpack` encoding.
+        (
+            "listpack",
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"7".to_vec(),
+                b"hello".to_vec(),
+            ],
+        ),
+        // A member longer than `set-max-listpack-value` (64) forces the hashtable encoding, which
+        // DUMPs as the plain `RDB_TYPE_SET`.
+        (
+            "plainht",
+            vec![
+                vec![b'x'; 100],
+                b"y".to_vec(),
+                b"12345".to_vec(),
+                b"z".to_vec(),
+            ],
+        ),
+    ];
+    for (enc, members) in &set_cases {
+        let src_key = format!("dr:set:{enc}:src").into_bytes();
+        let dst_key = format!("dr:set:{enc}:dst").into_bytes();
+        let mut sadd: Vec<&[u8]> = vec![b"SADD", &src_key];
+        sadd.extend(members.iter().map(std::vec::Vec::as_slice));
+        rds.cmd(&sadd);
+        let Some(blob) = bulk_bytes(&rds.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP set {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "redis DUMP of a set did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = iron.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let iron_reply = iron.cmd(&[b"SMEMBERS", &dst_key]);
+        let redis_reply = rds.cmd(&[b"SMEMBERS", &src_key]);
+        compared += 1;
+        if sorted_members(&iron_reply).is_none()
+            || sorted_members(&iron_reply) != sorted_members(&redis_reply)
+        {
+            div.push(Divergence {
+                cmd: format!("SET DUMP(redis)->RESTORE(iron) {enc}; RESTORE said {restore:?}"),
+                iron: iron_reply,
+                redis: redis_reply,
+                note: "a set DUMPed by redis did not RESTORE to the same members on IronCache (#612 SET)".to_owned(),
+            });
+        }
+    }
     compared
 }
 
