@@ -61,13 +61,16 @@ standard Redis 7.4+ commands.
   rejected with `CROSSSLOT`.
 - **Keyspace notifications.** `notify-keyspace-events` drives keyspace / keyevent Pub/Sub messages
   (including `expired` / `evicted`); disabled by default so the write hot path pays nothing.
-- **DUMP is STRING-only; RESTORE also accepts the SET type.** `DUMP` (encode) currently emits the
+- **DUMP is STRING-only; RESTORE also accepts SET and HASH.** `DUMP` (encode) currently emits the
   **STRING type ONLY** (a HyperLogLog counts, since an HLL is stored as a string); a `DUMP` of a
-  list, hash, set, or zset returns an error. `RESTORE` (decode) accepts the **STRING type AND the
+  list, hash, set, or zset returns an error. `RESTORE` (decode) accepts the **STRING type, the
   SET type in all three RDB encodings** (`intset`, `listpack`, and the plain length-prefixed set),
-  so a set `DUMP`ed by a real Redis `RESTORE`s here with identical members. `RESTORE` of a list,
-  hash, or zset is still refused as bad data, so do NOT assume full-fidelity `MIGRATE` across all
-  types yet. The remaining per-type codecs (and `DUMP` of the aggregate types) are tracked in #612.
+  **and the HASH type in its two non-field-TTL encodings** (`listpack` and the plain
+  length-prefixed hash), so a set OR a (non-field-TTL) hash `DUMP`ed by a real Redis `RESTORE`s here
+  with identical members/fields. A HASH with per-field TTLs (Redis 7.4+ `listpack_ex` / `metadata`
+  encodings) and `RESTORE` of a list or zset are still refused as bad data, so do NOT assume
+  full-fidelity `MIGRATE` across all types yet. The remaining per-type codecs (hash field-TTLs,
+  zset, list) and `DUMP` of the aggregate types are tracked in #612.
 
 For the full type-by-type feature list see the [README](../README.md); for the byte-for-byte
 parity story see [docs/design/DIFFERENTIAL_TESTING.md](design/DIFFERENTIAL_TESTING.md).
