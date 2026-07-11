@@ -16,6 +16,10 @@
 //! RESTOREs + PFCOUNTs identically on redis). Other value types (list/set/hash/zset) are a tracked
 //! follow-up; DUMP of one is a typed "unsupported" error rather than a wrong blob.
 //!
+//! The reusable RDB codec substrate (the CRC-64 footer, the RDB length + string encodings, and the
+//! container element iterators the aggregate types build on) lives in [`crate::rdb`]; this slice is
+//! the STRING encode/decode plus the command surface.
+//!
 //! ## Encoding fidelity
 //!
 //! DUMP writes the RAW string length-encoding (no LZF compression, no integer encoding): always a
@@ -32,95 +36,10 @@ use ironcache_storage::{
     DataType, ExpireWrite, NewValueOwned, RmwAction, RmwEntry, RmwStep, Store, UnixMillis,
 };
 
-/// The RDB opcode for a plain string value (`RDB_TYPE_STRING`).
-const RDB_TYPE_STRING: u8 = 0;
-
-/// The RDB version stamped into a DUMP footer. Redis's `verifyDumpPayload` accepts any version `<=`
-/// the server's `RDB_VERSION`, so a conservative 9 (Redis 5/6) is RESTORE-able by every redis >= 6.0
-/// while the type-0 string encoding is version-independent.
-const DUMP_RDB_VERSION: u16 = 9;
-
-/// The highest RDB footer version RESTORE accepts (matching Redis 8.x `RDB_VERSION`). A newer version
-/// is refused as [`ErrorReply::restore_bad_payload`], exactly as redis refuses a too-new payload.
-///
-/// Accepting up through 14 (rather than the older 11) lets a plain-string DUMP produced by a modern
-/// Redis/Valkey (which stamp a higher footer as new AGGREGATE encodings ship) RESTORE cleanly here.
-/// This is SOUND because our decoder only reconstructs the type-0 STRING encoding, which is
-/// version-independent (raw / INT8-16-32 / LZF, unchanged for many releases), and rejects any unknown
-/// TYPE byte or string encoding as [`RestoreParseError::BadData`] REGARDLESS of the footer version.
-/// So a v14 non-string blob is still refused on its type byte, not silently mis-decoded; only the
-/// version-stable string case is newly accepted. Our own DUMP still stamps the conservative
-/// `DUMP_RDB_VERSION` for maximum backward RESTORE-ability elsewhere (dump-low, accept-high).
-const SUPPORTED_RDB_VERSION: u16 = 14;
-
-/// The largest value RESTORE will reconstruct: the Redis 512 MiB bulk-string cap
-/// ([bulk-string-max-512mb], KEYSPACE.md). A declared length above this is a hostile/garbage payload,
-/// rejected as [`RestoreParseError::BadData`] BEFORE any allocation, so an attacker cannot make a tiny
-/// blob demand a huge buffer (the LZF `ulen` DoS the review flagged).
-const MAX_RESTORE_VALUE_BYTES: usize = 512 * 1024 * 1024;
-
-/// The ceiling on how much a decoder PRE-allocates from a still-unverified declared length: a legit
-/// value still grows past this via `push`/`extend`, but a tiny blob that lies about its size can never
-/// force more than this up front. The final exact-length check is the correctness gate.
-const DECODE_PREALLOC_CAP: usize = 64 * 1024;
-
-// ---------------------------------------------------------------------------
-// CRC-64 (Jones variant, the Redis DUMP checksum): width 64, poly 0xad93d23594c935a9, reflected in
-// and out, init 0. Validated against the published check value CRC64("123456789") = 0xe9c6d914c4b8d9ca.
-// ---------------------------------------------------------------------------
-
-/// The reflected form of the Jones polynomial (computed once at compile time; the bit-reversal is
-/// checked implicitly by the CRC known-answer test).
-const CRC64_POLY_REFLECTED: u64 = reflect64(0xad93_d235_94c9_35a9);
-
-/// Bit-reverse a 64-bit value (for building the reflected polynomial).
-const fn reflect64(mut x: u64) -> u64 {
-    let mut r = 0u64;
-    let mut i = 0;
-    while i < 64 {
-        r = (r << 1) | (x & 1);
-        x >>= 1;
-        i += 1;
-    }
-    r
-}
-
-/// CRC-64/Jones over `data`, continuing from `crc` (start at 0). The bitwise reflected algorithm; a
-/// byte-at-a-time loop, plenty fast for a bounded DUMP payload and free of any table to get wrong.
-fn crc64(mut crc: u64, data: &[u8]) -> u64 {
-    for &b in data {
-        crc ^= u64::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ CRC64_POLY_REFLECTED
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    crc
-}
-
-// ---------------------------------------------------------------------------
-// RDB length + string encoding.
-// ---------------------------------------------------------------------------
-
-/// Append the RDB length encoding of `len` to `out` (RDB_6BITLEN / RDB_14BITLEN / RDB_32BITLEN /
-/// RDB_64BITLEN). `RDB_ENCVAL` (the `11xxxxxx` special encodings) is only produced on DECODE.
-fn write_rdb_len(out: &mut Vec<u8>, len: u64) {
-    if len < 64 {
-        out.push(len as u8); // 00xxxxxx
-    } else if len < 16384 {
-        out.push(0x40 | (len >> 8) as u8); // 01xxxxxx yyyyyyyy
-        out.push((len & 0xff) as u8);
-    } else if let Ok(len32) = u32::try_from(len) {
-        out.push(0x80); // RDB_32BITLEN, then 4 bytes big-endian
-        out.extend_from_slice(&len32.to_be_bytes());
-    } else {
-        out.push(0x81); // RDB_64BITLEN, then 8 bytes big-endian
-        out.extend_from_slice(&len.to_be_bytes());
-    }
-}
+use crate::rdb::{
+    DUMP_RDB_VERSION, RDB_TYPE_STRING, RestoreParseError, crc64, read_rdb_string, verify_footer,
+    write_rdb_len,
+};
 
 /// Serialize `value` (its raw bytes) as a full DUMP blob: `type || raw-string || version || crc64`.
 #[must_use]
@@ -133,184 +52,6 @@ pub fn serialize_string(value: &[u8]) -> Vec<u8> {
     let crc = crc64(0, &payload);
     payload.extend_from_slice(&crc.to_le_bytes());
     payload
-}
-
-/// A DUMP-payload parse failure, mapped to the byte-exact redis RESTORE error.
-#[derive(Debug, PartialEq, Eq)]
-enum RestoreParseError {
-    /// The footer (version/CRC) is missing, too-new, or the checksum mismatches.
-    BadPayload,
-    /// The payload parsed structurally but its body is not a decodable value (unknown type,
-    /// truncated length, bad LZF, or trailing garbage).
-    BadData,
-}
-
-impl RestoreParseError {
-    fn into_reply(self) -> ErrorReply {
-        match self {
-            RestoreParseError::BadPayload => ErrorReply::restore_bad_payload(),
-            RestoreParseError::BadData => ErrorReply::restore_bad_data(),
-        }
-    }
-}
-
-/// Verify a DUMP blob's footer (version <= supported, CRC-64 matches) and return the value-payload
-/// slice (everything before the 10-byte footer).
-fn verify_footer(blob: &[u8]) -> Result<&[u8], RestoreParseError> {
-    if blob.len() < 11 {
-        // The smallest valid string blob is type(1) + len(1) + empty + version(2) + crc(8) = 12; a
-        // blob shorter than the footer + one type byte cannot be valid.
-        return Err(RestoreParseError::BadPayload);
-    }
-    let footer_at = blob.len() - 10;
-    let version = u16::from_le_bytes([blob[footer_at], blob[footer_at + 1]]);
-    if version > SUPPORTED_RDB_VERSION {
-        return Err(RestoreParseError::BadPayload);
-    }
-    let stored_crc = u64::from_le_bytes(blob[footer_at + 2..].try_into().expect("8 bytes"));
-    // The CRC covers the value bytes AND the 2-byte version (everything except the 8-byte CRC).
-    let computed = crc64(0, &blob[..blob.len() - 8]);
-    if computed != stored_crc {
-        return Err(RestoreParseError::BadPayload);
-    }
-    Ok(&blob[..footer_at])
-}
-
-/// Read an RDB length (or a special `RDB_ENCVAL` marker) from `p` at `*pos`, advancing `*pos`. On a
-/// special encoding, returns `Err`-carried marker via `Ok((len, is_encoded))` where `is_encoded`
-/// means the "length" is actually the encoding type.
-fn read_rdb_len(p: &[u8], pos: &mut usize) -> Result<(u64, bool), RestoreParseError> {
-    let first = *p.get(*pos).ok_or(RestoreParseError::BadData)?;
-    *pos += 1;
-    match first >> 6 {
-        0 => Ok((u64::from(first & 0x3f), false)), // 6-bit
-        1 => {
-            let lo = *p.get(*pos).ok_or(RestoreParseError::BadData)?;
-            *pos += 1;
-            Ok(((u64::from(first & 0x3f) << 8) | u64::from(lo), false)) // 14-bit
-        }
-        2 => {
-            // 0x80 = 32-bit big-endian; 0x81 = 64-bit big-endian.
-            match first {
-                0x80 => {
-                    let b = p.get(*pos..*pos + 4).ok_or(RestoreParseError::BadData)?;
-                    *pos += 4;
-                    Ok((u64::from(u32::from_be_bytes(b.try_into().unwrap())), false))
-                }
-                0x81 => {
-                    let b = p.get(*pos..*pos + 8).ok_or(RestoreParseError::BadData)?;
-                    *pos += 8;
-                    Ok((u64::from_be_bytes(b.try_into().unwrap()), false))
-                }
-                _ => Err(RestoreParseError::BadData),
-            }
-        }
-        _ => Ok((u64::from(first & 0x3f), true)), // 11xxxxxx: RDB_ENCVAL, the low 6 bits are the enc type
-    }
-}
-
-/// Decode an RDB string (raw, the INT8/16/32 special encodings, or LZF compression) at `*pos`.
-fn read_rdb_string(p: &[u8], pos: &mut usize) -> Result<Vec<u8>, RestoreParseError> {
-    let (len_or_enc, is_encoded) = read_rdb_len(p, pos)?;
-    if is_encoded {
-        return match len_or_enc {
-            0 => read_int_string(p, pos, 1), // RDB_ENC_INT8
-            1 => read_int_string(p, pos, 2), // RDB_ENC_INT16
-            2 => read_int_string(p, pos, 4), // RDB_ENC_INT32
-            3 => read_lzf_string(p, pos),    // RDB_ENC_LZF
-            _ => Err(RestoreParseError::BadData),
-        };
-    }
-    let len = usize::try_from(len_or_enc).map_err(|_| RestoreParseError::BadData)?;
-    // checked_add so a hostile length near usize::MAX is a clean BadData, never an overflow panic
-    // (which would fire under overflow-checks builds, i.e. debug + CI).
-    let end = pos.checked_add(len).ok_or(RestoreParseError::BadData)?;
-    let bytes = p.get(*pos..end).ok_or(RestoreParseError::BadData)?;
-    *pos = end;
-    Ok(bytes.to_vec())
-}
-
-/// Decode a little-endian signed integer of `width` bytes, rendered as its DECIMAL ASCII string
-/// (redis stores small integers this way; the RESTOREd value is the number's text, e.g. `12345`).
-fn read_int_string(p: &[u8], pos: &mut usize, width: usize) -> Result<Vec<u8>, RestoreParseError> {
-    let b = p
-        .get(*pos..*pos + width)
-        .ok_or(RestoreParseError::BadData)?;
-    *pos += width;
-    let v: i64 = match width {
-        1 => i64::from(b[0] as i8),
-        2 => i64::from(i16::from_le_bytes([b[0], b[1]])),
-        4 => i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        _ => return Err(RestoreParseError::BadData),
-    };
-    Ok(v.to_string().into_bytes())
-}
-
-/// Decompress an LZF-compressed RDB string: `clen` (compressed len) `ulen` (uncompressed len) then
-/// the LZF stream. LZF is a byte stream of (a) literal runs `0LLLLLLL` + L+1 literal bytes, and (b)
-/// back-references `LLLNNNNN [NNNNNNNN]` copying `len` bytes from `distance` back. Only DECOMPRESSION
-/// is needed (DUMP never compresses); the format is small and validated by a known-answer test.
-fn read_lzf_string(p: &[u8], pos: &mut usize) -> Result<Vec<u8>, RestoreParseError> {
-    let (clen, _) = read_rdb_len(p, pos)?;
-    let (ulen, _) = read_rdb_len(p, pos)?;
-    let clen = usize::try_from(clen).map_err(|_| RestoreParseError::BadData)?;
-    let ulen = usize::try_from(ulen).map_err(|_| RestoreParseError::BadData)?;
-    // Reject an absurd declared output size BEFORE decoding: `ulen` is fully attacker-controlled (a
-    // 64-bit RDB length), so bound it to the value cap so a tiny blob cannot demand a huge buffer.
-    if ulen > MAX_RESTORE_VALUE_BYTES {
-        return Err(RestoreParseError::BadData);
-    }
-    let end = pos.checked_add(clen).ok_or(RestoreParseError::BadData)?;
-    let input = p.get(*pos..end).ok_or(RestoreParseError::BadData)?;
-    *pos = end;
-    let out = lzf_decompress(input, ulen)?;
-    Ok(out)
-}
-
-/// The LZF decompressor (Marc Lehmann's liblzf, the variant Redis vendors). `expected` is the known
-/// output length; a stream that over/under-runs it or references before the start is `BadData`.
-fn lzf_decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, RestoreParseError> {
-    // Pre-allocate only up to a cap: a blob that lies (`expected` huge, stream tiny) grows the vec to
-    // its ACTUAL output and then fails the exact-length gate below, so it can never force a giant
-    // up-front allocation. A legit large value still grows naturally as bytes are pushed.
-    let mut out: Vec<u8> = Vec::with_capacity(expected.min(DECODE_PREALLOC_CAP));
-    let mut i = 0usize;
-    while i < input.len() {
-        let ctrl = input[i] as usize;
-        i += 1;
-        if ctrl < 32 {
-            // A literal run of ctrl+1 bytes.
-            let run = ctrl + 1;
-            let lit = input.get(i..i + run).ok_or(RestoreParseError::BadData)?;
-            out.extend_from_slice(lit);
-            i += run;
-        } else {
-            // A back-reference. High 3 bits of ctrl are (len-1) unless == 7, then an extra length byte.
-            let mut len = ctrl >> 5;
-            if len == 7 {
-                len += *input.get(i).ok_or(RestoreParseError::BadData)? as usize;
-                i += 1;
-            }
-            // Distance: low 5 bits of ctrl (high) + the next byte (low), then +1.
-            let lo = *input.get(i).ok_or(RestoreParseError::BadData)? as usize;
-            i += 1;
-            let distance = ((ctrl & 0x1f) << 8) | lo;
-            let mut ref_pos = out
-                .len()
-                .checked_sub(distance + 1)
-                .ok_or(RestoreParseError::BadData)?;
-            // Copy len+2 bytes, one at a time (ranges can overlap the output being written).
-            for _ in 0..len + 2 {
-                let byte = *out.get(ref_pos).ok_or(RestoreParseError::BadData)?;
-                out.push(byte);
-                ref_pos += 1;
-            }
-        }
-    }
-    if out.len() != expected {
-        return Err(RestoreParseError::BadData);
-    }
-    Ok(out)
 }
 
 /// Parse a DUMP blob (footer-verified) into the STRING value bytes. Rejects a non-string type or
@@ -470,6 +211,7 @@ fn parse_i64(bytes: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdb::SUPPORTED_RDB_VERSION;
     use ironcache_storage::{CountingAccounting, Store};
     use ironcache_store::ShardStore;
 
@@ -493,27 +235,6 @@ mod tests {
     fn seed(store: &mut TestStore, key: &[u8], val: &[u8]) {
         use ironcache_storage::{ExpireWrite, NewValue};
         store.upsert(0, key, NewValue::Bytes(val), ExpireWrite::Clear, NOW);
-    }
-
-    #[test]
-    fn crc64_matches_the_published_jones_check_value() {
-        // The canonical CRC-64/Jones (redis) check: crc64(0, "123456789") = 0xe9c6d914c4b8d9ca.
-        assert_eq!(crc64(0, b"123456789"), 0xe9c6_d914_c4b8_d9ca);
-        assert_eq!(crc64(0, b""), 0);
-    }
-
-    #[test]
-    fn rdb_len_encoding_covers_the_size_classes() {
-        let mut out = Vec::new();
-        write_rdb_len(&mut out, 5);
-        assert_eq!(out, [5]); // 6-bit
-        out.clear();
-        write_rdb_len(&mut out, 300);
-        assert_eq!(out, [0x40 | 1, 44]); // 14-bit: 300 = 0x12C -> (1<<8)|44
-        out.clear();
-        write_rdb_len(&mut out, 100_000);
-        assert_eq!(out[0], 0x80); // 32-bit marker
-        assert_eq!(&out[1..], &100_000u32.to_be_bytes());
     }
 
     #[test]

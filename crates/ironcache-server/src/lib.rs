@@ -38,6 +38,7 @@ pub mod conn;
 pub mod dispatch;
 pub mod glob;
 pub mod notify;
+pub mod rdb;
 pub mod route;
 
 // The ACL engine (#106): the runtime-mutable user registry + the user model + the rule
