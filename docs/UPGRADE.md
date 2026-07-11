@@ -280,6 +280,33 @@ replica is only promotable while its link was up and its lag was `<= replica_max
 preferred for upgrades because it moves ownership with no down-timeout window and no
 write-rejection blip.
 
+### How the clustered driver is verified (#392)
+
+The rolling-upgrade driver's guarantees are checked across layers, because an in-process
+loopback harness cannot deterministically drive a real committed failover, and booting a
+real raft cluster is load-sensitive (flaky as a hard CI gate). The split
+(`crates/ironcache/tests/cluster_upgrade_live.rs`):
+
+- **Always-on CI gate -- the FREEZE** (`freeze_seam_holds_a_real_write`): on a MINIMAL
+  single-node server (no raft, no formation, so deterministic) the driver's exact freeze
+  seam (`CLIENT PAUSE <ms> WRITE` via the shipped `Pauser`) is shown to HOLD a live
+  concurrent write (no `+OK`) until `CLIENT UNPAUSE`, then release + apply it. This is the
+  reliable hard gate for the load-bearing RPO=0 mechanism the failover-freeze fence uses.
+- **On-demand full live acceptance** (`live_cluster_upgrade_acceptance`, `#[ignore]`):
+  against a REAL 3-node raft cluster it proves real OBSERVE (the `INFO` / `CLUSTER INFO`
+  parse assembles a correct cluster view) and primary-last SEQUENCING (both replicas
+  upgraded before the primary, exactly one failover, `old_primary_id` fixed, terminates
+  completed; the promotion EFFECT is made controllable since a loopback self-promotion is
+  not deterministic). It PASSES when run but is gated off the default CI run (load-sensitive
+  formation timing); run with `cargo test -- --ignored` / nightly.
+- **DST promotion correctness**: the committed-promotion semantics (at most one owner per
+  epoch across partition/heal timelines) are proven exhaustively by the deterministic
+  split-brain gate `ironcache_raft::tests::failover_split_brain_gate`, not on a live cluster.
+- **Docker smoke (local, not CI)**: a real committed promotion under sustained traffic plus
+  the adversarial no-freeze control (which must SHOW acked-write loss when the freeze is
+  disabled) are a docker-harness follow-up that exercises the real RESP transport and the
+  real binary swap end to end.
+
 ---
 
 ## Verify the new version took over
