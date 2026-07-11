@@ -878,9 +878,11 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
         }
     }
 
-    // SET, HASH, ZSET, and LIST values are SEPARATE helpers (below): DUMP of an aggregate is not yet
-    // implemented on IronCache, so each parity check is one-directional (redis DUMP -> IronCache
-    // RESTORE) and does not fit the bidirectional loop above.
+    // SET, HASH, ZSET, and LIST values are SEPARATE helpers (below): they do not fit the simple
+    // SET/GET bidirectional loop above (each needs its own build + read-back commands). SET/HASH/ZSET
+    // DUMP is now implemented on IronCache, so those three check BOTH directions (redis DUMP ->
+    // IronCache RESTORE and IronCache DUMP -> redis RESTORE); LIST DUMP is still a tracked follow-up, so
+    // the list check stays one-directional (redis DUMP -> IronCache RESTORE).
     compared += set_dump_restore_interop(iron, rds, div);
     compared += hash_dump_restore_interop(iron, rds, div);
     compared += zset_dump_restore_interop(iron, rds, div);
@@ -889,12 +891,13 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
     compared
 }
 
-/// The SET half of the DUMP/RESTORE parity check (#612 SET RESTORE). ONE-DIRECTIONAL (r2i only): DUMP
-/// of a set is not yet implemented on IronCache (still a typed "unsupported" error), so we exercise
-/// the real-Redis DUMP -> IronCache RESTORE direction, which is exactly the migration path that
-/// matters. We force each of redis's three set encodings and assert the RESTOREd members match. When
-/// DUMP(set) lands (a later #612 phase) the i2r direction can be added here too. Returns the number of
-/// comparisons made; a mismatch is pushed onto `div`.
+/// The SET half of the DUMP/RESTORE parity check (#612 SET). BIDIRECTIONAL now that DUMP(set) is
+/// implemented. r2i (real-Redis DUMP -> IronCache RESTORE) forces each of redis's three set encodings
+/// and asserts the RESTOREd members match -- the migration path that matters. i2r (IronCache DUMP ->
+/// redis RESTORE) proves a REAL redis loads a blob WE emit: we build each case on IronCache (its own
+/// internal encoding is irrelevant, since DUMP always emits the plain `RDB_TYPE_SET`), DUMP it here,
+/// RESTORE into redis, and assert redis's `SMEMBERS` matches. Returns the number of comparisons made;
+/// a mismatch is pushed onto `div`.
 fn set_dump_restore_interop(
     iron: &mut Client,
     rds: &mut Client,
@@ -965,17 +968,48 @@ fn set_dump_restore_interop(
             });
         }
     }
+    // i2r: IronCache DUMP -> redis RESTORE. Build on IronCache, DUMP here, RESTORE into redis, compare.
+    for (enc, members) in &set_cases {
+        let src_key = format!("dr:set:{enc}:i2r:src").into_bytes();
+        let dst_key = format!("dr:set:{enc}:i2r:dst").into_bytes();
+        let mut sadd: Vec<&[u8]> = vec![b"SADD", &src_key];
+        sadd.extend(members.iter().map(std::vec::Vec::as_slice));
+        iron.cmd(&sadd);
+        let Some(blob) = bulk_bytes(&iron.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP(iron) set {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "IronCache DUMP of a set did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = rds.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let redis_reply = rds.cmd(&[b"SMEMBERS", &dst_key]);
+        let iron_reply = iron.cmd(&[b"SMEMBERS", &src_key]);
+        compared += 1;
+        if sorted_members(&redis_reply).is_none()
+            || sorted_members(&redis_reply) != sorted_members(&iron_reply)
+        {
+            div.push(Divergence {
+                cmd: format!("SET DUMP(iron)->RESTORE(redis) {enc}; RESTORE said {restore:?}"),
+                iron: iron_reply,
+                redis: redis_reply,
+                note: "a set DUMPed by IronCache did not RESTORE to the same members on redis (#612 SET DUMP)".to_owned(),
+            });
+        }
+    }
     compared
 }
 
-/// The HASH half of the DUMP/RESTORE parity check (#612 HASH RESTORE). ONE-DIRECTIONAL (r2i only):
-/// DUMP of a hash is not yet implemented on IronCache (still a typed "unsupported" error), so we
-/// exercise the real-Redis DUMP -> IronCache RESTORE direction, exactly the migration path that
-/// matters. We force BOTH of redis's non-field-TTL hash encodings -- `listpack` for a small hash and
-/// the plain `RDB_TYPE_HASH` (hashtable) for one with a long value -- and assert the RESTOREd
-/// field/value pairs AND `HLEN` match. The field-TTL hash encodings are a later #612 phase. When
-/// DUMP(hash) lands the i2r direction can be added here too. Returns the number of comparisons made; a
-/// mismatch is pushed onto `div`.
+/// The HASH half of the DUMP/RESTORE parity check (#612 HASH). BIDIRECTIONAL now that DUMP(hash) is
+/// implemented. r2i (real-Redis DUMP -> IronCache RESTORE) forces BOTH of redis's non-field-TTL hash
+/// encodings -- `listpack` for a small hash and the plain `RDB_TYPE_HASH` (hashtable) for one with a
+/// long value -- and asserts the RESTOREd field/value pairs AND `HLEN` match. i2r (IronCache DUMP ->
+/// redis RESTORE) builds each case on IronCache (its internal encoding is irrelevant, since DUMP always
+/// emits the plain `RDB_TYPE_HASH` with no field TTLs), DUMPs it here, RESTOREs into redis, and asserts
+/// redis's `HGETALL` + `HLEN` match. The field-TTL hash encodings are a later #612 phase. Returns the
+/// number of comparisons made; a mismatch is pushed onto `div`.
 fn hash_dump_restore_interop(
     iron: &mut Client,
     rds: &mut Client,
@@ -1040,17 +1074,55 @@ fn hash_dump_restore_interop(
             });
         }
     }
+    // i2r: IronCache DUMP -> redis RESTORE. Build on IronCache, DUMP here, RESTORE into redis, compare.
+    for (enc, pairs) in &hash_cases {
+        let src_key = format!("dr:hash:{enc}:i2r:src").into_bytes();
+        let dst_key = format!("dr:hash:{enc}:i2r:dst").into_bytes();
+        let mut hset: Vec<&[u8]> = vec![b"HSET", &src_key];
+        for (f, v) in pairs {
+            hset.push(f.as_slice());
+            hset.push(v.as_slice());
+        }
+        iron.cmd(&hset);
+        let Some(blob) = bulk_bytes(&iron.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP(iron) hash {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "IronCache DUMP of a hash did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = rds.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let redis_reply = rds.cmd(&[b"HGETALL", &dst_key]);
+        let iron_reply = iron.cmd(&[b"HGETALL", &src_key]);
+        let redis_len = rds.cmd(&[b"HLEN", &dst_key]);
+        let iron_len = iron.cmd(&[b"HLEN", &src_key]);
+        compared += 1;
+        if sorted_pairs(&redis_reply).is_none()
+            || sorted_pairs(&redis_reply) != sorted_pairs(&iron_reply)
+            || redis_len != iron_len
+        {
+            div.push(Divergence {
+                cmd: format!("HASH DUMP(iron)->RESTORE(redis) {enc}; RESTORE said {restore:?}"),
+                iron: iron_reply,
+                redis: redis_reply,
+                note: "a hash DUMPed by IronCache did not RESTORE to the same fields on redis (#612 HASH DUMP)".to_owned(),
+            });
+        }
+    }
     compared
 }
 
-/// The ZSET half of the DUMP/RESTORE parity check (#612 ZSET RESTORE). ONE-DIRECTIONAL (r2i only):
-/// DUMP of a zset is not yet implemented on IronCache (still a typed "unsupported" error), so we
-/// exercise the real-Redis DUMP -> IronCache RESTORE direction, exactly the migration path that
-/// matters. We force BOTH of redis's sorted-set encodings -- `listpack` for a small zset and the
-/// `skiplist` (which DUMPs as `RDB_TYPE_ZSET_2`, 8-byte binary-double scores) for a large one -- with
-/// a FRACTIONAL score, a LARGE score, a NEGATIVE score, and +inf/-inf, and assert `ZRANGE 0 -1
-/// WITHSCORES` (deterministic (score, member) order, all scores distinct) AND `ZCARD` match. When
-/// DUMP(zset) lands the i2r direction can be added here too. Returns the number of comparisons made; a
+/// The ZSET half of the DUMP/RESTORE parity check (#612 ZSET). BIDIRECTIONAL now that DUMP(zset) is
+/// implemented. r2i (real-Redis DUMP -> IronCache RESTORE) forces BOTH of redis's sorted-set encodings
+/// -- `listpack` for a small zset and the `skiplist` (which DUMPs as `RDB_TYPE_ZSET_2`, 8-byte
+/// binary-double scores) for a large one -- with a FRACTIONAL score, a LARGE score, a NEGATIVE score,
+/// and +inf/-inf, and asserts `ZRANGE 0 -1 WITHSCORES` (deterministic (score, member) order, all scores
+/// distinct) AND `ZCARD` match. i2r (IronCache DUMP -> redis RESTORE) builds each case on IronCache
+/// (its internal encoding is irrelevant, since DUMP always emits `RDB_TYPE_ZSET_2` binary-double
+/// scores, and +inf/-inf round-trip through the raw bytes), DUMPs it here, RESTOREs into redis, and
+/// asserts redis's `ZRANGE ... WITHSCORES` + `ZCARD` match. Returns the number of comparisons made; a
 /// mismatch is pushed onto `div`.
 fn zset_dump_restore_interop(
     iron: &mut Client,
@@ -1122,6 +1194,41 @@ fn zset_dump_restore_interop(
                 iron: iron_reply,
                 redis: redis_reply,
                 note: "a zset DUMPed by redis did not RESTORE to the same members/scores on IronCache (#612 ZSET)".to_owned(),
+            });
+        }
+    }
+    // i2r: IronCache DUMP -> redis RESTORE. Build on IronCache, DUMP here, RESTORE into redis, compare.
+    for (enc, pairs) in &zset_cases {
+        let src_key = format!("dr:zset:{enc}:i2r:src").into_bytes();
+        let dst_key = format!("dr:zset:{enc}:i2r:dst").into_bytes();
+        let mut zadd: Vec<&[u8]> = vec![b"ZADD", &src_key];
+        for (m, sc) in pairs {
+            // ZADD takes score BEFORE member.
+            zadd.push(sc.as_slice());
+            zadd.push(m.as_slice());
+        }
+        iron.cmd(&zadd);
+        let Some(blob) = bulk_bytes(&iron.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP(iron) zset {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "IronCache DUMP of a zset did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = rds.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let redis_reply = rds.cmd(&[b"ZRANGE", &dst_key, b"0", b"-1", b"WITHSCORES"]);
+        let iron_reply = iron.cmd(&[b"ZRANGE", &src_key, b"0", b"-1", b"WITHSCORES"]);
+        let redis_card = rds.cmd(&[b"ZCARD", &dst_key]);
+        let iron_card = iron.cmd(&[b"ZCARD", &src_key]);
+        compared += 1;
+        if redis_reply != iron_reply || redis_card != iron_card {
+            div.push(Divergence {
+                cmd: format!("ZSET DUMP(iron)->RESTORE(redis) {enc}; RESTORE said {restore:?}"),
+                iron: iron_reply,
+                redis: redis_reply,
+                note: "a zset DUMPed by IronCache did not RESTORE to the same members/scores on redis (#612 ZSET DUMP)".to_owned(),
             });
         }
     }

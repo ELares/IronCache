@@ -11,10 +11,21 @@
 //!
 //! ## Scope
 //!
-//! DUMP (encode) emits the STRING type (`RDB_TYPE_STRING = 0`) only. Because a HyperLogLog is stored
-//! AS a string (`cmd_hll`), this gives HLL DUMP/RESTORE byte-interop for free (#242 part 2: an HLL
-//! DUMPed here RESTOREs + PFCOUNTs identically on redis). DUMP of a non-string value is still a typed
-//! "unsupported" error rather than a wrong blob.
+//! DUMP (encode) emits the STRING type (`RDB_TYPE_STRING = 0`), and the SET, HASH, and ZSET aggregate
+//! types in their PLAIN RDB forms -- `RDB_TYPE_SET` (2), `RDB_TYPE_HASH` (4), and `RDB_TYPE_ZSET_2` (5,
+//! 8-byte little-endian binary-double scores). Because a HyperLogLog is stored AS a string (`cmd_hll`),
+//! the string path also gives HLL DUMP/RESTORE byte-interop for free (#242 part 2: an HLL DUMPed here
+//! RESTOREs + PFCOUNTs identically on redis).
+//!
+//! We emit the PLAIN forms (never the compact intset/listpack/skiplist encodings) because redis's
+//! RESTORE accepts `RDB_TYPE_SET` / `RDB_TYPE_HASH` / `RDB_TYPE_ZSET_2` at ANY cardinality -- the
+//! compact encodings are a SIZE optimization, not a correctness requirement -- so a plain-form blob is
+//! ALWAYS valid and always redis-loadable, regardless of the value's internal encoding on our side. Our
+//! footer stamps the conservative [`DUMP_RDB_VERSION`] and RESTORE compatibility is dump-low/accept-high
+//! (a modern redis is a higher RDB version >= 9), so a real redis accepts our blobs. (A future PR could
+//! emit the compact forms as a size optimization; out of scope here.) DUMP of a LIST is still a typed
+//! "unsupported" error rather than a wrong blob: the plain list form needs a listpack WRITER, which is
+//! a tracked follow-up (#612); DUMP of the STREAM type is likewise not yet emitted.
 //!
 //! RESTORE (decode) additionally accepts the SET type in all three RDB encodings -- the plain
 //! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- the HASH type in
@@ -64,7 +75,7 @@ use crate::rdb::{
     RDB_TYPE_SET_LISTPACK, RDB_TYPE_STRING, RDB_TYPE_ZSET, RDB_TYPE_ZSET_2, RDB_TYPE_ZSET_LISTPACK,
     RestoreParseError, crc64, intset_iter, listpack_iter, parse_ascii_double,
     read_rdb_ascii_double, read_rdb_binary_double, read_rdb_len, read_rdb_string, verify_footer,
-    write_rdb_len,
+    write_rdb_len, write_rdb_string,
 };
 
 /// A decoded hash's `(field, value)` pairs in stream order (a repeated field is resolved last-wins by
@@ -77,6 +88,15 @@ type HashPairs = Vec<(Vec<u8>, Vec<u8>)>;
 /// [`deserialize_zset`] signature under the `type_complexity` lint, mirroring [`HashPairs`].
 type ZSetPairs = Vec<(Vec<u8>, f64)>;
 
+/// Stamp the DUMP footer onto a `type || body` payload: append the little-endian [`DUMP_RDB_VERSION`]
+/// and then the little-endian CRC-64 (which covers the body AND the version), exactly as redis's DUMP
+/// does. Shared by every `serialize_*` so the footer is written in ONE place.
+fn push_dump_footer(payload: &mut Vec<u8>) {
+    payload.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+    let crc = crc64(0, payload);
+    payload.extend_from_slice(&crc.to_le_bytes());
+}
+
 /// Serialize `value` (its raw bytes) as a full DUMP blob: `type || raw-string || version || crc64`.
 #[must_use]
 pub fn serialize_string(value: &[u8]) -> Vec<u8> {
@@ -84,9 +104,67 @@ pub fn serialize_string(value: &[u8]) -> Vec<u8> {
     payload.push(RDB_TYPE_STRING);
     write_rdb_len(&mut payload, value.len() as u64);
     payload.extend_from_slice(value);
-    payload.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
-    let crc = crc64(0, &payload);
-    payload.extend_from_slice(&crc.to_le_bytes());
+    push_dump_footer(&mut payload);
+    payload
+}
+
+/// Serialize a SET as a full DUMP blob in the PLAIN `RDB_TYPE_SET` form: the type byte, the member
+/// COUNT (an RDB length), then each member as a raw RDB string ([`write_rdb_string`]), then the
+/// version + CRC-64 footer. The plain form is always redis-loadable regardless of our internal set
+/// encoding (see the module-level "Scope" note); the compact intset/listpack forms are a deferred
+/// size optimization. `members` is the [`ironcache_storage::SetValue::members`] snapshot, taken as a
+/// borrowed slice so there is no needless clone.
+#[must_use]
+pub fn serialize_set(members: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload = vec![RDB_TYPE_SET];
+    write_rdb_len(&mut payload, members.len() as u64);
+    for member in members {
+        write_rdb_string(&mut payload, member);
+    }
+    push_dump_footer(&mut payload);
+    payload
+}
+
+/// Serialize a HASH as a full DUMP blob in the PLAIN `RDB_TYPE_HASH` form: the type byte, the
+/// field/value PAIR count (an RDB length), then each pair as TWO raw RDB strings (field then value),
+/// then the version + CRC-64 footer. Plain-form rationale as for [`serialize_set`]; a plain hash
+/// carries NO field TTLs (the field-TTL encodings are a separate tracked follow-up). `pairs` is the
+/// [`ironcache_storage::HashValue::pairs`] snapshot, borrowed to avoid a clone.
+#[must_use]
+pub fn serialize_hash(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut payload = vec![RDB_TYPE_HASH];
+    write_rdb_len(&mut payload, pairs.len() as u64);
+    for (field, value) in pairs {
+        write_rdb_string(&mut payload, field);
+        write_rdb_string(&mut payload, value);
+    }
+    push_dump_footer(&mut payload);
+    payload
+}
+
+/// Serialize a ZSET as a full DUMP blob in the `RDB_TYPE_ZSET_2` form (the modern binary-double
+/// scores): the type byte, the member COUNT (an RDB length), then each member as a raw RDB string
+/// ([`write_rdb_string`]) followed by its 8-byte LITTLE-ENDIAN IEEE754 `binary64` score
+/// (`score.to_le_bytes()`, the exact bytes [`read_rdb_binary_double`] reads back), then the version +
+/// CRC-64 footer. Plain-form rationale as for [`serialize_set`]. `members` is the
+/// [`ironcache_storage::ZSetValue::members_with_scores`] snapshot, borrowed to avoid a clone.
+///
+/// A +inf / -inf score round-trips through `to_le_bytes` verbatim. A NaN score can NEVER reach here:
+/// ZADD refuses a NaN on input and RESTORE refuses a NaN-scored element, so the store never holds one;
+/// the `debug_assert` documents (and, in a debug build, enforces) that invariant.
+#[must_use]
+pub fn serialize_zset(members: &[(Vec<u8>, f64)]) -> Vec<u8> {
+    let mut payload = vec![RDB_TYPE_ZSET_2];
+    write_rdb_len(&mut payload, members.len() as u64);
+    for (member, score) in members {
+        debug_assert!(
+            !score.is_nan(),
+            "a NaN zset score is rejected on input (ZADD / RESTORE), so it is never stored or dumped"
+        );
+        write_rdb_string(&mut payload, member);
+        payload.extend_from_slice(&score.to_le_bytes());
+    }
+    push_dump_footer(&mut payload);
     payload
 }
 
@@ -527,21 +605,61 @@ fn deserialize_list(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
 // ---------------------------------------------------------------------------
 
 /// `DUMP key` -> the serialized value as a bulk string, or the null bulk string for a missing key.
-/// WRONGTYPE-style unsupported for a non-string value type (only the STRING type is serialized in
-/// this slice; an HLL is a string, so it works). READ-ONLY.
+/// Serializes the STRING type (an HLL is a string, so it works too) and the SET / HASH / ZSET
+/// aggregate types in their plain RDB forms; DUMP of a LIST (or a STREAM) is still a typed
+/// "unsupported" error rather than a wrong blob (LIST DUMP needs a listpack writer, a tracked
+/// follow-up). DUMP has no WRONGTYPE (it serializes whatever type is present). READ-ONLY: a
+/// STRING serializes straight from the read view, and a collection is read through the typed
+/// mutable view with [`RmwAction::Keep`] (the established read-via-`rmw_mut` pattern), so no
+/// write / dirty / replication happens.
 pub fn cmd_dump<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("dump"));
     }
-    match store.read(db, &req.args[1], now) {
+    let key = &req.args[1];
+    // A STRING (and thus an HLL) serializes directly from the read view's bytes, unchanged from the
+    // original string-only path; a missing key is the null bulk. The collection accessors live only on
+    // the typed MUTABLE view (`OccupiedEntryMut` carries no string-bytes accessor), so a NON-string
+    // value falls through to the `rmw_mut` read below. The read borrow ends before that call.
+    match store.read(db, key, now) {
+        None => return Value::Null,
         Some(v) if v.data_type() == DataType::String => {
-            Value::BulkString(Some(Bytes::from(serialize_string(v.as_bytes()))))
+            return Value::BulkString(Some(Bytes::from(serialize_string(v.as_bytes()))));
         }
-        Some(_) => Value::error(ErrorReply::err(
-            "DUMP of this value type is not yet supported (string only)",
-        )),
-        None => Value::Null,
+        Some(_) => {}
     }
+    // A collection: read its contents through the typed mutable view and encode the matching plain RDB
+    // form. `Keep` means no mutation, so this is a pure read despite using `rmw_mut`.
+    store.rmw_mut(db, key, now, |entry| {
+        let reply = match entry {
+            // The store is held `&mut` for the whole command, so a value present at the `read` above is
+            // still present here (nothing runs between the two calls on this core); `Vacant` is only a
+            // defensive fallback and maps to the missing-key null.
+            RmwEntry::Vacant => Value::Null,
+            RmwEntry::OccupiedMut(mut o) => match o.data_type() {
+                DataType::Set => o.as_set_mut().map_or(Value::Null, |s| {
+                    Value::BulkString(Some(Bytes::from(serialize_set(&s.members()))))
+                }),
+                DataType::Hash => o.as_hash_mut().map_or(Value::Null, |h| {
+                    Value::BulkString(Some(Bytes::from(serialize_hash(&h.pairs()))))
+                }),
+                DataType::ZSet => o.as_zset_mut().map_or(Value::Null, |z| {
+                    Value::BulkString(Some(Bytes::from(serialize_zset(&z.members_with_scores()))))
+                }),
+                // LIST DUMP needs a listpack writer and is a tracked follow-up (#612); STREAM DUMP is
+                // likewise not emitted yet. A STRING here would be the impossible race noted above.
+                DataType::List | DataType::Stream | DataType::String => Value::error(
+                    ErrorReply::err("DUMP of this value type is not yet supported"),
+                ),
+            },
+            RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+        };
+        RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply,
+        }
+    })
 }
 
 /// `RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ freq]` -> `+OK`.
@@ -2198,5 +2316,280 @@ mod tests {
             "-ERR Bad data format"
         );
         assert!(s.read(0, b"z", NOW).is_none(), "no key must be created");
+    }
+
+    // ---- SET / HASH / ZSET DUMP (#612 phase 7): the plain RDB encode side. ----
+    //
+    // These prove the DUMP encoders (`serialize_set` / `serialize_hash` / `serialize_zset`) emit a
+    // valid, RESTORE-able blob for every element/encoding, complementing the RESTORE tests above.
+    // The PRIMARY check is a round trip THROUGH THE STORE: seed a value in its natural internal
+    // encoding, `cmd_dump` it, `cmd_restore` the blob into a fresh key, and assert the reconstructed
+    // value equals the original (order-insensitive for set/hash; exact (score, member) for zset). A
+    // golden byte-layout test then pins the exact encoder output. NOTE the empty-collection invariant:
+    // the store deletes a key the moment its collection becomes empty (Redis semantics), so DUMP never
+    // observes an empty set/hash/zset -- there is no empty aggregate blob to emit or test.
+
+    /// Seed a collection value at `key` by building it through the store's create path (the same
+    /// [`NewValueOwned`] build RESTORE uses, so the store applies its encoding ladder), WITHOUT going
+    /// through a blob decode. This lets a DUMP test start from a value in its NATURAL internal encoding
+    /// (a large set/hash/zset lands in the hashtable/skiplist form), proving the encoder reads EVERY
+    /// element regardless of the source encoding.
+    fn seed_value(store: &mut TestStore, key: &[u8], value: NewValueOwned) {
+        store.rmw(0, key, NOW, move |_entry| RmwStep {
+            action: RmwAction::Replace(value),
+            expire: ExpireWrite::Clear,
+            reply: (),
+        });
+    }
+
+    /// `DUMP key` -> the raw blob bytes (panics if DUMP did not return a bulk string).
+    fn dump_blob(store: &mut TestStore, key: &[u8]) -> Bytes {
+        match cmd_dump(store, 0, NOW, &req(&[b"DUMP", key])) {
+            Value::BulkString(Some(b)) => b,
+            other => panic!("DUMP should be a bulk string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dump_set_round_trips_edge_element_bytes() {
+        // Edge members: an empty string, binary bytes (a NUL + high bytes), a > 64-byte member, and an
+        // integer-looking member -- each must survive DUMP -> RESTORE verbatim.
+        let mut s = test_store();
+        let members = vec![
+            b"".to_vec(),
+            vec![0u8, 1, 255, 200, b'x'],
+            vec![b'q'; 80],
+            b"12345".to_vec(),
+            b"plain".to_vec(),
+        ];
+        seed_value(&mut s, b"src", NewValueOwned::Set(members.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        // Order-insensitive membership equality, and every original member survives verbatim.
+        assert_eq!(set_members(&mut s, b"dst"), set_members(&mut s, b"src"));
+        assert_eq!(
+            set_members(&mut s, b"dst"),
+            members.into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn dump_set_round_trips_large_hashtable_encoding() {
+        // Enough members to force the hashtable encoding on our side: the encoder must read EVERY
+        // element through `members()`, independent of the source internal encoding.
+        let mut s = test_store();
+        let members: Vec<Vec<u8>> = (0..500)
+            .map(|i| format!("member-{i}").into_bytes())
+            .collect();
+        seed_value(&mut s, b"src", NewValueOwned::Set(members.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        let got = set_members(&mut s, b"dst");
+        assert_eq!(got.len(), 500); // SCARD
+        assert_eq!(got, members.into_iter().collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    fn dump_hash_round_trips_edge_pairs() {
+        // Edge fields/values: an empty field AND value, a binary value, a > 64-byte value, and an
+        // integer-looking value.
+        let mut s = test_store();
+        let pairs = vec![
+            (b"".to_vec(), b"".to_vec()),
+            (b"bin".to_vec(), vec![0u8, 7, 255, 128]),
+            (b"big".to_vec(), vec![b'x'; 80]),
+            (b"num".to_vec(), b"12345".to_vec()),
+            (b"name".to_vec(), b"bob".to_vec()),
+        ];
+        seed_value(&mut s, b"src", NewValueOwned::Hash(pairs.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(hash_pairs(&mut s, b"dst"), hash_pairs(&mut s, b"src"));
+        assert_eq!(
+            hash_pairs(&mut s, b"dst"),
+            pairs.into_iter().collect::<BTreeMap<_, _>>()
+        );
+    }
+
+    #[test]
+    fn dump_hash_round_trips_large_hashtable_encoding() {
+        let mut s = test_store();
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..500)
+            .map(|i| (format!("f{i}").into_bytes(), format!("v{i}").into_bytes()))
+            .collect();
+        seed_value(&mut s, b"src", NewValueOwned::Hash(pairs.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"dst");
+        assert_eq!(got.len(), 500); // HLEN
+        assert_eq!(got, pairs.into_iter().collect::<BTreeMap<_, _>>());
+    }
+
+    #[test]
+    fn dump_zset_round_trips_score_edges() {
+        // Score edges: negative, fractional, 0.0, +inf, -inf, and a very large finite score -- each
+        // must survive DUMP -> RESTORE with EXACT equality (the 8-byte binary-double is byte-for-byte).
+        let mut s = test_store();
+        let pairs = vec![
+            (b"neg".to_vec(), -3.5_f64),
+            (b"frac".to_vec(), 1.25),
+            (b"zero".to_vec(), 0.0),
+            (b"pinf".to_vec(), f64::INFINITY),
+            (b"ninf".to_vec(), f64::NEG_INFINITY),
+            (b"huge".to_vec(), 1.0e300),
+        ];
+        seed_value(&mut s, b"src", NewValueOwned::ZSet(pairs.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        // The full (score, member)-ordered snapshot matches, and each ZSCORE is bit-exact.
+        assert_eq!(zset_ordered(&mut s, b"dst"), zset_ordered(&mut s, b"src"));
+        for (member, score) in &pairs {
+            assert_eq!(
+                zset_score(&mut s, b"dst", member),
+                Some(*score),
+                "score for {member:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_zset_round_trips_large_skiplist_encoding() {
+        let mut s = test_store();
+        let pairs: Vec<(Vec<u8>, f64)> = (0..300)
+            .map(|i| (format!("m{i:04}").into_bytes(), f64::from(i) + 0.5))
+            .collect();
+        seed_value(&mut s, b"src", NewValueOwned::ZSet(pairs.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        let got = zset_ordered(&mut s, b"dst");
+        assert_eq!(got.len(), 300); // ZCARD
+        assert_eq!(got, zset_ordered(&mut s, b"src"));
+    }
+
+    #[test]
+    fn serialize_set_golden_byte_layout() {
+        // A two-member set {"a","bc"}: type(2), count(2), then each member as a raw RDB string
+        // (len-prefix + bytes), then the version + CRC-64 footer. Pin the exact body; the CRC itself is
+        // validated by rdb's known-answer test, so recomputing it here only checks that the encoder
+        // feeds the right bytes into the footer.
+        let blob = serialize_set(&[b"a".to_vec(), b"bc".to_vec()]);
+        let mut expect = vec![RDB_TYPE_SET, 2, 1, b'a', 2, b'b', b'c'];
+        let body_len = expect.len();
+        expect.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        expect.extend_from_slice(&crc64(0, &expect).to_le_bytes());
+        assert_eq!(blob, expect);
+        // The footer verifies and recovers exactly `type || body`.
+        assert_eq!(verify_footer(&blob).unwrap(), &expect[..body_len]);
+    }
+
+    #[test]
+    fn serialize_hash_golden_byte_layout() {
+        // A one-pair hash {"f":"vv"}: type(4), PAIR count(1), field string then value string.
+        let blob = serialize_hash(&[(b"f".to_vec(), b"vv".to_vec())]);
+        let mut expect = vec![RDB_TYPE_HASH, 1, 1, b'f', 2, b'v', b'v'];
+        let body_len = expect.len();
+        expect.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        expect.extend_from_slice(&crc64(0, &expect).to_le_bytes());
+        assert_eq!(blob, expect);
+        assert_eq!(verify_footer(&blob).unwrap(), &expect[..body_len]);
+    }
+
+    #[test]
+    fn serialize_zset_golden_byte_layout() {
+        // A one-member zset {"m":1.5}: type(5, ZSET_2), member count(1), member string, then the
+        // 8-byte little-endian binary-double score.
+        let blob = serialize_zset(&[(b"m".to_vec(), 1.5)]);
+        let mut expect = vec![RDB_TYPE_ZSET_2, 1, 1, b'm'];
+        expect.extend_from_slice(&1.5_f64.to_le_bytes());
+        let body_len = expect.len();
+        expect.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        expect.extend_from_slice(&crc64(0, &expect).to_le_bytes());
+        assert_eq!(blob, expect);
+        assert_eq!(verify_footer(&blob).unwrap(), &expect[..body_len]);
+        // A +inf score round-trips through to_le_bytes verbatim (the documented non-finite invariant).
+        let inf = serialize_zset(&[(b"p".to_vec(), f64::INFINITY)]);
+        assert_eq!(
+            deserialize_zset(&inf).unwrap(),
+            vec![(b"p".to_vec(), f64::INFINITY)]
+        );
+    }
+
+    #[test]
+    fn dump_aggregate_blob_footer_verifies_and_a_flipped_byte_is_rejected() {
+        // Every aggregate DUMP blob carries the same version + CRC-64 footer as a string blob: it
+        // verifies clean, and flipping a CRC byte makes RESTORE reject it (checksum mismatch), creating
+        // NO key.
+        let mut s = test_store();
+        seed_value(
+            &mut s,
+            b"set",
+            NewValueOwned::Set(vec![b"a".to_vec(), b"b".to_vec()]),
+        );
+        seed_value(
+            &mut s,
+            b"hash",
+            NewValueOwned::Hash(vec![(b"f".to_vec(), b"v".to_vec())]),
+        );
+        seed_value(
+            &mut s,
+            b"zset",
+            NewValueOwned::ZSet(vec![(b"m".to_vec(), 2.5)]),
+        );
+        for key in [&b"set"[..], b"hash", b"zset"] {
+            let clean = dump_blob(&mut s, key);
+            assert!(verify_footer(&clean).is_ok(), "{key:?} footer must verify");
+            let mut bad = clean.to_vec();
+            let last = bad.len() - 1;
+            bad[last] ^= 0xff; // flip a CRC byte
+            assert!(
+                matches!(
+                    cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"corrupt", b"0", &bad])),
+                    Value::Error(_)
+                ),
+                "a corrupted {key:?} blob must be rejected"
+            );
+            assert!(
+                s.read(0, b"corrupt", NOW).is_none(),
+                "no key from a corrupted {key:?} blob"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_of_a_list_is_still_unsupported() {
+        // LIST DUMP needs a listpack writer (a tracked #612 follow-up), so it stays a typed error,
+        // never a wrong blob. RESTORE of a real list already works (see the LIST RESTORE tests).
+        let mut s = test_store();
+        seed_value(
+            &mut s,
+            b"l",
+            NewValueOwned::List(vec![b"a".to_vec(), b"b".to_vec()]),
+        );
+        let err = cmd_dump(&mut s, 0, NOW, &req(&[b"DUMP", b"l"]));
+        assert_eq!(
+            match err {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-ERR DUMP of this value type is not yet supported"
+        );
     }
 }
