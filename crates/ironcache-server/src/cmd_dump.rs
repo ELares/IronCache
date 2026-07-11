@@ -17,10 +17,14 @@
 //! "unsupported" error rather than a wrong blob.
 //!
 //! RESTORE (decode) additionally accepts the SET type in all three RDB encodings -- the plain
-//! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- so a set DUMPed by a
-//! real redis RESTOREs here with identical members (#612 phase; DUMP of a set stays deferred). The
-//! remaining aggregate types (list/hash/zset) RESTORE is the tracked follow-up; a type we do not yet
-//! decode is refused as bad data, never mis-decoded.
+//! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- and the HASH type in
+//! its two non-field-TTL RDB encodings -- the plain `RDB_TYPE_HASH` and the `RDB_TYPE_HASH_LISTPACK`
+//! -- so a set OR a (non-field-TTL) hash DUMPed by a real redis RESTOREs here with identical
+//! members/fields (#612 phase; DUMP of an aggregate stays deferred). The field-TTL hash encodings
+//! (`RDB_TYPE_HASH_LISTPACK_EX`, `RDB_TYPE_HASH_METADATA`, and their pre-GA forms) are a tracked
+//! follow-up (#612 PR4) and are refused as bad data for now rather than half-decoded (a field TTL is
+//! never silently dropped). The remaining aggregate types (list/zset) RESTORE is the tracked
+//! follow-up; a type we do not yet decode is refused as bad data, never mis-decoded.
 //!
 //! The reusable RDB codec substrate (the CRC-64 footer, the RDB length + string encodings, and the
 //! container element iterators the aggregate types build on) lives in [`crate::rdb`]; this slice is
@@ -43,10 +47,17 @@ use ironcache_storage::{
 };
 
 use crate::rdb::{
-    DECODE_PREALLOC_CAP, DUMP_RDB_VERSION, LpElem, RDB_TYPE_SET, RDB_TYPE_SET_INTSET,
-    RDB_TYPE_SET_LISTPACK, RDB_TYPE_STRING, RestoreParseError, crc64, intset_iter, listpack_iter,
-    read_rdb_len, read_rdb_string, verify_footer, write_rdb_len,
+    DECODE_PREALLOC_CAP, DUMP_RDB_VERSION, LpElem, RDB_TYPE_HASH, RDB_TYPE_HASH_LISTPACK,
+    RDB_TYPE_HASH_LISTPACK_EX, RDB_TYPE_HASH_LISTPACK_EX_PRE_GA, RDB_TYPE_HASH_METADATA,
+    RDB_TYPE_HASH_METADATA_PRE_GA, RDB_TYPE_SET, RDB_TYPE_SET_INTSET, RDB_TYPE_SET_LISTPACK,
+    RDB_TYPE_STRING, RestoreParseError, crc64, intset_iter, listpack_iter, read_rdb_len,
+    read_rdb_string, verify_footer, write_rdb_len,
 };
+
+/// A decoded hash's `(field, value)` pairs in stream order (a repeated field is resolved last-wins by
+/// [`NewValueOwned::Hash`]). Aliased to keep the [`deserialize_hash`] signature under the
+/// `type_complexity` lint, mirroring `cmd_hash`'s `FieldValue`.
+type HashPairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Serialize `value` (its raw bytes) as a full DUMP blob: `type || raw-string || version || crc64`.
 #[must_use]
@@ -161,6 +172,104 @@ fn deserialize_set(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
     }
 }
 
+/// Parse a DUMP blob (footer-verified) into the HASH `(field, value)` pairs, ready for
+/// [`NewValueOwned::Hash`] (which applies the listpack/hashtable ladder and, via `HashVal::set`, keeps
+/// the LAST value for a repeated field -- Redis's last-wins semantics -- so the decoder need not
+/// pre-dedup). Handles the two NON-field-TTL RDB hash encodings:
+///
+/// * `RDB_TYPE_HASH` (4): an RDB length = the field/value PAIR count, then `2*count` RDB strings read
+///   alternately field, value, field, value. The implied `2*count` string count is bounded against the
+///   remaining payload bytes BEFORE any pre-allocation (a string is at least one length byte, so a pair
+///   count implying more strings than remaining bytes is a hostile/garbage header; `checked_mul` guards
+///   the doubling), and each string goes through [`read_rdb_string`] (inheriting its LZF + length-gating
+///   + bounded-alloc discipline).
+/// * `RDB_TYPE_HASH_LISTPACK` (16): the listpack blob, itself stored AS an RDB string (so redis may LZF-
+///   or raw-encode it, EXACTLY like the SET_LISTPACK case), decoded by [`listpack_iter`]; its elements
+///   are the FLATTENED pairs `[field, value, field, value, ...]`, so the element count MUST be EVEN --
+///   an odd count is a corrupt/hostile blob and is [`RestoreParseError::BadData`]. An [`LpElem::Int`]
+///   field OR value renders as its DECIMAL ASCII text (`ll2string`, as for a set) and an [`LpElem::Str`]
+///   is the raw bytes.
+///
+/// The field-TTL hash encodings -- `RDB_TYPE_HASH_LISTPACK_EX` (25), `RDB_TYPE_HASH_METADATA` (24), and
+/// their 7.4 pre-GA forms (23 / 22) -- are a tracked follow-up (#612 PR4). We do NOT half-decode a field
+/// TTL, so they are refused as [`RestoreParseError::BadData`] here, never mis-decoded (a field TTL is
+/// never silently dropped).
+///
+/// Every declared length is bounds-checked before a slice or allocation (the shared `rdb` discipline),
+/// so a hostile blob is a clean [`RestoreParseError::BadData`], never a panic or an over-allocation.
+fn deserialize_hash(blob: &[u8]) -> Result<HashPairs, RestoreParseError> {
+    let payload = verify_footer(blob)?;
+    let mut pos = 0usize;
+    let ty = *payload.get(pos).ok_or(RestoreParseError::BadData)?;
+    pos += 1;
+    match ty {
+        RDB_TYPE_HASH => {
+            let (count, is_encoded) = read_rdb_len(payload, &mut pos)?;
+            if is_encoded {
+                // A field/value pair count is never one of the RDB_ENCVAL special encodings.
+                return Err(RestoreParseError::BadData);
+            }
+            let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
+            // Each pair is TWO RDB strings, so the stream must hold `2*count` strings; the smallest
+            // string is a single length byte, so `2*count` larger than the remaining bytes is a lie ->
+            // BadData BEFORE the pre-allocation. `checked_mul` guards the doubling from overflow, and
+            // `read_rdb_string` re-validates each string's own declared length.
+            let strings = count.checked_mul(2).ok_or(RestoreParseError::BadData)?;
+            if strings > payload.len().saturating_sub(pos) {
+                return Err(RestoreParseError::BadData);
+            }
+            let mut pairs = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
+            for _ in 0..count {
+                let field = read_rdb_string(payload, &mut pos)?;
+                let value = read_rdb_string(payload, &mut pos)?;
+                pairs.push((field, value));
+            }
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes: malformed
+            }
+            Ok(pairs)
+        }
+        RDB_TYPE_HASH_LISTPACK => {
+            // Stored AS an RDB string (redis `rdbSaveRawString`); decode the string first (LZF handled
+            // for free), then the listpack, whose elements are the flattened field/value pairs.
+            let body = read_rdb_string(payload, &mut pos)?;
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes after the listpack string
+            }
+            let elems = listpack_iter(&body)?;
+            // A hash listpack is field/value PAIRS, so the element count must be EVEN; an odd count is
+            // a corrupt/hostile blob (redis never writes one).
+            if elems.len() % 2 != 0 {
+                return Err(RestoreParseError::BadData);
+            }
+            let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(elems.len() / 2);
+            let mut it = elems.into_iter();
+            // The even-count check above guarantees `it` yields pairs; the `while let` pattern stops
+            // cleanly at exhaustion regardless. An int element renders as decimal ASCII, a string is
+            // the raw bytes (matching the SET_LISTPACK rendering).
+            while let (Some(f), Some(v)) = (it.next(), it.next()) {
+                let field = match f {
+                    LpElem::Int(n) => n.to_string().into_bytes(),
+                    LpElem::Str(b) => b.into_vec(),
+                };
+                let value = match v {
+                    LpElem::Int(n) => n.to_string().into_bytes(),
+                    LpElem::Str(b) => b.into_vec(),
+                };
+                pairs.push((field, value));
+            }
+            Ok(pairs)
+        }
+        // The field-TTL hash encodings (`RDB_TYPE_HASH_LISTPACK_EX` / `_METADATA` and their 7.4 pre-GA
+        // forms 23 / 22) are a tracked follow-up (#612 PR4): we do NOT decode a field TTL, so they are
+        // refused as BadData rather than mis-decoded (a field TTL is never silently dropped). Any OTHER
+        // type reaching here is a routing bug (the caller dispatches the decodable types elsewhere);
+        // it is likewise BadData, since the value cannot be reconstructed. The two cases share a body,
+        // so they collapse into one wildcard arm.
+        _ => Err(RestoreParseError::BadData),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The commands.
 // ---------------------------------------------------------------------------
@@ -260,14 +369,24 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         }
         // Route on the RDB type byte, which is `blob[0]` (the first payload byte, before the footer)
         // and is CRC-covered, so `verify_footer` inside the chosen decoder still authenticates it: a
-        // SET type reconstructs a `NewValueOwned::Set` (the store dedups + applies the encoding
-        // ladder), everything else falls to the STRING decoder (which rejects a non-STRING type as
-        // BadData). Both paths install through the same `RmwAction::Replace` used by the string RESTORE
-        // -- only the value construction differs, so REPLACE / ttl / ABSTTL / IDLETIME / FREQ all hold.
+        // SET type reconstructs a `NewValueOwned::Set` and a HASH type a `NewValueOwned::Hash` (the
+        // store dedups + applies the encoding ladder), everything else falls to the STRING decoder
+        // (which rejects a non-STRING type as BadData). The four field-TTL hash type bytes route to
+        // `deserialize_hash` too, which cleanly refuses them as BadData (PR4), so no key is created.
+        // All paths install through the same `RmwAction::Replace` used by the string RESTORE -- only
+        // the value construction differs, so REPLACE / ttl / ABSTTL / IDLETIME / FREQ all hold.
         let decoded = match blob.first() {
             Some(&RDB_TYPE_SET | &RDB_TYPE_SET_INTSET | &RDB_TYPE_SET_LISTPACK) => {
                 deserialize_set(blob).map(NewValueOwned::Set)
             }
+            Some(
+                &RDB_TYPE_HASH
+                | &RDB_TYPE_HASH_LISTPACK
+                | &RDB_TYPE_HASH_LISTPACK_EX
+                | &RDB_TYPE_HASH_METADATA
+                | &RDB_TYPE_HASH_METADATA_PRE_GA
+                | &RDB_TYPE_HASH_LISTPACK_EX_PRE_GA,
+            ) => deserialize_hash(blob).map(NewValueOwned::Hash),
             _ => deserialize_string(blob).map(|v| NewValueOwned::Bytes(Bytes::from(v))),
         };
         match decoded {
@@ -962,5 +1081,218 @@ mod tests {
             "-ERR Bad data format"
         );
         assert!(s.read(0, b"h", NOW).is_none(), "no key must be created");
+    }
+
+    // ---- HASH RESTORE (#612 phase 3): the two non-field-TTL RDB hash encodings. ----
+
+    use std::collections::BTreeMap;
+
+    /// The HGETALL snapshot of `key` as a `field -> value` map (empty if absent / not a hash), read
+    /// through the typed `HashValue` view for order-independent assertions (HLEN is `.len()`, HGET is a
+    /// lookup).
+    fn hash_pairs(store: &mut TestStore, key: &[u8]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let pairs = match entry {
+                RmwEntry::OccupiedMut(mut o) => {
+                    o.as_hash_mut().map(|h| h.pairs()).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: pairs.into_iter().collect(),
+            }
+        })
+    }
+
+    #[test]
+    fn restore_plain_hash_yields_string_pairs() {
+        // A plain RDB_TYPE_HASH (redis's hashtable encoding on DUMP): a PAIR count then that many
+        // field/value RDB strings, read alternately.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3); // three field/value PAIRS
+        push_rdb_string(&mut body, b"f1");
+        push_rdb_string(&mut body, b"v1");
+        push_rdb_string(&mut body, b"f2");
+        push_rdb_string(&mut body, b"v2");
+        push_rdb_string(&mut body, b"f3");
+        push_rdb_string(&mut body, b"v3");
+        let blob = set_blob(RDB_TYPE_HASH, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"phash", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"phash");
+        assert_eq!(got.len(), 3); // HLEN
+        assert_eq!(got.get(&b"f1"[..]).map(Vec::as_slice), Some(&b"v1"[..])); // HGET
+        assert_eq!(got.get(&b"f2"[..]).map(Vec::as_slice), Some(&b"v2"[..]));
+        assert_eq!(got.get(&b"f3"[..]).map(Vec::as_slice), Some(&b"v3"[..]));
+    }
+
+    #[test]
+    fn restore_listpack_hash_yields_string_and_int_pairs() {
+        // A listpack-encoded hash with mixed string + int fields AND values: the ints render as decimal
+        // ASCII, the strings are raw bytes. Elements are the flattened pairs field,value,field,value.
+        let mut s = test_store();
+        let lp = build_listpack(&[
+            lp_str6(b"name"),
+            lp_str6(b"bob"),
+            lp_str6(b"age"),
+            lp_int16(42), // an INT value -> "42"
+            lp_int16(7),  // an INT field -> "7"
+            lp_str6(b"lucky"),
+        ]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"lhash", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"lhash");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.get(&b"name"[..]).map(Vec::as_slice), Some(&b"bob"[..]));
+        assert_eq!(got.get(&b"age"[..]).map(Vec::as_slice), Some(&b"42"[..]));
+        assert_eq!(got.get(&b"7"[..]).map(Vec::as_slice), Some(&b"lucky"[..]));
+    }
+
+    #[test]
+    fn restore_listpack_hash_repeated_field_keeps_last_value() {
+        // A hand-built listpack hash with the SAME field twice: NewValueOwned::Hash builds via
+        // HashVal::set (last write overwrites in place), so the LAST value wins, matching Redis. Real
+        // redis never dumps a duplicate field, but the decoder must not trust the input to be unique.
+        let mut s = test_store();
+        let lp = build_listpack(&[
+            lp_str6(b"k"),
+            lp_str6(b"first"),
+            lp_str6(b"k"),
+            lp_str6(b"second"),
+        ]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dup", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"dup");
+        assert_eq!(got.len(), 1, "the repeated field must collapse to one");
+        assert_eq!(
+            got.get(&b"k"[..]).map(Vec::as_slice),
+            Some(&b"second"[..]),
+            "last value wins"
+        );
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_an_odd_listpack() {
+        // A hash listpack must hold an EVEN number of elements (field/value pairs); an odd count is a
+        // corrupt/hostile blob and is BadData (no partial pair kept).
+        let lp = build_listpack(&[lp_str6(b"a"), lp_str6(b"b"), lp_str6(b"c")]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn restore_hash_field_ttl_type_is_unsupported_and_creates_no_key() {
+        // The field-TTL hash encodings (HASH_LISTPACK_EX=25, HASH_METADATA=24, and the pre-GA 23/22)
+        // are DEFERRED to PR4: each must be a clean bad-data error with NO key created (never a
+        // half-decoded / TTL-dropped hash).
+        for &ty in &[
+            RDB_TYPE_HASH_LISTPACK_EX,
+            RDB_TYPE_HASH_METADATA,
+            RDB_TYPE_HASH_LISTPACK_EX_PRE_GA,
+            RDB_TYPE_HASH_METADATA_PRE_GA,
+        ] {
+            let mut s = test_store();
+            let blob = set_blob(ty, &[0x00]); // any body; the type byte is refused before decode
+            let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"ex", b"0", &blob]));
+            assert_eq!(
+                match err {
+                    Value::Error(e) => e.line(),
+                    o => panic!("type {ty}: {o:?}"),
+                },
+                "-ERR Bad data format",
+                "field-TTL type {ty} must be a clean bad-data error"
+            );
+            assert!(
+                s.read(0, b"ex", NOW).is_none(),
+                "type {ty}: no key must be created"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_huge_declared_count_without_allocating() {
+        // A plain RDB_TYPE_HASH whose declared pair count (~4 billion) dwarfs the tiny body: the
+        // 2*count-vs-remaining bound rejects BEFORE the pre-allocation, no over-alloc, no panic.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff);
+        push_rdb_string(&mut body, b"only-field");
+        push_rdb_string(&mut body, b"only-value");
+        let blob = set_blob(RDB_TYPE_HASH, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_listpack_length_past_the_end() {
+        // A hash listpack whose header total_bytes lies far past the real slice must be BadData with no
+        // over-read (the listpack decoder's exact-length gate).
+        let mut lp = build_listpack(&[lp_str6(b"f"), lp_str6(b"v")]);
+        lp[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn restore_hash_honors_replace_and_ttl() {
+        let mut s = test_store();
+        // Restore a plain hash with no ttl.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 2);
+        push_rdb_string(&mut body, b"a");
+        push_rdb_string(&mut body, b"1");
+        push_rdb_string(&mut body, b"b");
+        push_rdb_string(&mut body, b"2");
+        let blob = set_blob(RDB_TYPE_HASH, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])),
+            Value::ok()
+        );
+        // Restoring onto the existing key without REPLACE is BUSYKEY (value untouched).
+        assert_eq!(
+            match cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])) {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-BUSYKEY Target key name already exists."
+        );
+        // REPLACE + a relative ttl: a listpack hash overwrites the value and the deadline is now + ttl.
+        let lp = build_listpack(&[lp_str6(b"x"), lp_int16(9)]);
+        let mut lbody = Vec::new();
+        push_rdb_string(&mut lbody, &lp);
+        let lblob = set_blob(RDB_TYPE_HASH_LISTPACK, &lbody);
+        assert_eq!(
+            cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"k", b"30000", &lblob, b"REPLACE"])
+            ),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"k");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get(&b"x"[..]).map(Vec::as_slice), Some(&b"9"[..]));
+        assert_eq!(
+            s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
+            Some(UnixMillis(NOW.0 + 30_000))
+        );
     }
 }

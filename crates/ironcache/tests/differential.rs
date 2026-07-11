@@ -740,6 +740,30 @@ fn sorted_members(r: &Resp) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// Extract an `HGETALL` reply (a FLAT field/value array in RESP2) as a SORTED list of `(field, value)`
+/// byte-pairs (order-independent comparison), or `None` if the reply is not an even-length array of
+/// bulk strings.
+fn sorted_pairs(r: &Resp) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    match r {
+        Resp::Array(Some(items)) if items.len() % 2 == 0 => {
+            let mut flat = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    Resp::Bulk(Some(b)) => flat.push(b.clone()),
+                    _ => return None,
+                }
+            }
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = flat
+                .chunks_exact(2)
+                .map(|c| (c[0].clone(), c[1].clone()))
+                .collect();
+            out.sort();
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Prove the DUMP serialization blob interoperates in BOTH directions: `SET`/`PFADD` a value on the
 /// SOURCE server, `DUMP` it, `RESTORE` the blob on the DESTINATION server, and read it back -- it must
 /// equal the source value. Runs for plain / integer-looking (redis int-encodes) / binary / long
@@ -854,10 +878,11 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
         }
     }
 
-    // SET values are a SEPARATE helper (below): DUMP of a set is not yet implemented on IronCache, so
-    // the set parity check is one-directional (redis DUMP -> IronCache RESTORE) and does not fit the
-    // bidirectional loop above.
+    // SET and HASH values are SEPARATE helpers (below): DUMP of an aggregate is not yet implemented on
+    // IronCache, so each parity check is one-directional (redis DUMP -> IronCache RESTORE) and does not
+    // fit the bidirectional loop above.
     compared += set_dump_restore_interop(iron, rds, div);
+    compared += hash_dump_restore_interop(iron, rds, div);
 
     compared
 }
@@ -935,6 +960,81 @@ fn set_dump_restore_interop(
                 iron: iron_reply,
                 redis: redis_reply,
                 note: "a set DUMPed by redis did not RESTORE to the same members on IronCache (#612 SET)".to_owned(),
+            });
+        }
+    }
+    compared
+}
+
+/// The HASH half of the DUMP/RESTORE parity check (#612 HASH RESTORE). ONE-DIRECTIONAL (r2i only):
+/// DUMP of a hash is not yet implemented on IronCache (still a typed "unsupported" error), so we
+/// exercise the real-Redis DUMP -> IronCache RESTORE direction, exactly the migration path that
+/// matters. We force BOTH of redis's non-field-TTL hash encodings -- `listpack` for a small hash and
+/// the plain `RDB_TYPE_HASH` (hashtable) for one with a long value -- and assert the RESTOREd
+/// field/value pairs AND `HLEN` match. The field-TTL hash encodings are a later #612 phase. When
+/// DUMP(hash) lands the i2r direction can be added here too. Returns the number of comparisons made; a
+/// mismatch is pushed onto `div`.
+fn hash_dump_restore_interop(
+    iron: &mut Client,
+    rds: &mut Client,
+    div: &mut Vec<Divergence>,
+) -> usize {
+    let mut compared = 0usize;
+    // Type left to inference: the fully-written nested type trips clippy's `type_complexity` lint.
+    let hash_cases = vec![
+        // Small, mixed string + int fields/values -> redis `listpack` encoding.
+        (
+            "listpack",
+            vec![
+                (b"name".to_vec(), b"bob".to_vec()),
+                (b"age".to_vec(), b"42".to_vec()),
+                (b"7".to_vec(), b"lucky".to_vec()),
+            ],
+        ),
+        // A value longer than `hash-max-listpack-value` (64) forces the hashtable encoding, which DUMPs
+        // as the plain `RDB_TYPE_HASH`.
+        (
+            "plainht",
+            vec![
+                (b"blob".to_vec(), vec![b'x'; 100]),
+                (b"n".to_vec(), b"12345".to_vec()),
+                (b"z".to_vec(), b"end".to_vec()),
+            ],
+        ),
+    ];
+    for (enc, pairs) in &hash_cases {
+        let src_key = format!("dr:hash:{enc}:src").into_bytes();
+        let dst_key = format!("dr:hash:{enc}:dst").into_bytes();
+        let mut hset: Vec<&[u8]> = vec![b"HSET", &src_key];
+        for (f, v) in pairs {
+            hset.push(f.as_slice());
+            hset.push(v.as_slice());
+        }
+        rds.cmd(&hset);
+        let Some(blob) = bulk_bytes(&rds.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP hash {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "redis DUMP of a hash did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = iron.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let iron_reply = iron.cmd(&[b"HGETALL", &dst_key]);
+        let redis_reply = rds.cmd(&[b"HGETALL", &src_key]);
+        let iron_len = iron.cmd(&[b"HLEN", &dst_key]);
+        let redis_len = rds.cmd(&[b"HLEN", &src_key]);
+        compared += 1;
+        if sorted_pairs(&iron_reply).is_none()
+            || sorted_pairs(&iron_reply) != sorted_pairs(&redis_reply)
+            || iron_len != redis_len
+        {
+            div.push(Divergence {
+                cmd: format!("HASH DUMP(redis)->RESTORE(iron) {enc}; RESTORE said {restore:?}"),
+                iron: iron_reply,
+                redis: redis_reply,
+                note: "a hash DUMPed by redis did not RESTORE to the same fields on IronCache (#612 HASH)".to_owned(),
             });
         }
     }
