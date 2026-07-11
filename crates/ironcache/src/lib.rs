@@ -58,6 +58,11 @@ pub mod cluster_upgrade;
 // the NodeUpgrader trait (prod: SSH-invoke the single-node `ironcache upgrade`); the CLI wiring + the
 // live 3-node acceptance test are following slices.
 pub mod cluster_upgrade_driver;
+// The `ironcache upgrade --cluster` TOML actuation-map INVENTORY + the `--dry-run` plan preview (#392
+// slice 4): parses the operator's static per-node map (resp_addr / auth / ssh_target / upgrade_source
+// + observe seeds) into the driver's Inventory, and derives the ordered no-action plan (a pure seam
+// over a single observed ClusterView) that `--dry-run` prints instead of acting.
+pub mod cluster_upgrade_inventory;
 pub mod pubsub;
 pub mod raft_boot;
 /// HA-7d LIVE per-shard replica attach. Reached ONLY in raft-mode once an `AssignReplica`

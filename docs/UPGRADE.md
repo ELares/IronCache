@@ -210,6 +210,96 @@ by `try_raft_cluster_mutator` (`crates/ironcache/src/serve.rs:4830`):
 
 The strategy: **move ownership off a node before you upgrade it.**
 
+You can drive that whole sequence AUTOMATICALLY with `ironcache upgrade --cluster`
+([Automated](#automated-ironcache-upgrade---cluster)), or perform it BY HAND with the
+per-node commands ([Manual](#1-confirm-the-topology-and-write-safety)). The automated path
+runs the same steps the manual sections describe, with the added failover-freeze fence.
+
+### Automated: `ironcache upgrade --cluster`
+
+`ironcache upgrade --cluster` runs the whole roll from ONE orchestrator invocation: it
+discovers the live topology, upgrades the replicas first (each via the single-node flow on
+its host), promotes an upgraded in-sync replica, then upgrades the old primary LAST. The
+dynamic topology (roles, versions, lag, membership) is read live over the authenticated
+RESP surface; a small static TOML **inventory** supplies what cannot be discovered: how to
+reach each node (`resp_addr` + optional `auth`) and how to actuate its out-of-band binary
+swap (`ssh_target` + `upgrade_source`), plus the observe `seeds`.
+
+**Safety model (RPO 0).** Before each promotion the driver applies a *failover-freeze*
+fence: `CLIENT PAUSE WRITE` on the OLD primary (no further write is acknowledged), drain
+the chosen candidate's master-side lag to EXACTLY 0, and only THEN `CLUSTER FAILOVER`. If
+the drain does not reach 0 within `--drain-timeout`, it FAILS CLOSED (unpause, no
+promotion). So freeze-drain-failover loses **zero acknowledged writes** (RPO 0), and the
+primary is always upgraded last. Only one node is ever down at a time, so reads stay served
+throughout.
+
+**Inventory format** (TOML; all values below are PLACEHOLDERS -- use your own hosts):
+
+```toml
+# Which node(s) to CLUSTER-observe from (the seed discovery order). Each must name a
+# [[node]] id; at least one is required.
+seeds = ["node-a"]
+
+[[node]]
+id             = "node-a"                 # announce id (the promotion / CLUSTER FAILOVER target)
+resp_addr      = "10.0.0.1:6379"          # authenticated RESP host:port (INFO / CLUSTER / PAUSE)
+auth           = "REQUIREPASS"            # optional requirepass (sent only over the RESP socket)
+ssh_target     = "deploy@node-a.example"  # opaque ssh target (user@host or an ssh alias)
+upgrade_source = "--to v1.2.3"            # the per-node `ironcache upgrade` source args
+
+[[node]]
+id             = "node-b"
+resp_addr      = "10.0.0.2:6379"
+ssh_target     = "deploy@node-b.example"
+upgrade_source = "--to v1.2.3"
+
+[[node]]
+id             = "node-c"
+resp_addr      = "10.0.0.3:6379"
+ssh_target     = "deploy@node-c.example"
+upgrade_source = "--to v1.2.3"
+```
+
+The inventory is validated fail-closed before any node is touched: it must be well-formed
+TOML with at least one `[[node]]`, unique non-empty ids, well-formed `host:port` addresses,
+and at least one seed that names a declared node. An unknown key or a bad address is a clear
+error, not a silent default.
+
+**Preview first, then run.** `--dry-run` OBSERVES the cluster once and prints the derived
+plan (current versions, the replica roll order, the promotion candidate, the primary
+upgraded LAST) then EXITS, taking NO action -- confirm primary-last before committing:
+
+```sh
+# Preview the plan (no upgrade, no failover):
+ironcache upgrade --cluster --inventory cluster.toml --to v1.2.3 --dry-run
+
+# Execute the roll:
+ironcache upgrade --cluster --inventory cluster.toml --to v1.2.3
+```
+
+Both `--inventory <FILE>` and `--to <TAG>` are REQUIRED in cluster mode (dev / lock builds
+pin a constant version, so the target cannot be inferred). The per-node local flags
+(`--target`, `--unit`, `--resp-addr`, `--readyz-addr`, `--auth-file`) do NOT apply on the
+orchestrator; each node's reach + actuation comes from the inventory.
+
+Cluster-mode tuning flags (sensible defaults; match the driver / server defaults):
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--inventory <FILE>` | -- (required) | the static actuation-map TOML |
+| `--to <TAG>` | -- (required) | the explicit target version to roll to |
+| `--max-lag <N>` | server `replica_max_lag` (256) | promotion candidate pre-filter (the freeze drains to lag 0 regardless) |
+| `--drain-timeout <SECS>` | `60` | failover-freeze drain bound before failing closed |
+| `--pause-ms <MS>` | `30000` | the `CLIENT PAUSE WRITE` window on the old primary during a promotion |
+| `--per-node-timeout <SECS>` | `30` | bound on each per-node RESP exchange |
+| `--max-ticks <N>` | `300` | tick budget before failing loud (`StalledAfterBudget`) instead of looping |
+| `--dry-run` | off | observe once, print the plan, take no action |
+
+On a stall or an action error the driver exits NONZERO and names the blocking step (no
+quorum, no in-sync candidate, or a node upgrade that did not complete), fail-closed. The
+manual sections below describe the same mechanism step by step (and are the fallback if you
+prefer to drive it yourself).
+
 ### 1. Confirm the topology and write-safety
 
 ```sh

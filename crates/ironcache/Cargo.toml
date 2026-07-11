@@ -86,6 +86,13 @@ tokio-rustls = { workspace = true }
 ring = { version = "0.17", default-features = false }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# The `ironcache upgrade --cluster` static actuation-map inventory (#392 slice 4): the operator
+# supplies a small TOML file (per-node resp_addr / auth / ssh_target / upgrade_source + the observe
+# seeds) that parses into the driver's `Inventory` / `Vec<ActuationTarget>`. `toml` + `serde` are
+# ALREADY workspace dependencies (the config stack uses them), so declaring them here adds NO new
+# crate to Cargo.lock; only the derive path over the small inventory structs is exercised.
+toml = { workspace = true }
+serde = { workspace = true }
 # Typed errors for the `ironcache upgrade` self-updater (#387): the Verifier/Source/Swap/Service/
 # HealthProbe/Save seams each carry a `thiserror`-derived error enum (no stringly-typed errors,
 # ERRORS.md). Already a workspace dependency used pervasively in the library crates, so this adds NO
