@@ -157,6 +157,34 @@ pub fn build_inboxes(n: usize) -> (Inbox, Vec<mpsc::Receiver<ShardWork>>) {
     (Inbox::from(senders), receivers)
 }
 
+/// The depth of a per-shard cutover CONTROL channel (#638 slice-3): a single in-flight cutover
+/// trigger per shard is enough (one streamed cutover at a time), and the shard drains it promptly in
+/// its drain loop's 3rd select arm.
+const CUTOVER_CONTROL_DEPTH: usize = 1;
+
+/// Build `n` per-shard CUTOVER CONTROL channels (#638 slice-3): a DEDICATED, bounded `mpsc` PER shard
+/// carrying the [`CutoverStart`](crate::upgrade::cutover_coord::CutoverStart) trigger, SEPARATE from
+/// the data inbox so a SIGUSR1-driven cutover trigger never queues behind cross-shard data traffic
+/// (no head-of-line blocking). Returns the senders (host side, one per shard, held in `BootHandles`
+/// for the in-server cutover host to deliver on) and the matching receivers (one per shard, in shard
+/// order, each moved into that shard's [`run_drain_loop`] alongside its data receiver).
+#[must_use]
+pub fn build_cutover_control(
+    n: usize,
+) -> (
+    Vec<mpsc::Sender<crate::upgrade::cutover_coord::CutoverStart>>,
+    Vec<mpsc::Receiver<crate::upgrade::cutover_coord::CutoverStart>>,
+) {
+    let mut senders = Vec::with_capacity(n);
+    let mut receivers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (tx, rx) = mpsc::channel(CUTOVER_CONTROL_DEPTH);
+        senders.push(tx);
+        receivers.push(rx);
+    }
+    (senders, receivers)
+}
+
 /// Sample each shard's cross-shard inbox OCCUPANCY (#556, the coordinator back-pressure gauge):
 /// `max_capacity - capacity` per shard, i.e. the number of cross-shard work items currently queued
 /// and not yet drained. Returned in shard-index order (`[i]` is shard `i`'s inbox).
@@ -196,11 +224,14 @@ pub fn inbox_depths(inbox: &Inbox) -> Vec<u64> {
 // This is the per-shard boot sequence + the steady-state AND post-shutdown drain loops in one
 // function (they share every captured handle); it sits at the line budget by nature, so the #391
 // PR-2 receiver-role branch tips it just over -- allow it, matching the house style for the other
-// long boot/serve functions (serve.rs / replica_attach.rs).
+// long boot/serve functions (serve.rs / replica_attach.rs). The #638 slice-3 cutover-control
+// receiver adds the 8th argument, so allow the arg count too.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_drain_loop(
     shard_index: usize,
     mut rx: mpsc::Receiver<ShardWork>,
+    mut cutover_rx: mpsc::Receiver<crate::upgrade::cutover_coord::CutoverStart>,
     ctx: ServerContext,
     inbox: Inbox,
     persist: Option<Arc<crate::persist::PersistState>>,
@@ -345,6 +376,10 @@ pub async fn run_drain_loop(
     // Poll the flag on a short cadence through the runtime timer SEAM (NOT tokio::time, ADR-0003),
     // racing it against the work recv so live cross-shard work is still serviced until the stop.
     let poll = std::time::Duration::from_millis(20);
+    // The #638 slice-3 CUTOVER CONTROL arm is live until its channel closes. `cutover_open` gates the
+    // 3rd select branch so a closed control channel (the host senders dropped at process teardown)
+    // DISABLES the arm rather than busy-looping on `recv()` returning `None`.
+    let mut cutover_open = true;
     let stop_requested = loop {
         tokio::select! {
             maybe = rx.recv() => {
@@ -368,6 +403,17 @@ pub async fn run_drain_loop(
                     // All senders dropped (the process is already tearing down): stop the loop. Not a
                     // flag-driven stop, so no save is attempted here.
                     None => break false,
+                }
+            }
+            // THE #638 SLICE-3 CUTOVER CONTROL ARM (the 3rd branch): a `CutoverStart` delivered by the
+            // in-server cutover host spawns THIS shard's per-shard cutover task on THIS shard's
+            // LocalSet, CONCURRENTLY with the drain loop + connection tasks (the shard KEEPS SERVING
+            // through Phase 1). Separate from the data inbox above, so the trigger never queues behind
+            // cross-shard traffic. A closed channel (`None`) disables the arm to avoid a busy loop.
+            maybe_cut = cutover_rx.recv(), if cutover_open => {
+                match maybe_cut {
+                    Some(start) => spawn_shard_cutover(&ctx, shard_index, start),
+                    None => cutover_open = false,
                 }
             }
             () = rt.timer(poll) => {
@@ -429,6 +475,90 @@ pub async fn run_drain_loop(
             }
         }
     }
+}
+
+/// Spawn THIS shard's per-shard cutover TASK on its OWN LocalSet (#638 slice-3), wiring the tested
+/// [`run_shard_cutover_task`](crate::upgrade::cutover_coord::run_shard_cutover_task) (slice 2) into
+/// the live shard. Invoked by the drain loop's 3rd select arm when the in-server cutover host delivers
+/// a [`CutoverStart`](crate::upgrade::cutover_coord::CutoverStart):
+///
+/// 1. RE-ADOPT the host-accepted handoff stream onto THIS shard's tokio runtime (the host converted it
+///    to a reactor-free `std` stream so it could cross the thread; the re-adopted tokio stream is now
+///    reactor-bound to this shard and never crosses a thread again -- design risk 4).
+/// 2. Build the `ensure` ring-install seam (`ensure_shard_ring` + `shard_store`), run as the task's
+///    FIRST synchronous action so the observer ring is present before `freeze_cut` latches `F`. It
+///    reuses the raft/replica ring when present (idempotent), so a raft node is never double-installed.
+/// 3. `spawn_local` the task so it runs CONCURRENTLY with the drain loop + connection tasks: the shard
+///    KEEPS SERVING through Phase 1. The `!Send` store/ring/stream never leave this thread; only the
+///    `Send` `CutoverCoord` (inside `start`) coordinates the cross-shard barrier.
+///
+/// `now` is read from THIS shard's Env clock (the determinism seam, ADR-0003); the replid is the
+/// node's per-boot repl history token when present (raft mode), else a zero sentinel (a non-raft node
+/// has no replication identity, and the receiver ignores the HELLO replid on adopt).
+#[cfg(unix)]
+fn spawn_shard_cutover(
+    ctx: &ServerContext,
+    shard_index: usize,
+    start: crate::upgrade::cutover_coord::CutoverStart,
+) {
+    let crate::upgrade::cutover_coord::CutoverStart {
+        coord,
+        shard,
+        chunk_max,
+        stream,
+    } = start;
+    // Step 1: re-adopt the host-accepted std stream onto THIS shard's runtime.
+    let stream = match tokio::net::UnixStream::from_std(stream) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                shard = shard_index,
+                error = %e,
+                "ironcache: could not adopt the per-shard cutover handoff stream; skipping this \
+                 shard's cutover (the host barrier fail-closes to Abort)"
+            );
+            return;
+        }
+    };
+    let now = UnixMillis(shard_env().borrow().now_unix_millis());
+    let replid = ctx
+        .repl_history_id
+        .unwrap_or_else(|| ironcache_repl::ReplId::from_bytes([0u8; 20]));
+    // Step 2: the ring-install seam, captured into the task (run as its FIRST synchronous action).
+    let ensure_ctx = ctx.clone();
+    let ensure = move || {
+        let ring = crate::serve::ensure_shard_ring(&ensure_ctx, shard_index);
+        let store = shard_store(
+            ensure_ctx.databases,
+            ensure_ctx.info.maxmemory_policy,
+            crate::serve::scan_reserved_bits(ensure_ctx.shards),
+        );
+        (store, ring)
+    };
+    // Step 3: spawn the !Send task on this shard's LocalSet (concurrent with serving). Detach the
+    // JoinHandle (drop it): the fire-and-forget task runs the cutover to its own commit/abort
+    // independently of the drain loop (dropping the handle does NOT cancel a spawned tokio task).
+    drop(tokio::task::spawn_local(
+        crate::upgrade::cutover_coord::run_shard_cutover_task(
+            coord, shard, stream, ensure, replid, now, chunk_max,
+        ),
+    ));
+    tracing::info!(
+        shard = shard_index,
+        "ironcache: streamed cutover started on this shard (Phase 1 runs while still serving)"
+    );
+}
+
+/// Off unix there is NO streamed cutover (the handoff rides an AF_UNIX socket), so
+/// [`CutoverStart`](crate::upgrade::cutover_coord::CutoverStart) is uninhabited and this is
+/// unreachable; it exists to keep the drain loop's 3rd select arm uniform across platforms.
+#[cfg(not(unix))]
+fn spawn_shard_cutover(
+    _ctx: &ServerContext,
+    _shard_index: usize,
+    start: crate::upgrade::cutover_coord::CutoverStart,
+) {
+    match start {}
 }
 
 /// Dispatch ONE drained cross-shard unit, routing the async YIELDING save path for `__ICSAVE`

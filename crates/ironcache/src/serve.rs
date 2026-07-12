@@ -196,6 +196,14 @@ pub struct BootHandles {
     /// back-pressure gauge. Always present (an inbox is built for every boot); the metrics task only
     /// READS its depth, never sends. A cheap `Arc<[Sender]>` clone.
     pub inbox: coordinator::Inbox,
+    /// The #638 slice-3 per-shard CUTOVER CONTROL senders (one per shard, in shard order): the
+    /// in-server streamed live-cutover host delivers a
+    /// [`CutoverStart`](crate::upgrade::cutover_coord::CutoverStart) on `[i]` to trigger shard `i`'s
+    /// per-shard cutover task (its drain loop's 3rd select arm), SEPARATE from the data inbox so the
+    /// trigger never queues behind cross-shard traffic. Held here so the binary's SIGUSR1 host drive
+    /// can reach every shard; empty of traffic on any non-cutover boot.
+    pub cutover_control:
+        Vec<tokio::sync::mpsc::Sender<crate::upgrade::cutover_coord::CutoverStart>>,
     /// The hot TLS cert-reload handle (#563), `Some` only when `tls = on`. The binary installs a
     /// SIGHUP handler ([`spawn_tls_reload_on_sighup`]) over it so the configured cert/key can be
     /// re-read and atomically swapped WITHOUT a restart. `None` (TLS off / every plaintext boot)
@@ -681,7 +689,18 @@ pub fn run_server_observed(
     // shards == 1 every key is home-owned, so the queues carry no traffic and the path is
     // byte-identical to before this layer (verified by the coordinator_stage1 parity test).
     let total = config.shards.max(1);
-    let (inbox, rxs) = coordinator::build_inboxes(total);
+    let (inbox, data_rxs) = coordinator::build_inboxes(total);
+    // The #638 slice-3 per-shard CUTOVER CONTROL channels: a DEDICATED mpsc PER shard (separate from
+    // the data inbox, so a SIGUSR1-driven cutover trigger never queues behind cross-shard traffic).
+    // The senders go out on `BootHandles` for the in-server cutover host to deliver on; each receiver
+    // rides into its shard's drain loop, paired with the shard's data receiver.
+    let (cutover_control, cutover_rxs) = coordinator::build_cutover_control(total);
+    // Pair each shard's (data receiver, cutover-control receiver) by index; `run_shards` moves the
+    // pair to shard `i`'s drain loop, which splits it into the two select arms.
+    let rxs: Vec<(
+        tokio::sync::mpsc::Receiver<coordinator::ShardWork>,
+        tokio::sync::mpsc::Receiver<crate::upgrade::cutover_coord::CutoverStart>,
+    )> = data_rxs.into_iter().zip(cutover_rxs).collect();
     // A clone of the inbox senders returned in `BootHandles` so the `/metrics` endpoint can SAMPLE
     // each shard's inbox occupancy for the `ironcache_shard_inbox_depth` gauge (#556). Taken here,
     // before `inbox` is cloned into the serve / drain / io_uring closures below, so it is always
@@ -805,8 +824,14 @@ pub fn run_server_observed(
         // load-on-boot completes. `None` when the metrics endpoint is off (byte-identical: the drain
         // loop's signal is a no-op). `run_server_observed` does not use `ready` after this point.
         move |index: usize,
-              rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>,
+              rxs: (
+            tokio::sync::mpsc::Receiver<coordinator::ShardWork>,
+            tokio::sync::mpsc::Receiver<crate::upgrade::cutover_coord::CutoverStart>,
+        ),
               shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            // Split the per-shard pair into the data receiver + the #638 slice-3 cutover-control
+            // receiver (the drain loop's 2nd and 3rd select arms).
+            let (rx, cutover_rx) = rxs;
             let ctx = drain_ctx.clone();
             let inbox = inbox.clone();
             let persist = persist.clone();
@@ -815,7 +840,7 @@ pub fn run_server_observed(
             // drive the SAVE-ON-EXIT (#139) when a SIGTERM/SIGINT-triggered stop begins. `ready`
             // is the per-shard readiness countdown (#152): this shard decrements it once its
             // load-on-boot has finished, so `/readyz` flips to 200 only after EVERY shard loaded.
-            coordinator::run_drain_loop(index, rx, ctx, inbox, persist, shutdown, ready)
+            coordinator::run_drain_loop(index, rx, cutover_rx, ctx, inbox, persist, shutdown, ready)
         }
     };
 
@@ -927,6 +952,7 @@ pub fn run_server_observed(
         runtime: runtime_handle,
         topology,
         inbox: inbox_for_handles,
+        cutover_control,
         tls_reload,
     })
 }
@@ -8437,48 +8463,110 @@ pub fn spawn_tls_reload_on_sighup(handle: TlsReloadHandle) {
     }
 }
 
-/// Block the calling (main) thread until a termination signal (SIGINT/SIGTERM) arrives, then flip
-/// `flag` so the shard accept loops + the save-on-exit watch begin the GRACEFUL stop (#139,
-/// SHUTDOWN.md): the FIRST signal initiates the graceful shutdown (drain + save-on-exit, driven by
-/// the shard executors), and a SECOND signal arriving while that stop is in progress ESCALATES to an
-/// IMMEDIATE `exit(0)` so an operator can always force the issue (a stuck drain or a slow exit save
-/// can never trap the process). The signal handler itself does NOT terminate from inside the handler
-/// (Redis-faithful: a stop signal becomes a controlled shutdown, not an abrupt in-handler exit
+/// What a delivered signal asks [`wait_for_signal`] to do: begin the graceful SHUTDOWN
+/// (SIGINT/SIGTERM, the unchanged #139 path) or begin a streamed live CUTOVER (SIGUSR1, #638). The
+/// caller (`main`) branches on this: `Shutdown` drives the drain + join exactly as before; `Cutover`
+/// runs the in-server cutover host and, unless it commits, resumes waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// SIGINT/SIGTERM: initiate the graceful shutdown. [`wait_for_signal`] has ALREADY set the
+    /// shutdown flag and armed the second-signal force-exit watcher (byte-identical to the prior
+    /// behavior); the caller runs `shutdown_and_join`.
+    Shutdown,
+    /// SIGUSR1 (#638): initiate a streamed live cutover. The shutdown flag is NOT set here (the
+    /// cutover must run BEFORE any flag, so `DRAIN_GRACE` never bounds it); the caller drives the
+    /// in-server cutover host and, on a non-commit outcome, loops back to [`wait_for_signal`].
+    Cutover,
+}
+
+/// Resolve WHICH delivered signal fired into a [`SignalOutcome`] (SIGINT/SIGTERM -> `Shutdown`,
+/// SIGUSR1 -> `Cutover`). Extracted from [`wait_for_signal`] so the arm selection is unit-tested
+/// DETERMINISTICALLY with plain futures (a `ready` for the one that fires, `pending` for the rest)
+/// instead of driving real signals into the test process.
+#[cfg(unix)]
+async fn resolve_signal<I, T, U>(sigint: I, sigterm: T, sigusr1: U) -> SignalOutcome
+where
+    I: std::future::Future,
+    T: std::future::Future,
+    U: std::future::Future,
+{
+    tokio::select! {
+        _ = sigint => SignalOutcome::Shutdown,
+        _ = sigterm => SignalOutcome::Shutdown,
+        _ = sigusr1 => SignalOutcome::Cutover,
+    }
+}
+
+/// Apply the resolved [`SignalOutcome`]'s FLAG side effect: a `Shutdown` records the stop request on
+/// `flag` (so the shards drain + the save-on-exit watch fires); a `Cutover` leaves `flag` UNTOUCHED
+/// (the cutover runs before any shutdown). Split out (no watcher arming here) so the flag behavior is
+/// unit-tested without installing a real signal handler.
+fn apply_signal_flag(outcome: SignalOutcome, flag: &Arc<std::sync::atomic::AtomicBool>) {
+    if matches!(outcome, SignalOutcome::Shutdown) {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Block the calling (main) thread until a signal arrives, returning the [`SignalOutcome`] the caller
+/// acts on. SIGINT/SIGTERM behave EXACTLY as before (#139, SHUTDOWN.md): the FIRST such signal sets
+/// `flag` so the shard accept loops + the save-on-exit watch begin the GRACEFUL stop, and a SECOND
+/// arriving while that stop is in progress ESCALATES to an IMMEDIATE `exit(0)`; the function returns
+/// [`SignalOutcome::Shutdown`]. SIGUSR1 (#638) is the streamed live-cutover trigger: it returns
+/// [`SignalOutcome::Cutover`] WITHOUT setting `flag` or arming the force-exit watcher (the cutover
+/// runs first; only a commit later sets the flag). The signal handler itself does NOT terminate from
+/// inside the handler (Redis-faithful: a stop signal becomes a controlled shutdown
 /// [redis-sigterm-sigint-graceful-shutdown]); it only records the request via `flag`, and the second
 /// signal's force-exit is the deliberate IronCache escalation.
 ///
 /// Uses tokio's signal handling on a small dedicated current-thread runtime (signal handling lives
 /// in the binary only, CLI_BINARY.md, so the determinism boundary holds).
-pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
+#[must_use]
+pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) -> SignalOutcome {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
-        return;
+        // No runtime: treat as a shutdown request (the safe, prior-behavior default).
+        apply_signal_flag(SignalOutcome::Shutdown, flag);
+        return SignalOutcome::Shutdown;
     };
-    rt.block_on(async {
+    let outcome = rt.block_on(async {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
-                return;
+                return SignalOutcome::Shutdown;
             };
             let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-                return;
+                return SignalOutcome::Shutdown;
             };
-            // FIRST signal: initiate the graceful stop (the caller drives the drain + join next).
-            tokio::select! {
-                _ = sigint.recv() => {}
-                _ = sigterm.recv() => {}
+            // SIGUSR1 arms the streamed live-cutover trigger (#638). A failure to install it is
+            // NON-FATAL: the cutover trigger is simply unavailable and the graceful-shutdown path
+            // (SIGINT/SIGTERM) still works, so fall back to shutdown-only selection.
+            if let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) {
+                resolve_signal(sigint.recv(), sigterm.recv(), sigusr1.recv()).await
+            } else {
+                tokio::select! {
+                    _ = sigint.recv() => SignalOutcome::Shutdown,
+                    _ = sigterm.recv() => SignalOutcome::Shutdown,
+                }
             }
         }
         #[cfg(not(unix))]
         {
+            // SIGUSR1 is a unix signal; off unix there is only the graceful ctrl-c stop.
             let _ = tokio::signal::ctrl_c().await;
+            SignalOutcome::Shutdown
         }
     });
-    // Record the stop request so the shards drain + the save-on-exit watch fires.
-    flag.store(true, Ordering::SeqCst);
+    // Record the stop request ONLY for a Shutdown (a Cutover leaves the flag untouched: it runs
+    // before any shutdown so DRAIN_GRACE never bounds it).
+    apply_signal_flag(outcome, flag);
+    if outcome == SignalOutcome::Cutover {
+        // A cutover does NOT arm the force-exit watcher: the OLD keeps serving until (and unless) a
+        // commit later sets the flag. Return to the caller, which drives the in-server cutover host.
+        return SignalOutcome::Cutover;
+    }
 
     // SECOND-SIGNAL FORCE (#139, SHUTDOWN.md): arm a DEDICATED long-lived watcher thread for the
     // ESCALATION. It must outlive this function (the graceful join the caller runs next can take up
@@ -8515,6 +8603,7 @@ pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
                 });
             });
     }
+    SignalOutcome::Shutdown
 }
 
 #[cfg(test)]
@@ -8759,6 +8848,55 @@ mod tests {
         assert!(
             preinstalled.borrow().head() > head_before,
             "the reused ring still observes writes: replication was not clobbered"
+        );
+    }
+
+    /// #638 SIGNAL SEAM (arm selection, deterministic): [`resolve_signal`] maps SIGINT and SIGTERM to
+    /// `Shutdown` and SIGUSR1 to `Cutover`, whichever fires. Driven with plain futures (a `ready` for
+    /// the arm under test, `pending` for the others) so it is hermetic -- no real signals reach the
+    /// test process.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_signal_maps_each_arm() {
+        use std::future::{pending, ready};
+        // SIGINT -> Shutdown.
+        assert_eq!(
+            resolve_signal(ready(()), pending::<()>(), pending::<()>()).await,
+            SignalOutcome::Shutdown,
+            "SIGINT initiates the graceful shutdown"
+        );
+        // SIGTERM -> Shutdown.
+        assert_eq!(
+            resolve_signal(pending::<()>(), ready(()), pending::<()>()).await,
+            SignalOutcome::Shutdown,
+            "SIGTERM initiates the graceful shutdown"
+        );
+        // SIGUSR1 -> Cutover (the #638 streamed live-cutover trigger).
+        assert_eq!(
+            resolve_signal(pending::<()>(), pending::<()>(), ready(())).await,
+            SignalOutcome::Cutover,
+            "SIGUSR1 initiates a streamed live cutover"
+        );
+    }
+
+    /// #638 SIGNAL SEAM (flag side effect): a `Shutdown` records the stop request on the flag (the
+    /// unchanged #139 behavior); a `Cutover` leaves it UNTOUCHED (the cutover runs BEFORE any
+    /// shutdown, so `DRAIN_GRACE` never bounds it). This pins that a SIGUSR1 does NOT begin a
+    /// shutdown, distinguishing it from SIGINT/SIGTERM.
+    #[test]
+    fn apply_signal_flag_sets_only_on_shutdown() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        apply_signal_flag(SignalOutcome::Cutover, &flag);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a Cutover (SIGUSR1) does NOT set the shutdown flag"
+        );
+
+        apply_signal_flag(SignalOutcome::Shutdown, &flag);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "a Shutdown (SIGINT/SIGTERM) sets the shutdown flag (unchanged #139 path)"
         );
     }
 
