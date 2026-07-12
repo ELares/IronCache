@@ -1271,6 +1271,19 @@ fn expire_cycle_tick(
     if is_replica_passive() {
         return 0;
     }
+    // #391 PR-4 (W5, internal-mutator suspension): while THIS shard is QUIESCING for a streamed
+    // live-cutover final delta cut, the background active-expiry reaper is INERT (return 0 before any
+    // store/wheel borrow). A reap during the outage would route a removal through the write funnel
+    // and append a StreamDel at a ring offset ABOVE the latched cut `E`; the bounded delta ship stops
+    // at `E`, so that removal would be MISSED by the receiver and the OLD would diverge from the
+    // E-consistent cut the receiver committed. Suspending it here -- together with the store's
+    // passive lazy-expiry the cutover driver sets alongside the quiesce (so a read during the outage
+    // reports a due key as absent WITHOUT physically removing it) -- means NO internal mutation is
+    // acked above `E`, so `bulk UNION delta(F, E]` stays EXACTLY the acked keyspace as of `E`. One
+    // core-local bool load, default `false`: the non-cutover path is byte-unchanged.
+    if is_shard_loading() {
+        return 0;
+    }
     // DEBUG SET-ACTIVE-EXPIRE (#411): when the node disabled the active-expiry cycle, this
     // background reaper is INERT too (return 0 before any borrow), so only LAZY reap-on-access
     // removes a key -- the conformance contract. One relaxed load, default-true so the common
