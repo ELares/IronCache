@@ -51,11 +51,15 @@
 //! resume (no split-brain) and a crash before it cannot lose the acked keyspace (the OLD still holds
 //! it live).
 //!
-//! ## Deferred to PR-5 / PR-6 (expressed here as authority state + TODOs)
+//! ## The NEW's serve-flip (PR-5) and what is still deferred to PR-6
 //!
-//! The NEW's client serve-flip gate (PR-5) and the orchestrator sibling spawn + drain/exit-on-Commit
-//! / resume-on-Abort + inherited-listener no-RST (PR-6) are NOT wired here. Where this module needs
-//! "the OLD stops serving" or "the NEW serves" it expresses the AUTHORITY state (a
+//! The NEW's client serve-flip is now wired (PR-5): a single process-global serve gate
+//! ([`crate::serve::is_serving`]) rejects EVERY client command with `-LOADING` while the NEW is
+//! receiving, and [`begin_serving_on_commit`] flips it to serving EXACTLY ONCE, all-or-nothing across
+//! shards, on the `Committed` transition -- strictly after the OLD released write authority, so no
+//! write is double-acked. Still deferred to PR-6 (expressed here as authority state + TODOs): the
+//! orchestrator sibling spawn + drain/exit-on-Commit / resume-on-Abort + inherited-listener no-RST.
+//! Where this module needs "the OLD stops serving" it expresses the AUTHORITY state (a
 //! [`WriteAuthority`] / the permanent quiesce) and leaves a TODO. Everything below is tested over
 //! in-process [`tokio::net::UnixStream::pair`]s, not real processes.
 
@@ -109,6 +113,27 @@ pub fn decide_cutover<T>(prepared: &[Result<T, HandoffError>]) -> (CutoverState,
         CutoverState::Pending | CutoverState::Abort => WriteAuthority::Held,
     };
     (state, authority)
+}
+
+/// #391 PR-5: the NEW's client SERVE-FLIP -- the client-visible consequence of the receiver-
+/// authoritative `Committed` transition. Flip the process-global serve gate
+/// ([`crate::serve::set_serving`]) to `true` so the NEW begins serving client commands.
+///
+/// Called EXACTLY ONCE, and ONLY after BOTH: (a) [`promote`] has durably installed staging ->
+/// `data_dir` (the NEW serves only committed, durable state@E), and (b) the OLD has RELEASED write
+/// authority -- it sent `Commit` only after [`decide_cutover`] returned [`WriteAuthority::Released`]
+/// and its quiesce became permanent (PR-4). Because a SINGLE process-global bool gates every shard,
+/// the flip is ALL-OR-NOTHING with no per-shard stagger (the cross-shard barrier already decided
+/// all-or-nothing). And because it flips strictly AFTER the OLD's release, no write is EVER acked by
+/// both processes across the cutover: the OLD acks no write from `E` onward (permanent quiesce), and
+/// the NEW acks writes only from HERE. Before this the process-global gate rejected every client
+/// command with `-LOADING`, so a client never read a half-loaded or not-yet-committed store.
+///
+/// `dead_code`-allowed: the live caller is the PR-6 orchestrator (it drives `recv_await_commit` ->
+/// [`promote`] -> this -> [`stream::send_served`]); exercised now by the PR-5 continuity hero test.
+#[allow(dead_code)]
+pub(crate) fn begin_serving_on_commit() {
+    crate::serve::set_serving(true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -798,6 +823,231 @@ mod tests {
         }
 
         crate::serve::unquiesce_shard(); // tidy the thread-local for other tests on this thread.
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- (e) PR-5 CLIENT CONTINUITY ACROSS THE SERVE-FLIP: no key served by neither/both. ----
+
+    /// (e) THE PR-5 HERO: a client reading a mixed keyspace THROUGHOUT the serve-flip observes, for
+    /// EVERY key, either the OLD's value (pre-flip) or the NEW's committed value (post-flip) -- never a
+    /// spurious miss from a flip gap, and never a write acked by BOTH sides. Models the flip in-process:
+    /// the NEW is committed to state@E (via the real PR-4 commit path + durable promote) behind its
+    /// process-global serve gate, while the OLD is permanently quiesced at E (still serving READS). A
+    /// concurrent reader hammers GET/MGET across the whole keyspace while the transition runs. Asserts:
+    ///   (1) while the NEW is not serving, a client hitting it gets `-LOADING` (never a wrong/empty
+    ///       answer) and the OLD keeps serving EXACTLY state@E;
+    ///   (2) on the `Committed` flip the NEW serves state@E for EVERY key;
+    ///   (3) there is no instant where a write is acked by BOTH: the OLD is permanently quiesced from
+    ///       the release (`is_shard_loading()` stays true across the flip), and the NEW begins acking
+    ///       writes only at the flip, which is STRICTLY after that release.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn hero_e_client_continuity_across_the_serve_flip() {
+        use std::cell::Cell;
+
+        /// The modeled NEW client reply -- exactly the top-of-`route_and_dispatch` gate decision.
+        #[derive(Debug, PartialEq, Eq)]
+        enum NewReply {
+            Loading,
+            Value(Vec<u8>),
+            Miss,
+        }
+        /// Model a client GET against the NEW: the process-global serve gate FIRST (a `-LOADING` while
+        /// receiving), else the committed store read. This is the SAME decision the real dispatch gate
+        /// makes (`is_serving()` -> `ErrorReply::loading()`), so the test exercises the real primitive.
+        fn new_get(new_map: &HashMap<(u32, Vec<u8>), Vec<u8>>, key: &(u32, Vec<u8>)) -> NewReply {
+            if !crate::serve::is_serving() {
+                return NewReply::Loading;
+            }
+            match new_map.get(key) {
+                Some(v) => NewReply::Value(v.clone()),
+                None => NewReply::Miss,
+            }
+        }
+
+        const PRE: u32 = 1_200;
+        const RESERVED: u32 = 12;
+        crate::serve::unquiesce_shard(); // defensive: fresh thread-local gate.
+        crate::serve::set_serving(true); // defensive: fresh process-global gate (restored at the end).
+
+        let (store, ring) = seeded(PRE, RESERVED, "pre");
+        let root = tmp_root("hero-c");
+        let _ = std::fs::remove_dir_all(&root);
+        let staging = Staging::new(root.join("staging")).expect("staging dir");
+        let data_dir = root.join("data");
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+
+        // ---- Reach state@E: drive the real PR-4 cutover to PREPARED under write load, decide Commit
+        //      (which RELEASES the OLD's authority -> permanent quiesce), then COMMIT + durable promote.
+        let writer = hammer(&store, RESERVED, PRE);
+        let sender = send_shard_to_prepared(&mut a, &store, &ring, 0, replid(), NOW, 4);
+        let receiver =
+            receive_shard_to_prepared(&mut b, || ShardStore::new(DBS), DBS, NOW, &staging);
+        let (writer_ops, s_res, r_res) = tokio::join!(writer, sender, receiver);
+        let e = s_res.expect("sender reached PREPARED");
+        let (prepared, entry) = r_res.expect("receiver reached PREPARED");
+        assert_eq!(prepared.final_offset, e, "both ends agree on the cut E");
+        assert!(
+            writer_ops > 500,
+            "the writer genuinely hammered ({writer_ops} ops)"
+        );
+
+        // THE LINEARIZATION POINT (PR-4): all shards prepared -> release authority (permanent quiesce),
+        // THEN commit. PR-5 rides on the resulting Released authority.
+        let prepared_results: Vec<Result<ReplOffset, HandoffError>> = vec![Ok(e)];
+        let (state, authority) = decide_cutover(&prepared_results);
+        assert_eq!(state, CutoverState::Commit);
+        assert_eq!(
+            authority,
+            WriteAuthority::Released,
+            "the OLD released write authority at the commit decision"
+        );
+        assert!(
+            crate::serve::is_shard_loading(),
+            "the OLD's quiesce is PERMANENT after the release (it never acks a write again)"
+        );
+
+        // The NEW receives Commit + durably promotes staging -> data_dir (still NOT serving).
+        let committed = {
+            let send = stream::send_commit(&mut a);
+            let recv = stream::recv_await_commit(&mut b, prepared);
+            let (cs, cr) = tokio::join!(send, recv);
+            cs.expect("commit sent");
+            match cr.expect("receiver got the decision") {
+                stream::ShardCommit::Committed(loaded) => loaded,
+                stream::ShardCommit::Aborted => panic!("expected a commit"),
+            }
+        };
+        staging
+            .write_manifest(NOW.0 / 1000, vec![entry])
+            .expect("manifest");
+        promote(staging.dir(), &data_dir).expect("promote staging -> data_dir");
+
+        // state@E, the ONE value every read must return: OLD-live == NEW-committed == durable-on-disk.
+        let reference = dump_map(&store.borrow(), NOW);
+        assert_eq!(
+            dump_map(&committed.store, NOW),
+            reference,
+            "NEW committed == OLD state@E"
+        );
+        let durable = reconstruct_shard(&data_dir, 0, NOW, || ShardStore::new(DBS))
+            .expect("promoted dir reconstructs");
+        assert_eq!(
+            dump_map(&durable, NOW),
+            reference,
+            "durable data_dir == OLD state@E"
+        );
+        assert!(!reference.is_empty(), "the acked keyspace is non-empty");
+        let new_map = dump_map(&committed.store, NOW); // the NEW's committed keyspace, served post-flip.
+        let sample_keys: Vec<(u32, Vec<u8>)> = reference.keys().take(64).cloned().collect();
+
+        // ---- Model the RECEIVER boot: the NEW is NOT serving yet (booted with the gate false). ----
+        crate::serve::set_serving(false);
+        // (1) pre-flip: a client hitting the NEW gets `-LOADING` for every sampled key (never value/miss).
+        for k in &sample_keys {
+            assert_eq!(
+                new_get(&new_map, k),
+                NewReply::Loading,
+                "pre-flip the NEW rejects with -LOADING (never a wrong/empty answer)"
+            );
+        }
+
+        // ---- THE TRANSITION UNDER READ LOAD: a reader hammers the keyspace while the flip runs. ----
+        let saw_loading = Cell::new(0u64);
+        let saw_serving = Cell::new(0u64);
+        let prev_serving = Cell::new(false);
+
+        let reader = async {
+            for _ in 0..800 {
+                // (3) the OLD is permanently quiesced from the release: it acks NO write, at every
+                // instant -- so no write can be acked by both the OLD and the (post-flip) NEW.
+                assert!(
+                    crate::serve::is_shard_loading(),
+                    "the OLD stays permanently quiesced across the whole flip (no write double-acked)"
+                );
+                let serving = crate::serve::is_serving();
+                // Monotonic: the serve gate only ever moves false -> true, never back (all-or-nothing).
+                assert!(
+                    !prev_serving.get() || serving,
+                    "the serve flip is monotonic (it never flips back to not-serving)"
+                );
+                prev_serving.set(serving);
+                if serving {
+                    saw_serving.set(saw_serving.get() + 1);
+                    // (2) post-flip: the NEW serves the committed state@E value for EVERY key.
+                    for k in &sample_keys {
+                        assert_eq!(
+                            new_get(&new_map, k),
+                            NewReply::Value(reference[k].clone()),
+                            "post-flip the NEW serves the committed state@E value (no spurious miss)"
+                        );
+                    }
+                } else {
+                    saw_loading.set(saw_loading.get() + 1);
+                    // (1) pre-flip: the NEW rejects (`-LOADING`), and the client reads the OLD, which
+                    // still serves EXACTLY state@E -- for every key, no spurious miss from a flip gap.
+                    for k in &sample_keys {
+                        assert_eq!(
+                            new_get(&new_map, k),
+                            NewReply::Loading,
+                            "pre-flip the NEW is -LOADING under read load"
+                        );
+                    }
+                    assert_eq!(
+                        dump_map(&store.borrow(), NOW),
+                        reference,
+                        "the OLD still serves EXACTLY state@E while the NEW is not serving"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let flipper = async {
+            // Let the reader observe the pre-flip (`-LOADING` + OLD continuity) window.
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+            // THE FLIP ordering (the continuity crux): the OLD released FIRST (permanent quiesce,
+            // asserted above), and the NEW is still not serving here -- so serving goes true STRICTLY
+            // after the release, and no write is ever acked by both.
+            assert!(
+                !crate::serve::is_serving(),
+                "the NEW is not serving at the flip point"
+            );
+            assert!(
+                crate::serve::is_shard_loading(),
+                "the OLD released (permanent quiesce) BEFORE the NEW begins serving"
+            );
+            begin_serving_on_commit(); // the single all-or-nothing client-visible flip.
+            // Let the reader observe the post-flip (NEW serving state@E) window.
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        tokio::join!(reader, flipper);
+
+        assert!(
+            crate::serve::is_serving(),
+            "the NEW is serving after the flip"
+        );
+        assert!(
+            saw_loading.get() > 0,
+            "the reader observed the pre-flip -LOADING window under load"
+        );
+        assert!(
+            saw_serving.get() > 0,
+            "the reader observed the post-flip serving window under load"
+        );
+        assert_eq!(
+            dump_map(&committed.store, NOW),
+            reference,
+            "the final NEW keyspace is still EXACTLY state@E"
+        );
+
+        crate::serve::unquiesce_shard(); // tidy the thread-local for other tests on this thread.
+        crate::serve::set_serving(true); // restore the process-global default (serving).
         let _ = std::fs::remove_dir_all(&root);
     }
 
