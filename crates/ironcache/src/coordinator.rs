@@ -1685,6 +1685,12 @@ async fn resolve_receive_role(ctx: &ServerContext, shard_index: usize) -> Result
     };
     match receive_shard_from_handoff(ctx, &plan, shard_index).await {
         Ok(final_offset) => {
+            // #638 slice-4 RECEIVER FLIP BARRIER: THIS shard committed (its store was received +
+            // adopted). Report the commit to the process-global cross-shard flip barrier; the LAST
+            // shard to report performs the single all-or-nothing `set_serving(true)` flip, so the
+            // sibling begins serving only AFTER every shard committed -- never on the first shard's
+            // commit while a sibling shard is still receiving (which would serve a not-ready store).
+            crate::serve::report_receiver_shard_committed();
             tracing::info!(
                 shard = shard_index,
                 final_offset = final_offset.0,
@@ -1693,11 +1699,14 @@ async fn resolve_receive_role(ctx: &ServerContext, shard_index: usize) -> Result
             Ok(true)
         }
         Err(e) => {
+            // Data-safe abort: NOTHING is installed (the live store handle is untouched) and this
+            // shard does NOT report a commit, so the cross-shard flip barrier never reaches N and the
+            // process-global serve gate stays `false` -- the sibling never serves a partial keyspace.
             tracing::error!(
                 shard = shard_index,
                 error = %e,
                 "ironcache: streamed-handoff receive-load FAILED; installing nothing (data-safe \
-                 abort, shard left unready). TODO(#391 PR-6): abort the sibling unserving."
+                 abort, shard left unready + node kept unserving via the flip barrier)."
             );
             Err(())
         }

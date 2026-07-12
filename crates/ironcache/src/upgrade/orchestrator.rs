@@ -54,7 +54,7 @@ use ironcache_storage::{AccountingHook, EvictionHook, UnixMillis};
 use ironcache_store::ShardStore;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::commit::{Staging, begin_serving_on_commit, decide_cutover, promote, resume_old_shard};
+use super::commit::{ReceiverFlipBarrier, Staging, decide_cutover, promote, resume_old_shard};
 use super::stream::{self, CutoverState, HandoffError, LoadedShard, PreparedShard};
 
 /// The environment variable naming the streamed-handoff ROLE of a spawned process
@@ -424,10 +424,17 @@ where
 
     // THE FLIP (all committed): manifest LAST, atomic promote, then begin serving, then SERVED. Every
     // acked write <= E for every shard is already fsync'd to staging (Phase 1 bulk + Phase 3 delta),
-    // so the promote publishes a durable state@E, and only THEN does the process begin serving.
+    // so the promote publishes a durable state@E, and only THEN does the process begin serving. The
+    // single all-or-nothing SERVING flip is routed through a [`ReceiverFlipBarrier`] -- the SAME gather
+    // the live per-shard sibling uses -- so this whole-node driver and the multi-shard sibling share
+    // one flip authority: report one commit per adopted shard; the barrier flips serving EXACTLY ONCE,
+    // on the Nth (last) report. Single-threaded here, so it is trivially all-or-nothing.
     staging.write_manifest(save_unix_secs, entries)?;
     promote(staging.dir(), data_dir)?;
-    begin_serving_on_commit();
+    let flip = ReceiverFlipBarrier::new(committed.len());
+    for _ in &committed {
+        flip.report_committed();
+    }
     for stream_io in streams.iter_mut() {
         stream::send_served(stream_io).await?;
     }

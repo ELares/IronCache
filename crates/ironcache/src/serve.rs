@@ -299,6 +299,12 @@ pub fn run_server_observed(
         && config.handoff_socket.is_some()
     {
         set_serving(false);
+        // #638 slice-4 RECEIVER FLIP BARRIER: install the cross-shard flip barrier sized to the shard
+        // count, ONCE, before any shard spawns. Each shard, on its OWN cutover commit (adopt), reports
+        // to it (`report_receiver_shard_committed`); the LAST shard to commit performs the single
+        // all-or-nothing `set_serving(true)` flip -- never the FIRST shard while a sibling shard is
+        // still not committed. A normal (non-receiver) boot never installs it, so the gate is absent.
+        install_receiver_flip_barrier(config.shards.max(1));
     }
 
     // The cluster node id (CLUSTER_CONTRACT.md #70), leaked to a 'static str at boot exactly
@@ -1531,6 +1537,35 @@ pub(crate) fn is_serving() -> bool {
 /// read is [`is_serving`].
 pub(crate) fn set_serving(serving: bool) {
     SERVING.store(serving, Ordering::Relaxed);
+}
+
+/// The #638 slice-4 RECEIVER-side cross-shard FLIP barrier (process-global). Installed ONCE at boot,
+/// ONLY in the streamed-handoff RECEIVER role, with N = the shard count. Each shard, on its OWN
+/// successful cutover commit (adopt), reports to it; the barrier flips [`SERVING`] to `true` EXACTLY
+/// ONCE, on the Nth (all shards) report -- so the multi-shard sibling begins serving ALL-OR-NOTHING,
+/// never on the FIRST shard's commit while a sibling shard is still not committed. `None` (absent) on
+/// every normal (non-receiver) boot, so the default datapath never touches it.
+static RECEIVER_FLIP_BARRIER: std::sync::OnceLock<
+    std::sync::Arc<crate::upgrade::commit::ReceiverFlipBarrier>,
+> = std::sync::OnceLock::new();
+
+/// Install the process-global receiver FLIP barrier for a streamed-handoff RECEIVER boot (#638 slice
+/// 4), sized to `total` shards. Called ONCE at boot (in [`run_server_observed`]) right where the
+/// receiver serve gate is set `false`, BEFORE any shard spawns. Idempotent via [`std::sync::OnceLock`]
+/// (a second call is ignored); a non-receiver boot never calls it, so the barrier stays absent.
+pub(crate) fn install_receiver_flip_barrier(total: usize) {
+    let _ = RECEIVER_FLIP_BARRIER.set(std::sync::Arc::new(
+        crate::upgrade::commit::ReceiverFlipBarrier::new(total),
+    ));
+}
+
+/// Report THIS shard's own cutover commit to the process-global receiver FLIP barrier (#638 slice 4):
+/// the LAST shard to commit performs the single all-or-nothing [`set_serving`]`(true)` flip. A no-op
+/// when no barrier is installed (every non-receiver boot), so the default path is byte-unchanged.
+pub(crate) fn report_receiver_shard_committed() {
+    if let Some(barrier) = RECEIVER_FLIP_BARRIER.get() {
+        barrier.report_committed();
+    }
 }
 
 /// Build a FRESH [`ShardStoreImpl`] with this shard's configured eviction policy, accounting,

@@ -129,11 +129,77 @@ pub fn decide_cutover<T>(prepared: &[Result<T, HandoffError>]) -> (CutoverState,
 /// the NEW acks writes only from HERE. Before this the process-global gate rejected every client
 /// command with `-LOADING`, so a client never read a half-loaded or not-yet-committed store.
 ///
-/// `dead_code`-allowed: the live caller is the PR-6 orchestrator (it drives `recv_await_commit` ->
-/// [`promote`] -> this -> [`stream::send_served`]); exercised now by the PR-5 continuity hero test.
-#[allow(dead_code)]
+/// The live callers are the #638 slice-4 [`ReceiverFlipBarrier`] (the receiver-side cross-shard flip
+/// gather) and [`crate::upgrade::orchestrator::run_receiver_cutover`] (which now routes its flip
+/// through that barrier); exercised by the PR-5 continuity hero test and the flip-barrier unit tests.
 pub(crate) fn begin_serving_on_commit() {
     crate::serve::set_serving(true);
+}
+
+/// The #638 slice-4 RECEIVER-side cross-shard FLIP BARRIER: the all-or-nothing gate that flips the
+/// NEW's process-global client serve gate ([`crate::serve::set_serving`], via
+/// [`begin_serving_on_commit`]) to serving EXACTLY ONCE, and ONLY after EVERY shard of a (possibly
+/// multi-shard) sibling has committed its own cutover.
+///
+/// ## Why a barrier (the multi-shard hazard)
+///
+/// The serve gate is a SINGLE process-global bool. On a multi-shard sibling each shard commits (adopts
+/// its received store) on its OWN thread at its OWN instant. If each shard flipped the gate directly on
+/// its own commit, the FIRST shard to commit would flip the WHOLE node to serving while sibling shards
+/// are STILL not committed -- a client hitting a not-yet-committed shard's keyspace would then read a
+/// not-ready store. The barrier makes the flip ALL-OR-NOTHING: every shard REPORTS its commit here, and
+/// the gate flips once, only when the committed count reaches `total` (all shards).
+///
+/// ## The mechanism (monotonic, lock-free, no coordinator task)
+///
+/// A single [`AtomicUsize`](std::sync::atomic::AtomicUsize) committed-count plus the immutable `total`.
+/// [`ReceiverFlipBarrier::report_committed`] does one `fetch_add(1)`: the shard whose add makes the
+/// count REACH `total` (the LAST to commit) is the one that performs the single
+/// [`begin_serving_on_commit`]. Because only the exact Nth `fetch_add` yields `prev + 1 == total`, the
+/// flip happens EXACTLY ONCE -- earlier reports (`prev + 1 < total`) do not flip, and any extra report
+/// after N (`prev + 1 > total`) never re-flips and never panics: idempotent and monotonic (the gate only
+/// ever moves `false -> true`, never back). If ANY shard ABORTS / never reports, the count never reaches
+/// `total`, the gate stays `false`, and the sibling exits without ever serving (adopt nothing, no
+/// partial serving). It holds ONLY an atomic + a `usize`, so it is `Send + Sync` and is shared by `Arc`
+/// across every shard thread; the `!Send` per-shard stores never enter it.
+///
+/// Single-shard (`total == 1`) is the UNCHANGED behavior: the one commit is the Nth, so it flips on that
+/// one commit exactly as before. `total == 0` (a degenerate empty handoff -- never a real node) never
+/// reaches the flip, so it stays unserving.
+#[derive(Debug)]
+pub(crate) struct ReceiverFlipBarrier {
+    /// How many shards have reported their own cutover commit so far.
+    committed: std::sync::atomic::AtomicUsize,
+    /// The total shard count the flip waits for (N). The gate flips when `committed` reaches this.
+    total: usize,
+}
+
+impl ReceiverFlipBarrier {
+    /// Build a barrier that flips the serve gate once `total` shards have each reported a commit.
+    #[must_use]
+    pub(crate) fn new(total: usize) -> Self {
+        ReceiverFlipBarrier {
+            committed: std::sync::atomic::AtomicUsize::new(0),
+            total,
+        }
+    }
+
+    /// Report ONE shard's own cutover commit. The shard whose report makes the committed count REACH
+    /// `total` (the last to commit) performs the single all-or-nothing serve flip
+    /// ([`begin_serving_on_commit`]); every other report is a plain count bump. Idempotent and
+    /// monotonic: only the exact Nth report flips, extra reports never re-flip and never panic, and the
+    /// gate never reverts.
+    pub(crate) fn report_committed(&self) {
+        // `fetch_add` returns the PREVIOUS count, so `prev + 1` is THIS report's ordinal. The flip is
+        // performed by (and only by) the report whose ordinal equals `total` -- exactly once. `AcqRel`
+        // so the flip happens-after every reporting shard's adopt is visible on the flipping thread.
+        let prev = self
+            .committed
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if prev + 1 == self.total {
+            begin_serving_on_commit();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1467,5 +1533,120 @@ mod tests {
             !crate::serve::is_shard_loading(),
             "the reaper resumes (guard false) after the outage"
         );
+    }
+
+    // ---- (#638 slice-4) THE RECEIVER-SIDE CROSS-SHARD FLIP BARRIER ----
+
+    /// Serialize the flip-barrier tests among themselves: each mutates the PROCESS-GLOBAL `SERVING`
+    /// gate (set it `false`, drive the barrier, restore it `true`), so they must not interleave with
+    /// one another. A poisoned lock (a prior test panicked mid-critical-section) is RECOVERED rather
+    /// than cascaded. These are plain `#[test]`s (no `.await`), so a `std` mutex guard is never held
+    /// across an await. Each test ALSO restores `SERVING` to the default (`true`) on the way out,
+    /// matching the slice-2 discipline so the other modules' hero tests are not perturbed.
+    static FLIP_BARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// N=3: the flip WAITS for ALL shards. After 2 reports the gate is STILL false; the 3rd (Nth)
+    /// report flips it to serving -- EXACTLY on the Nth, not before.
+    #[test]
+    fn receiver_flip_waits_for_all_shards() {
+        let _guard = FLIP_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::serve::set_serving(false); // model the NEW receiver boot (gate closed until commit).
+
+        let barrier = ReceiverFlipBarrier::new(3);
+        barrier.report_committed();
+        assert!(
+            !crate::serve::is_serving(),
+            "1 of 3 shards committed -> still not serving"
+        );
+        barrier.report_committed();
+        assert!(
+            !crate::serve::is_serving(),
+            "2 of 3 shards committed -> still not serving (the flip is NOT before the Nth)"
+        );
+        barrier.report_committed();
+        assert!(
+            crate::serve::is_serving(),
+            "the 3rd (Nth) shard commit flips the gate to serving (all-or-nothing)"
+        );
+
+        crate::serve::set_serving(true); // restore the process-global default.
+    }
+
+    /// N=3 with an ABORT: 2 shards commit, the 3rd never reports (it aborted / failed to commit). The
+    /// count never reaches N, so the gate STAYS false -- the sibling never serves a partial keyspace.
+    #[test]
+    fn receiver_flip_never_serves_on_abort() {
+        let _guard = FLIP_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::serve::set_serving(false);
+
+        let barrier = ReceiverFlipBarrier::new(3);
+        barrier.report_committed();
+        barrier.report_committed();
+        // The 3rd shard ABORTED: it never reports (adopt-nothing). The count is stuck at 2 < 3.
+        assert!(
+            !crate::serve::is_serving(),
+            "an abort (a shard that never commits) leaves the gate false (no partial serve)"
+        );
+
+        crate::serve::set_serving(true);
+    }
+
+    /// N=1 (single-shard, the UNCHANGED behavior): the one commit IS the Nth, so it flips on that one
+    /// commit exactly as the direct pre-barrier flip did.
+    #[test]
+    fn receiver_flip_single_shard_flips_on_its_commit() {
+        let _guard = FLIP_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::serve::set_serving(false);
+
+        let barrier = ReceiverFlipBarrier::new(1);
+        assert!(
+            !crate::serve::is_serving(),
+            "not serving before the one commit"
+        );
+        barrier.report_committed();
+        assert!(
+            crate::serve::is_serving(),
+            "the single shard's commit flips the gate (single-shard == today's behavior)"
+        );
+
+        crate::serve::set_serving(true);
+    }
+
+    /// IDEMPOTENT / MONOTONIC: extra reports after N do NOT re-flip and do NOT panic. Proven exactly:
+    /// after the Nth flip we manually re-close the gate, then fire extra reports and assert the gate
+    /// STAYS closed -- so the flip fires EXACTLY ONCE (on the Nth), never again.
+    #[test]
+    fn receiver_flip_is_idempotent_after_all_committed() {
+        let _guard = FLIP_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::serve::set_serving(false);
+
+        let barrier = ReceiverFlipBarrier::new(3);
+        barrier.report_committed();
+        barrier.report_committed();
+        barrier.report_committed();
+        assert!(
+            crate::serve::is_serving(),
+            "the Nth (3rd) report flipped the gate to serving"
+        );
+
+        // Re-close the gate, then spam EXTRA reports: a monotonic/idempotent barrier never re-flips.
+        crate::serve::set_serving(false);
+        for _ in 0..5 {
+            barrier.report_committed(); // must not panic and must not re-flip.
+        }
+        assert!(
+            !crate::serve::is_serving(),
+            "extra reports after N never re-flip the gate (the flip is EXACTLY once, on the Nth)"
+        );
+
+        crate::serve::set_serving(true);
     }
 }
