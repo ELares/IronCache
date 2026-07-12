@@ -568,6 +568,27 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
     // else never reaches the drain loop (the serve loop only enqueues those two classes);
     // dispatch_remote_* refuses a mis-routed command defensively.
     let cmd_upper = crate::serve::ascii_upper(request.command());
+
+    // -- THE `-LOADING` WRITE-QUIESCE GATE ON THE CROSS-SHARD PATH (#391, Decision 2 Option C). A
+    // write to a key THIS shard OWNS but that a SIBLING home core received is dispatched HERE (via
+    // the inbox), NOT through this shard's `route_and_dispatch`, so the quiesce must ALSO reject it
+    // on the OWNING shard -- BEFORE `dispatch_remote_keyed` reaches the store's write funnel and
+    // assigns a ring offset. Without this second gate a cross-shard write could land above this
+    // shard's latched cut offset E during the brief window where the owner is quiesced but the
+    // sender's home shard is not yet (the flag is PER-SHARD, so the two do not flip atomically). It
+    // reads THIS (owning) shard's core-local flag on THIS shard's thread: one predictable-not-taken
+    // bool load on the default path, short-circuiting the write classifier. Cross-shard hops are
+    // never inside a MULTI (a cross-shard transaction is rejected at queue time), so the classifier
+    // runs with `in_multi = false` / no staged batch. Reads pass straight through.
+    if crate::serve::is_shard_loading()
+        && ironcache_server::request_is_write_for_pause(&cmd_upper, false, &[])
+    {
+        return ShardReply {
+            value: Value::error(ironcache_protocol::ErrorReply::loading()),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
     // The internal whole-keyspace partials run `cmd_keyspace` / `db_len` reads over THIS shard's
     // partition, but are NOT in `spec_of`, so `classify` returns `AlwaysHome` for them; allow-list
     // them alongside the classified set: the two #371 slot-scans and the #531 `__ICINFOKEYSPACE`

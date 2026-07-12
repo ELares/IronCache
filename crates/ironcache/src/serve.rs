@@ -979,6 +979,18 @@ thread_local! {
     // owner's WRITE path, so no admission/evict runs there; removals arrive only via the
     // stream. This guard closes the one remaining self-removal source (the timer reaper).
     static REPLICA_PASSIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Whether THIS shard is mid-QUIESCE for a streamed live-cutover final delta cut (#391,
+    // Decision 2 Option C). While `true`, the dispatch write gate rejects every client MUTATOR with
+    // `-LOADING` BEFORE the write is assigned a ring offset / appended to the ring, so the final cut
+    // ships a consistent tail: no mutation is acked at an offset above the latched cut offset E.
+    // Reads are still served during the quiesce. Core-local (per shard, shared-nothing ADR-0002), a
+    // plain `Cell<bool>` exactly like REPLICA_PASSIVE above -- deliberately NOT a shared atomic: a
+    // cross-thread atomic would RACE the E-latch (the on-thread quiesce sets this flag and reads
+    // `ring.head()` in ONE uninterrupted critical section, which a shared flag cannot guarantee). Set
+    // by [`quiesce_shard`] (with the E-latch, one on-thread step), cleared by [`unquiesce_shard`]
+    // (the abort/resume path). DEFAULTS `false`: the non-cutover hot path pays a single
+    // predictable-not-taken bool load per command and is byte-unchanged.
+    static LOADING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // The shard's PER-SHARD Pub/Sub subscription table (SERVER_PUSH.md #20, PR 91a): channel
     // -> {conn id -> push sender}. Core-local (per shard, shared-nothing ADR-0002) with NO
     // lock; held as Rc<RefCell<..>> exactly like STORE/WHEEL/ENV so a connection task, the
@@ -1059,6 +1071,72 @@ pub(crate) fn set_replica_passive(passive: bool) {
 #[must_use]
 pub(crate) fn is_replica_passive() -> bool {
     REPLICA_PASSIVE.with(std::cell::Cell::get)
+}
+
+/// Set THIS shard's core-local `-LOADING` write-quiesce flag (#391, Decision 2 Option C).
+///
+/// `pub(crate)` so the quiesce/unquiesce entries below (and, in a later PR, the on-shard-thread
+/// `ShardWork` control message that drives the live cutover) flip it. A plain `Cell` write on the
+/// shard's own thread; NOT a shared atomic (that would race the E-latch, see [`quiesce_shard`]).
+///
+/// `dead_code`-allowed: this + [`quiesce_shard`] + [`unquiesce_shard`] are the quiesce ENTRY the
+/// PR-4 cutover coordinator wires (there is no live caller yet; the dispatch gate uses the separate
+/// [`is_shard_loading`] read, which IS live). Covered by the PR-3 quiesce unit test.
+#[allow(dead_code)]
+pub(crate) fn set_shard_loading(loading: bool) {
+    LOADING.with(|c| c.set(loading));
+}
+
+/// Whether THIS shard is currently quiescing writes for a streamed-cutover final delta cut (#391).
+///
+/// This is the HOT-PATH read the dispatch write gate ([`route_and_dispatch`]) and the cross-shard
+/// drain gate ([`crate::coordinator::run_remote`]) consult: a single core-local `Cell<bool>` load
+/// (shared-nothing ADR-0002), `false` on every non-cutover command, so the default path pays one
+/// predictable-not-taken branch and never reaches the write classifier. `pub(crate)` so the
+/// coordinator drain loop reads the OWNING shard's flag on its own thread.
+#[must_use]
+pub(crate) fn is_shard_loading() -> bool {
+    LOADING.with(std::cell::Cell::get)
+}
+
+/// QUIESCE THIS shard for a streamed live-cutover final delta cut and return the cut offset `E`
+/// (#391, Decision 2 Option C). The clean entry the PR-4 cutover coordinator calls, ON this shard's
+/// thread (via the existing inbox), to stop acking writes and latch the tail.
+///
+/// The two statements below are ONE uninterrupted on-shard-thread critical section: there is no
+/// `.await` and no cross-thread hop between setting the core-local `loading` flag and latching
+/// `E = ring.head()`, so nothing else runs in between on this single-threaded, shared-nothing shard
+/// (ADR-0002). The instant `loading` is set, the dispatch write gate rejects every client MUTATOR
+/// with `-LOADING` BEFORE it is assigned a ring offset (the offset is assigned only inside the
+/// store's write funnel, downstream of the gate), so no write can be appended above the `E` captured
+/// here. That structurally guarantees "a client write is acked only if its offset <= E" and closes
+/// the E-latch TOCTOU window (W1) WITHOUT a lock or a cross-thread atomic. Reads keep flowing.
+///
+/// `ring` is the shard's always-on replication observer ring (the same ring the write path appends
+/// to and the cutover sender drains); it is threaded in explicitly, exactly as
+/// [`crate::upgrade::stream::send_cutover`] takes it, rather than read from a thread-local -- so the
+/// quiesce and the delta ship agree on one ring. Idempotent: re-quiescing simply re-latches the head.
+///
+/// `dead_code`-allowed: the PR-4 cutover coordinator is the (single) live caller (it invokes this on
+/// the shard thread via the inbox, then ships `ring[F+1..=E]` with the returned `E`). Exercised now
+/// by the PR-3 quiesce unit test.
+#[allow(dead_code)]
+pub(crate) fn quiesce_shard(
+    ring: &Rc<RefCell<ironcache_repl::ReplRing>>,
+) -> ironcache_repl::ReplOffset {
+    set_shard_loading(true);
+    ring.borrow().head()
+}
+
+/// UNQUIESCE THIS shard: clear the `-LOADING` flag so it resumes acking writes (#391). The
+/// ABORT/RESUME path -- a failed or aborted cutover leaves every shard fully serving again. Runs on
+/// the shard's own thread (like [`quiesce_shard`]); idempotent (a no-op when not quiescing).
+///
+/// `dead_code`-allowed: the PR-4 cutover coordinator calls this on the abort edge. Exercised now by
+/// the PR-3 quiesce unit test.
+#[allow(dead_code)]
+pub(crate) fn unquiesce_shard() {
+    set_shard_loading(false);
 }
 
 /// The shard's per-shard Pub/Sub subscription table handle (SERVER_PUSH.md #20, PR 91a),
@@ -3748,6 +3826,33 @@ async fn route_and_dispatch(
     ) {
         state_rc.borrow_mut().counters.on_command();
         encode_into(out, &ironcache_server::Value::error(deny), conn.proto);
+        return false;
+    }
+
+    // -- THE `-LOADING` WRITE-QUIESCE GATE (#391 streamed live-cutover, Decision 2 Option C).
+    // While THIS shard is quiescing for the final delta cut, reject every client MUTATOR with
+    // `-LOADING` HERE -- BEFORE routing, MULTI queueing, cross-shard hop, or local dispatch, and so
+    // BEFORE the store's write funnel assigns the write a ring offset. That is what makes "a client
+    // write is acked only if its offset <= E" structural: the write never reaches the ring, so it
+    // can never land above the latched cut offset. Reads (and admin like PING/INFO) flow straight
+    // through. The write classifier is the SAME [`ironcache_server::request_is_write_for_pause`] the
+    // CLIENT PAUSE gate uses, so the MULTI/EXEC convention matches exactly: a command merely being
+    // QUEUED inside a MULTI is not a write here (it is held at its EXEC), and an EXEC whose staged
+    // batch contains any write IS a write (so the whole transaction is rejected, never partially
+    // applied above E). DEFAULT (not quiescing) is BYTE-UNCHANGED and near-free: `is_shard_loading`
+    // is a single core-local `Cell<bool>` load that short-circuits the `&&`, so the classifier never
+    // runs and this is one predictable-not-taken branch. This is DELIBERATELY not CLIENT PAUSE: a
+    // paused write applies AFTER the window (at an offset > E, lost by the cut), whereas this REJECTS
+    // it so the client retries against whichever process ends up authoritative.
+    if is_shard_loading()
+        && ironcache_server::request_is_write_for_pause(&cmd_upper, conn.in_multi, &conn.queued)
+    {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::loading()),
+            conn.proto,
+        );
         return false;
     }
 
@@ -8281,6 +8386,106 @@ mod tests {
             UnixMillis(0),
         );
         wheel.borrow_mut().register(0, key, deadline);
+    }
+
+    #[test]
+    fn quiesce_latches_e_gates_writes_and_unquiesce_resumes() {
+        // #391 PR-3 HERO: the per-shard `-LOADING` write quiesce + E-latch. This is the load-bearing
+        // safety unit: it asserts "a client write is acked only if its offset <= E" and that an
+        // in-flight-tail write after the E-latch is rejected + never appended, while reads keep
+        // flowing and unquiesce resumes writes.
+        use ironcache_repl::{ReplObserver, ReplOffset, ReplRing};
+
+        // Belt-and-braces: this test drives the shard-thread-local LOADING flag; ensure no prior
+        // state leaks in (each libtest test runs on its own thread, so this is defensive).
+        unquiesce_shard();
+        assert!(!is_shard_loading(), "a fresh shard is not quiescing");
+
+        // An always-on observer ring on a fresh store: EVERY applied write is assigned a monotonic
+        // ring offset (the keystone the cut relies on). Two client writes give the ring a tail.
+        let ring = ReplRing::new(4096, ReplOffset::ZERO);
+        let mut store =
+            ShardStore::with_hooks(16, Policy::cache_default(), CountingAccounting::new());
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        let now = UnixMillis(1_000);
+        store.upsert(0, b"k1", NewValue::Bytes(b"v1"), ExpireWrite::Clear, now);
+        store.upsert(0, b"k2", NewValue::Bytes(b"v2"), ExpireWrite::Clear, now);
+        let head_before = ring.borrow().head();
+        assert_ne!(
+            head_before,
+            ReplOffset::ZERO,
+            "the two writes advanced the ring before the quiesce"
+        );
+
+        // QUIESCE: on this (shard) thread, set loading + latch E in ONE critical section.
+        let e = quiesce_shard(&ring);
+        assert!(
+            is_shard_loading(),
+            "the shard is quiescing after quiesce_shard"
+        );
+        assert_eq!(e, head_before, "E is the ring head at the quiesce instant");
+
+        // A client MUTATOR attempted now is REJECTED by the gate BEFORE offset assignment. The
+        // production gate is `is_shard_loading() && request_is_write_for_pause(..)`; assert that
+        // exact decision. Because a rejected write returns before the store is ever touched, we do
+        // NOT apply it -- and the ring never advances, so no acked write lands above E.
+        assert!(
+            is_shard_loading() && ironcache_server::request_is_write_for_pause(b"SET", false, &[]),
+            "a client write is quiesced (the gate would reject it with -LOADING)"
+        );
+        assert_eq!(
+            ring.borrow().head(),
+            e,
+            "the rejected write is never appended: the offset stays at E"
+        );
+
+        // A READ is still served during the quiesce: the gate never classifies a read as a write,
+        // so it flows through, and serving it does not advance the ring.
+        assert!(
+            !ironcache_server::request_is_write_for_pause(b"GET", false, &[]),
+            "a read is not a write, so the quiesce gate lets it through"
+        );
+        assert!(
+            store.contains_live(0, b"k1", now),
+            "a read is served during the quiesce"
+        );
+        assert_eq!(ring.borrow().head(), e, "a read does not advance the ring");
+
+        // Structural "acked implies offset <= E": nothing new was assigned an offset while
+        // quiescing, so the ring head is still exactly E.
+        assert_eq!(ring.borrow().head(), e, "no mutation was acked above E");
+
+        // UNQUIESCE (the abort/resume path): writes resume; the next write acks and advances PAST E.
+        unquiesce_shard();
+        assert!(
+            !is_shard_loading(),
+            "the shard resumes acking writes after unquiesce"
+        );
+        assert!(
+            !(is_shard_loading()
+                && ironcache_server::request_is_write_for_pause(b"SET", false, &[])),
+            "a write is no longer quiesced after unquiesce"
+        );
+        store.upsert(0, b"k3", NewValue::Bytes(b"v3"), ExpireWrite::Clear, now);
+        assert!(
+            ring.borrow().head() > e,
+            "a resumed write acks and advances the offset past E"
+        );
+    }
+
+    #[test]
+    fn quiesce_gate_is_a_core_local_bool_and_defaults_off() {
+        // HOT PATH / DEFAULT: the quiesce guard is a single core-local `Cell<bool>` (NOT a shared
+        // atomic), defaulting `false`, so a non-cutover shard pays one predictable-not-taken bool
+        // load per command and the `&&` short-circuits BEFORE the write classifier ever runs -- the
+        // dispatch path is byte-unchanged. This documents + pins that default-off property.
+        unquiesce_shard();
+        assert!(!is_shard_loading(), "not quiescing by default");
+        // The guard toggles on this shard's own thread only (shared-nothing ADR-0002).
+        set_shard_loading(true);
+        assert!(is_shard_loading(), "the core-local flag flips on");
+        set_shard_loading(false);
+        assert!(!is_shard_loading(), "the core-local flag flips back off");
     }
 
     #[test]

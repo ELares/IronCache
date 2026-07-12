@@ -78,6 +78,14 @@ pub enum ErrorCode {
     /// number of replicas are currently in sync. Verified against redis/redis `src/server.c`
     /// (`shared.noreplicaserr`, `"-NOREPLICAS Not enough good replicas to write."`).
     NoReplicas,
+    /// `-LOADING <message>` the server is loading the dataset in memory and cannot serve the
+    /// command right now (Redis 6+ `shared.loadingerr`). IronCache emits it during the streamed
+    /// live-cutover upgrade (#391): while a shard is quiescing writes for the final delta cut, a
+    /// client MUTATOR is rejected with `-LOADING` so no write is acked past the cut offset. Clients
+    /// pattern-match the leading `LOADING` token to retry transiently, so the token is part of the
+    /// contract. Added at the END of the enum so no existing discriminant churns (the freeze-point
+    /// rule above).
+    Loading,
 }
 
 impl ErrorCode {
@@ -102,6 +110,7 @@ impl ErrorCode {
             ErrorCode::Ask => "ASK",
             ErrorCode::TryAgain => "TRYAGAIN",
             ErrorCode::NoReplicas => "NOREPLICAS",
+            ErrorCode::Loading => "LOADING",
         }
     }
 }
@@ -1174,6 +1183,22 @@ impl ErrorReply {
     pub fn no_replicas() -> Self {
         ErrorReply::new(ErrorCode::NoReplicas, "Not enough good replicas to write.")
     }
+
+    /// `-LOADING server is loading the dataset in memory` - the transient reply the server returns
+    /// when it cannot serve a command because it is loading the dataset (Redis 6+ `shared.loadingerr`,
+    /// `"-LOADING Redis is loading the dataset in memory\r\n"`). IronCache emits it during the
+    /// streamed live-cutover upgrade (#391): a shard quiescing writes for the final delta cut rejects
+    /// every client MUTATOR with this reply so no write is acknowledged past the cut offset. The
+    /// leading `server` (rather than a product name) keeps the reply free of any deployment specifics
+    /// while preserving the byte-exact `LOADING` token clients pattern-match to retry. The encoder
+    /// appends the trailing CRLF, so [`Self::line`] returns the reply without it.
+    #[must_use]
+    pub fn loading() -> Self {
+        ErrorReply::new(
+            ErrorCode::Loading,
+            "server is loading the dataset in memory",
+        )
+    }
 }
 
 /// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so
@@ -1389,6 +1414,32 @@ mod tests {
         );
         assert_eq!(ErrorReply::oom().code(), ErrorCode::Oom);
         assert_eq!(ErrorCode::Oom.token(), "OOM");
+    }
+
+    #[test]
+    fn loading_is_byte_exact() {
+        // #391 streamed live-cutover quiesce. The `LOADING` token mirrors Redis 6+
+        // `shared.loadingerr` byte-for-byte except the leading `server` (in place of a product
+        // name), so a client's transient-retry pattern-match on the token still works. `line()` is
+        // the reply WITHOUT the trailing CRLF (the encoder appends it).
+        assert_eq!(
+            ErrorReply::loading().line(),
+            "-LOADING server is loading the dataset in memory"
+        );
+        assert_eq!(ErrorReply::loading().code(), ErrorCode::Loading);
+        assert_eq!(ErrorCode::Loading.token(), "LOADING");
+        // The FULL on-wire line (with the encoder's CRLF) is byte-exact -- this is what the
+        // dispatch quiesce gate writes to the client.
+        let mut wire = Vec::new();
+        crate::encode::encode(
+            &mut wire,
+            &crate::value::Value::error(ErrorReply::loading()),
+            crate::value::ProtoVersion::Resp2,
+        );
+        assert_eq!(
+            wire,
+            b"-LOADING server is loading the dataset in memory\r\n"
+        );
     }
 
     #[test]
