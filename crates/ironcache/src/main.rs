@@ -375,8 +375,14 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
             serve::SignalOutcome::Cutover => {
                 match drive_cutover(&cfg, &set, &handles.cutover_control) {
                     CutoverAction::SetShutdownFlag => {
-                        // The cutover already committed BEFORE this flag, so DRAIN_GRACE never bounds it;
-                        // shard 0's drain loop now observes the flag and exits(0) after the normal drain.
+                        // The cutover COMMITTED. Mark this as a cutover HANDOFF exit (#638) BEFORE the
+                        // shutdown flag: the drain paths then use the SHORT `CUTOVER_DRAIN_GRACE` (the OLD
+                        // closes its already-quiesced client connections promptly so a client retrying
+                        // `-LOADING` reconnects to the NEW immediately -- sub-second stall), and shard 0
+                        // SKIPS the redundant save-on-exit (the NEW already durably promoted state@E). A
+                        // committed cutover is a handoff, not a leisurely shutdown; SIGINT/SIGTERM never
+                        // sets this flag, so their full-`DRAIN_GRACE` graceful stop is byte-unchanged.
+                        ironcache_runtime::bootstrap::mark_cutover_exit();
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }

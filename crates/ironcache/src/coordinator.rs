@@ -425,6 +425,18 @@ pub async fn run_drain_loop(
     };
 
     if stop_requested {
+        // COMMITTED-CUTOVER FAST EXIT (#638): on a committed streamed cutover the NEW already durably
+        // promoted this shard's state@E (the receiver publishes `dump-shard-<n>.icss` BEFORE it sends
+        // Served), so a redundant OLD save-on-exit would only DELAY the handoff exit (holding the
+        // quiesced client connections past the fast drain) for zero durability gain. Skip it and
+        // exit(0) immediately -- the handoff already succeeded, the exit is the last step. The normal
+        // SIGINT/SIGTERM stop does NOT set this flag, so its save-on-exit below is byte-unchanged.
+        if shard_index == 0 && ironcache_runtime::bootstrap::is_cutover_exit() {
+            tracing::info!(
+                "ironcache: committed-cutover fast exit (state@E already promoted by the NEW) -> exit 0"
+            );
+            std::process::exit(0);
+        }
         // A save policy is the LIVE runtime policy (a `CONFIG SET save` may have turned it on/off
         // since boot), so read it from the runtime overlay, gated on persistence being enabled.
         let is_save_host = shard_index == 0 && persist.is_some() && ctx.runtime.has_save_policy();
@@ -1721,21 +1733,21 @@ async fn resolve_receive_role(_ctx: &ServerContext, _shard_index: usize) -> Resu
     Ok(false)
 }
 
-/// #391 PR-2: connect to the handoff socket for THIS shard and pull its store into the thread-local
-/// [`ShardStoreImpl`], adopting ONLY on the fully verified, cutover-acked path.
+/// #391 PR-2 / #638: connect to the handoff socket for THIS shard and pull its store into the
+/// thread-local [`ShardStoreImpl`], adopting ONLY on the fully verified, cutover-COMMITTED path.
 ///
 /// The receiver dials the sender's node-local socket (retrying while it is not yet bound, bounded by
-/// the plan timeout), then drives the transport's [`recv_shard_timed`](crate::upgrade::drive::recv_shard_timed)
-/// bulk + delta + cutover into a FRESH store (offset-gated apply, `first == F+1` contiguity,
-/// `applied == final_offset`, CRC + db-count verified inside the transport). Only that Ok result is
-/// installed; on ANY error nothing is installed and the live store is untouched (see
-/// [`receive_shard_into`]). `now` is read from THIS shard's Env clock (the determinism seam,
-/// ADR-0003), and `make_store` builds the SAME concrete [`ShardStoreImpl`] the live serve path uses,
-/// so the installed store is type-identical.
+/// the plan timeout), then drives the **PR-4 commit protocol** (bulk -> `BulkStaged` -> delta ->
+/// `Prepared` -> await `Commit`/`Abort` -> `Served`) via [`receive_shard_into`] into a FRESH store
+/// (offset-gated apply, `first == F+1` contiguity, `applied == final_offset`, CRC + db-count verified
+/// inside the transport). Only a COMMITTED result is installed; on ANY error/abort nothing is installed
+/// and the live store is untouched. `now` is read from THIS shard's Env clock (the determinism seam,
+/// ADR-0003), and `make_store` builds the SAME concrete [`ShardStoreImpl`] the live serve path uses, so
+/// the installed store is type-identical.
 ///
 /// # Errors
-/// Any [`HandoffError`] from the connect or the transport (socket error, timeout, verify/contiguity
-/// failure, or a peer abort).
+/// Any [`HandoffError`] from the connect, the staging setup, or the transport (socket error, timeout,
+/// verify/contiguity failure, or a peer abort).
 #[cfg(unix)]
 async fn receive_shard_from_handoff(
     ctx: &ServerContext,
@@ -1760,32 +1772,64 @@ async fn receive_shard_from_handoff(
     let mut stream =
         crate::upgrade::drive::connect_handoff_for_shard(&plan.socket, shard_index, plan.timeout)
             .await?;
-    receive_shard_into(
+    // The PR-4 receiver needs a per-shard STAGING dir (Refinement A: fsync the bulk state@F + the
+    // bounded delta before `Prepared`). A throwaway per-shard/per-pid dir under the system temp,
+    // removed after the receive regardless of outcome; the durable copy on COMMIT lands in `data_dir`.
+    let staging_dir = std::env::temp_dir().join(format!(
+        "ic-cutover-recv-{}-shard-{shard_index}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    let staging = crate::upgrade::commit::Staging::new(&staging_dir)?;
+    // The node data dir (when persistence is configured): the committed shard's state@E is durably
+    // published there so a subsequent NEW boot reloads it. `None` on a persistence-off receiver (the
+    // adopt is then in-memory-only, matching a non-persistent node's steady state).
+    let data_dir = ctx.boot.data_dir.clone();
+    let result = receive_shard_into(
         &mut stream,
         &store_rc,
         move || crate::serve::fresh_shard_store(dbs, policy, reserved_bits),
         dbs,
         now,
         plan.timeout,
+        &staging,
+        data_dir.as_deref(),
     )
-    .await
+    .await;
+    // Remove the throwaway staging dir (the durable copy, if any, is already in `data_dir`).
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result
 }
 
-/// #391 PR-2 (the testable seam): pull a shard's store from `stream` into a LOCAL fresh store and, on
-/// the fully verified cutover-acked path ONLY, INSTALL it as the thread-local store `store_rc`.
+/// #391 PR-2 / #638 (the testable seam): pull a shard's store from `stream` and, on the fully verified
+/// cutover-COMMITTED path ONLY, INSTALL it as the thread-local store `store_rc`.
 ///
-/// This is the one place the receiver adopts: [`recv_shard_timed`](crate::upgrade::drive::recv_shard_timed)
-/// builds the fresh store, enforcing db-count, `first == F+1` contiguity, `applied == final_offset`,
-/// and the CRC/version envelope, and DROPS its partial store on any error (adopt nothing). Only its
-/// `Ok(LoadedShard)` is swapped into `store_rc` in ONE statement -- mirroring the HA-7d full-sync
-/// atomic store swap ([`crate::replica_attach`]) -- so a mid-stream error leaves `store_rc` exactly as
-/// it was (never half-populated). Generic over the store hooks + stream so it is driven directly over
-/// a `UnixStream::pair` in the unit tests, and concretely over the real socket by
-/// [`receive_shard_from_handoff`].
+/// This drives the **PR-4 commit protocol** the live SIGUSR1 sender speaks (`run_shard_cutover_task`
+/// -> `sender_phase1_bulk` / `send_delta_await_prepared` / `send_commit` / `await_served`), NOT the
+/// legacy `recv_shard` (which only ever sent `HELLO_ACK` + `CutoverAck` and so DEADLOCKED the live
+/// sender waiting on `BulkStaged` -- the bug the #638 slice-5 real-server acceptance surfaced):
+/// 1. [`receive_shard_to_prepared`](crate::upgrade::commit::receive_shard_to_prepared): recv bulk ->
+///    fsync it to `staging` -> `BulkStaged` -> recv + verify the bounded delta -> fsync it -> `Prepared`.
+/// 2. [`recv_await_commit`](crate::upgrade::stream::recv_await_commit): await the host's cross-shard
+///    `Commit`/`Abort` (the receiver's half of the write-authority transfer -- NOTHING is served before
+///    a `Commit`, so an aborted flip never leaves a half-adopted shard).
+/// 3. On `Commit`: when a `data_dir` is configured, DURABLY publish this shard's `state@E` to
+///    `dump-shard-<n>.icss` (per-shard-safe, so a NEW crash right after the cutover cannot lose the
+///    adopted keyspace), then `Served` (unblocking the sender's `await_served` so the OLD drains +
+///    exits), then ADOPT the store in ONE statement -- mirroring the HA-7d full-sync atomic swap so a
+///    mid-stream error leaves `store_rc` exactly as it was.
+/// 4. On `Abort` / ANY error: install NOTHING (the live store handle is untouched). The caller does not
+///    report to the receiver flip barrier, so the sibling never serves a partial keyspace.
+///
+/// Generic over the store hooks + stream so it is driven directly over a `UnixStream::pair` in the unit
+/// tests, and concretely over the real socket by [`receive_shard_from_handoff`]. `staging` is the
+/// per-shard Refinement-A staging area; `data_dir` (when `Some`) is the node data dir the promoted
+/// snapshot lands in.
 ///
 /// # Errors
 /// Any [`HandoffError`] from the transport; on error nothing is installed.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // the receiver's PR-4 inputs; mirrors the sender primitives.
 async fn receive_shard_into<E, A, S, M>(
     stream: &mut S,
     store_rc: &Rc<RefCell<ShardStore<E, A>>>,
@@ -1793,6 +1837,8 @@ async fn receive_shard_into<E, A, S, M>(
     expected_databases: u32,
     now: UnixMillis,
     timeout: Duration,
+    staging: &crate::upgrade::commit::Staging,
+    data_dir: Option<&std::path::Path>,
 ) -> Result<ReplOffset, HandoffError>
 where
     E: EvictionHook,
@@ -1800,19 +1846,66 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     M: FnMut() -> ShardStore<E, A>,
 {
-    // Build into a LOCAL LoadedShard (never adopted until fully verified + cutover-acked).
-    let loaded = crate::upgrade::drive::recv_shard_timed(
-        stream,
-        make_store,
-        expected_databases,
-        now,
+    use crate::upgrade::commit::receive_shard_to_prepared;
+    use crate::upgrade::stream::{ShardCommit, recv_await_commit, send_served};
+
+    // PHASE 1 + 3: recv bulk (fsync to staging, outside the outage) -> BulkStaged -> recv + verify the
+    // bounded delta (fsync) -> Prepared. Bounded so a hung/wedged sender aborts rather than hangs.
+    let (prepared, _entry) = match tokio::time::timeout(
         timeout,
+        receive_shard_to_prepared(stream, make_store, expected_databases, now, staging),
     )
-    .await?;
-    // ADOPT: install the verified store as THIS shard's thread-local store in one statement. On any
-    // error above we returned early and never reached here, so the live handle stays untouched.
+    .await
+    {
+        Ok(res) => res?,
+        Err(_elapsed) => {
+            return Err(HandoffError::Timeout {
+                phase: "recv-shard",
+            });
+        }
+    };
+
+    // AWAIT the host's cross-shard COMMIT/ABORT. On a dropped socket (host crash before Commit) this
+    // fail-closes -> the receiver adopts nothing (no split-brain).
+    let committed = match tokio::time::timeout(timeout, recv_await_commit(stream, prepared)).await {
+        Ok(res) => res?,
+        Err(_elapsed) => {
+            return Err(HandoffError::Timeout { phase: "commit" });
+        }
+    };
+    let loaded = match committed {
+        ShardCommit::Committed(loaded) => *loaded,
+        // The flip aborted (a sibling shard failed, or the host aborted): adopt NOTHING.
+        ShardCommit::Aborted => return Err(HandoffError::Aborted),
+    };
+
+    // DURABLE PUBLISH (state@E) BEFORE the OLD exits: write this shard's `dump-shard-<n>.icss` to the
+    // node data dir so a subsequent NEW boot reloads state@E and a NEW crash right after the cutover
+    // cannot lose the adopted keyspace. Per-shard-safe (distinct file), and the OLD is already quiesced
+    // (state@E too), so a concurrent OLD save is benign (identical content, atomic tmp->rename).
+    // BEST-EFFORT: the sender has RELEASED authority + sent Commit, so an error here must NOT abort the
+    // adopt (that would strand a W3 standby); the in-memory adopt below still stands.
+    if let Some(dir) = data_dir {
+        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = ironcache_persist::save_shard_to_dir(&loaded.store, loaded.shard, dir, now)
+        {
+            tracing::error!(
+                shard = loaded.shard,
+                error = %e,
+                "ironcache: streamed-handoff receiver could not durably publish state@E to data_dir; \
+                 the in-memory adopt still stands (a NEW crash before its own next save would be cold)"
+            );
+        }
+    }
+
+    // SERVED: tell the sender the commit landed (its `await_served` returns -> the OLD drains + exits).
+    send_served(stream).await?;
+
+    // ADOPT: install the verified store as THIS shard's thread-local store in one statement. Only
+    // reached on a COMMITTED flip, so the live handle is never left half-populated.
+    let final_offset = loaded.final_offset;
     *store_rc.borrow_mut() = loaded.store;
-    Ok(loaded.final_offset)
+    Ok(final_offset)
 }
 
 /// The coarse poll cadence the periodic-save loop ticks on while the save policy is OFF (or between
@@ -2454,12 +2547,56 @@ mod tests {
 #[cfg(all(test, unix))]
 mod receiver_load_tests {
     use super::*;
-    use crate::upgrade::stream::{freeze_cut, send_bulk_from_frozen, send_shard_from_frozen};
+    use crate::upgrade::commit::{Staging, send_shard_to_prepared};
+    use crate::upgrade::stream::{await_served, freeze_cut, send_bulk_from_frozen, send_commit};
     use ironcache_repl::{ReplId, ReplObserver, ReplRing};
     use ironcache_storage::{ExpireWrite, NewValue, Store};
     use ironcache_store::SnapshotCursor;
     use std::collections::HashMap;
     use tokio::net::UnixStream;
+
+    /// A throwaway per-test staging dir + `data_dir=None` receiver-side inputs for [`receive_shard_into`]
+    /// (the receiver now speaks the PR-4 commit protocol, so every test drives the whole
+    /// bulk -> Prepared -> Commit -> Served sequence). Persistence is off in these unit tests -- the
+    /// adopt is in-memory only -- so `data_dir` is `None`; the staging dir is removed on drop.
+    struct RecvStaging {
+        staging: Staging,
+        dir: std::path::PathBuf,
+    }
+    impl RecvStaging {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ic-recv-load-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let staging = Staging::new(&dir).expect("staging dir");
+            Self { staging, dir }
+        }
+    }
+    impl Drop for RecvStaging {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Drive the FULL PR-4 SENDER half the live SIGUSR1 cutover speaks -- the mirror of
+    /// [`receive_shard_into`]: freeze + bulk -> await BulkStaged -> quiesce + delta -> await Prepared
+    /// (`send_shard_to_prepared`), then `send_commit`, then `await_served`. Pairs against a receiver that
+    /// runs to a COMMIT; the two halves must match (the legacy `send_shard`/`send_cutover` deadlocked the
+    /// PR-4 receiver, the bug the #638 slice-5 acceptance surfaced). Returns the sender's cut offset E.
+    async fn send_shard_commit_served(
+        stream: &mut UnixStream,
+        store: &Rc<RefCell<ShardStore>>,
+        ring: &Rc<RefCell<ReplRing>>,
+        shard: u32,
+    ) -> Result<ReplOffset, HandoffError> {
+        let e = send_shard_to_prepared(stream, store, ring, shard, replid(), NOW, 4).await?;
+        send_commit(stream).await?;
+        await_served(stream).await?;
+        Ok(e)
+    }
 
     const DBS: u32 = 4;
     const NOW: UnixMillis = UnixMillis(1_000);
@@ -2547,8 +2684,10 @@ mod receiver_load_tests {
     /// gone), adopting through the sender's exact cut offset.
     #[tokio::test(flavor = "current_thread")]
     async fn receive_role_load_installs_exact_keyspace_with_encoding_and_ttl() {
-        let (mut src, ring) = observed(DBS);
-        populate(&mut src, 40);
+        crate::serve::unquiesce_shard(); // defensive: fresh thread-local serve gate.
+        let (src_bare, ring) = observed(DBS);
+        let src = Rc::new(RefCell::new(src_bare));
+        populate(&mut src.borrow_mut(), 40);
 
         // The receiver's live store handle, pre-seeded with a STALE sentinel to prove the install
         // REPLACES the whole store (adopt, not merge).
@@ -2562,8 +2701,11 @@ mod receiver_load_tests {
         );
         let store_rc = Rc::new(RefCell::new(recv_store));
 
+        let rs = RecvStaging::new("install-exact");
         let (mut a, mut b) = UnixStream::pair().expect("socket pair");
-        let sender = send_shard_from_frozen(&mut a, &mut src, &ring, 0, replid(), NOW, 4);
+        // The receiver now speaks PR-4; drive the matching PR-4 sender (bulk -> Prepared -> Commit ->
+        // Served), NOT the legacy `send_shard_from_frozen` (which would deadlock the commit await).
+        let sender = send_shard_commit_served(&mut a, &src, &ring, 0);
         let receiver = receive_shard_into(
             &mut b,
             &store_rc,
@@ -2571,6 +2713,8 @@ mod receiver_load_tests {
             DBS,
             NOW,
             GENEROUS,
+            &rs.staging,
+            None,
         );
         let (sres, rres) = tokio::join!(sender, receiver);
 
@@ -2582,7 +2726,7 @@ mod receiver_load_tests {
         );
 
         // The installed store equals the sender's keyspace across value + encoding + absolute TTL.
-        let want = dump_map(&src, NOW);
+        let want = dump_map(&src.borrow(), NOW);
         let got = dump_map(&store_rc.borrow(), NOW);
         assert_eq!(
             got, want,
@@ -2600,6 +2744,7 @@ mod receiver_load_tests {
             Some(TTL_AT),
             "the absolute TTL deadline round-trips verbatim (no rebase)"
         );
+        crate::serve::unquiesce_shard(); // the PR-4 sender permanently quiesced; tidy the thread-local.
     }
 
     /// DROP-ON-ERROR (mid-stream): the sender streams the BULK then DROPS the socket WITHOUT the
@@ -2622,13 +2767,15 @@ mod receiver_load_tests {
         let store_rc = Rc::new(RefCell::new(recv_store));
         let before = dump_map(&store_rc.borrow(), NOW);
 
+        let rs = RecvStaging::new("drop-midstream");
         let (mut a, mut b) = UnixStream::pair().expect("socket pair");
         // The sender ships the BULK (chunk_max = 1 -> many frames, a real partial transfer), then DROPS
-        // `a` with NO cutover; the receiver's `recv_cutover` then sees EOF mid-stream and aborts.
+        // `a` BEFORE the PR-4 commit sequence; the receiver then sees EOF mid-stream (either its
+        // BulkStaged reply cannot flush or the delta read hits EOF) and aborts -- adopting NOTHING.
         let sender = async move {
             let (frozen, cut) = freeze_cut(&mut src, &ring);
             let _ = send_bulk_from_frozen(&mut a, &frozen, 0, DBS, replid(), cut, NOW, 1).await;
-            // `a` drops here (no `send_cutover`) -> the receiver's cutover read hits EOF.
+            // `a` drops here (no delta / Commit) -> the receiver's read hits EOF mid-stream.
         };
         let receiver = receive_shard_into(
             &mut b,
@@ -2637,6 +2784,8 @@ mod receiver_load_tests {
             DBS,
             NOW,
             GENEROUS,
+            &rs.staging,
+            None,
         );
         let ((), rres) = tokio::join!(sender, receiver);
 
@@ -2665,8 +2814,10 @@ mod receiver_load_tests {
     /// receiver-side verification failure (the db-count gate) end-to-end through the install seam.
     #[tokio::test(flavor = "current_thread")]
     async fn receive_role_load_fail_closed_on_db_count_mismatch_installs_nothing() {
-        let (mut src, ring) = observed(DBS);
-        populate(&mut src, 12);
+        crate::serve::unquiesce_shard(); // defensive: fresh thread-local serve gate.
+        let (src_bare, ring) = observed(DBS);
+        let src = Rc::new(RefCell::new(src_bare));
+        populate(&mut src.borrow_mut(), 12);
 
         // The receiver expects TWICE the sender's database count.
         let mut recv_store = ShardStore::new(DBS * 2);
@@ -2680,8 +2831,11 @@ mod receiver_load_tests {
         let store_rc = Rc::new(RefCell::new(recv_store));
         let before = dump_map(&store_rc.borrow(), NOW);
 
+        let rs = RecvStaging::new("fail-closed-dbcount");
         let (mut a, mut b) = UnixStream::pair().expect("socket pair");
-        let sender = send_shard_from_frozen(&mut a, &mut src, &ring, 0, replid(), NOW, 4);
+        // The PR-4 sender streams the HELLO; the receiver rejects the db-count at the HELLO (before any
+        // key), so the sender observes the abort at `await_bulk_staged` and NOTHING is installed.
+        let sender = send_shard_commit_served(&mut a, &src, &ring, 0);
         let receiver = receive_shard_into(
             &mut b,
             &store_rc,
@@ -2689,6 +2843,8 @@ mod receiver_load_tests {
             DBS * 2,
             NOW,
             GENEROUS,
+            &rs.staging,
+            None,
         );
         let (sres, rres) = tokio::join!(sender, receiver);
 

@@ -354,8 +354,10 @@ mod uring_bootstrap {
                             serve_loop(conn_rx, &serve, shard, &shutdown).await;
                             // Bounded graceful join of the drain task (SHUTDOWN.md): the drain
                             // loop returns promptly on a flagged stop; this is the same final
-                            // backstop bound the tokio bootstrap applies.
-                            let drain_grace = tokio::time::sleep(crate::bootstrap::DRAIN_GRACE);
+                            // backstop bound the tokio bootstrap applies (the SHORT cutover grace
+                            // on a committed streamed-cutover exit, else the full DRAIN_GRACE).
+                            let drain_grace =
+                                tokio::time::sleep(crate::bootstrap::active_drain_grace());
                             tokio::pin!(drain_grace);
                             tokio::select! {
                                 _ = drain_task => {}
@@ -479,7 +481,7 @@ mod uring_bootstrap {
         if live.get() == 0 {
             return;
         }
-        let deadline = tokio::time::Instant::now() + crate::bootstrap::DRAIN_GRACE;
+        let deadline = tokio::time::Instant::now() + crate::bootstrap::active_drain_grace();
         let tick = Duration::from_millis(20);
         while live.get() > 0 {
             if tokio::time::Instant::now() >= deadline {
