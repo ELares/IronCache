@@ -191,6 +191,45 @@ Exactly one source (`--binary`, `--from-url`, or `--to`) must be given. If persi
 NOT configured, `ironcache upgrade` refuses unless `--yes` (you are accepting a cold
 restart).
 
+### In-server streamed live cutover (SIGUSR1, #638) -- opt-in via `handoff_socket`
+
+The default upgrade above SWAPS the binary and RESTARTS the process (the socket-activation
+handoff keeps the listen queue open across the brief restart). An alternative shape keeps
+the OLD process SERVING while it streams its live keyspace to a freshly spawned sibling
+(a re-exec of the binary in receiver role) and flips write authority at a single committed
+linearization point -- no restart, no acknowledged-write loss, and no orphaned-backlog RST
+because the sibling INHERITS the OLD's client listen fd. This path is OPT-IN: it runs only
+when a node is configured with a `handoff_socket` (TOML `handoff_socket = "..."` or
+`IRONCACHE_HANDOFF_SOCKET`, `crates/ironcache-config/src/lib.rs`), a node-local AF_UNIX
+rendezvous path both the OLD and the sibling agree on.
+
+The trigger is **SIGUSR1** to the running server pid (`crates/ironcache/src/serve.rs`
+`wait_for_signal` -> `SignalOutcome::Cutover`; `crates/ironcache/src/main.rs` `drive_cutover`).
+On a plain `SIGTERM`/`SIGINT` the server still does the unchanged graceful stop; SIGUSR1 is
+the streamed-cutover trigger:
+
+```sh
+# the running server must have handoff_socket configured; then:
+kill -USR1 "$(redis-cli INFO server | sed -n 's/^process_id://p' | tr -d '\r')"
+# on COMMIT: the sibling serves on the same port and the OLD process exits(0);
+# on ABORT (a bad/unusable handoff socket, or a failed receiver): the OLD keeps serving,
+#   never exits, and writes resume -- the trigger is fail-safe toward keep-serving.
+```
+
+`ironcache upgrade --streamed` is the intended CLI wrapper (it reads `INFO server`'s
+`process_id` and sends the signal); until it is wired the raw `kill -USR1` above is the
+trigger.
+
+> STATUS (slice-5 acceptance, #638): the SIGUSR1 trigger, the sender-side barrier, the
+> sibling spawn + inherited-listener no-RST, and the receiver-side serve-flip barrier are in
+> place, and the ABORT path (OLD keeps serving with zero loss) is verified end to end by
+> `crates/ironcache/tests/upgrade_streamed_sigusr1.rs`. The COMMIT path is NOT yet
+> operational: the real-server acceptance surfaced that the receiver boot path still drives
+> the legacy handoff receive (`stream::recv_shard`) instead of the PR-4 commit protocol the
+> live sender speaks (`BulkStaged`/`Prepared`/`Served`), so a real cutover currently deadlocks
+> and safely aborts. Use the default socket-activation `ironcache upgrade` above for
+> production single-node upgrades until the receiver commit-protocol wiring lands.
+
 ---
 
 ## HA cluster rolling upgrade
