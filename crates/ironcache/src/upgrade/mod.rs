@@ -32,6 +32,11 @@
 //! via [`std::process::Command`] from THIS short-lived process (not the server), which is NOT a
 //! `fork` syscall and respects the no-fork invariant (invariant 4).
 
+/// The receiver-authoritative cross-process COMMIT (#391 PR-4): the write-authority transfer at the
+/// streamed live cutover. New `Prepared`/`Commit`/`Served`/`BulkStaged` frames + the per-shard
+/// commit state machine + Refinement A staging fsync (bulk early / delta in-outage) + the atomic
+/// staging -> data_dir promote, wired to the PR-3 quiesce and closing the W5 internal-mutator window.
+pub mod commit;
 pub mod drive;
 pub mod fetch;
 pub mod health;

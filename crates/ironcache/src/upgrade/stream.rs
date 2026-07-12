@@ -141,6 +141,11 @@ const K_FRAME: u8 = 3;
 const K_CUTOVER: u8 = 4;
 const K_CUTOVER_ACK: u8 = 5;
 const K_ABORT: u8 = 6;
+// The #391 PR-4 receiver-authoritative cross-process COMMIT frames (the write-authority transfer).
+const K_BULK_STAGED: u8 = 7;
+const K_PREPARED: u8 = 8;
+const K_COMMIT: u8 = 9;
+const K_SERVED: u8 = 10;
 
 /// A typed handoff failure (ERRORS.md: no stringly-typed errors). EVERY variant is an ABORT: the
 /// receiver drops its partial store and the sender keeps the old process serving. The variants pin
@@ -237,9 +242,10 @@ pub enum HandoffError {
 }
 
 impl HandoffError {
-    /// Map a socket I/O error to [`HandoffError::Io`] (a mid-transfer disconnect surfaces as an
-    /// `UnexpectedEof` here, which is an abort like any other I/O failure).
-    fn io(e: &std::io::Error) -> Self {
+    /// Map a socket / file I/O error to [`HandoffError::Io`] (a mid-transfer disconnect surfaces as
+    /// an `UnexpectedEof` here, which is an abort like any other I/O failure). `pub(crate)` so the
+    /// PR-4 staging fsync ([`crate::upgrade::commit`]) maps its persist-crate `io::Error`s the same way.
+    pub(crate) fn io(e: &std::io::Error) -> Self {
         HandoffError::Io(e.to_string())
     }
 }
@@ -272,6 +278,26 @@ enum HandoffMsg {
     CutoverAck,
     /// Either side hit a failure and is tearing down; the peer must abort too.
     Abort,
+    /// RECEIVER -> SENDER (#391 PR-4, Refinement A): the receiver has fsync'd the BULK snapshot
+    /// (state@F) to its staging dir while the OLD still serves (Phase 1), so the HEAVY fsync is
+    /// OUTSIDE the write outage. The sender does NOT begin the write-quiesce (the outage) until it
+    /// receives this, keeping only the bounded post-E delta fsync inside the outage.
+    BulkStaged,
+    /// RECEIVER -> SENDER (#391 PR-4): this shard is fully VERIFIED (contiguity + `applied == E` +
+    /// CRC) AND its received state is fsync'd to staging. It is the receiver's promise that every
+    /// acked write `<= E` for this shard is now durably staged. The sender's coordinator gathers a
+    /// `Prepared` from EVERY shard (the all-or-nothing barrier) before it will `Commit`.
+    Prepared,
+    /// SENDER/coordinator -> RECEIVER (#391 PR-4): every shard is `Prepared`, so the flip is on. The
+    /// sender sends this ONLY AFTER it has released write authority (its quiesce is now permanent),
+    /// so a receiver that sees `Commit` knows the OLD will never ack another write (no split-brain).
+    /// The receiver adopts + promotes staging on this, and NOTHING before it.
+    Commit,
+    /// RECEIVER -> SENDER (#391 PR-4): the receiver promoted `staging -> data_dir` and is now the
+    /// serving authority. The OLD may drain in-flight reads + `exit(0)` (the actual drain/exit is
+    /// deferred to PR-6). A lost `Served` leaves the OLD in read-only degraded standby (W3), never a
+    /// resume-writes (which would split-brain) and never a destroy (which would lose data).
+    Served,
 }
 
 impl HandoffMsg {
@@ -291,6 +317,11 @@ impl HandoffMsg {
             }
             HandoffMsg::CutoverAck => (K_CUTOVER_ACK, Vec::new()),
             HandoffMsg::Abort => (K_ABORT, Vec::new()),
+            // The PR-4 commit-protocol control frames are all payload-free (pure sequence points).
+            HandoffMsg::BulkStaged => (K_BULK_STAGED, Vec::new()),
+            HandoffMsg::Prepared => (K_PREPARED, Vec::new()),
+            HandoffMsg::Commit => (K_COMMIT, Vec::new()),
+            HandoffMsg::Served => (K_SERVED, Vec::new()),
         }
     }
 
@@ -338,6 +369,31 @@ impl HandoffMsg {
                 Ok(HandoffMsg::CutoverAck)
             }
             K_ABORT => Ok(HandoffMsg::Abort),
+            // The PR-4 control frames carry NO payload; a non-empty body is malformed (fail-closed).
+            K_BULK_STAGED => {
+                if !payload.is_empty() {
+                    return Err(HandoffError::Malformed);
+                }
+                Ok(HandoffMsg::BulkStaged)
+            }
+            K_PREPARED => {
+                if !payload.is_empty() {
+                    return Err(HandoffError::Malformed);
+                }
+                Ok(HandoffMsg::Prepared)
+            }
+            K_COMMIT => {
+                if !payload.is_empty() {
+                    return Err(HandoffError::Malformed);
+                }
+                Ok(HandoffMsg::Commit)
+            }
+            K_SERVED => {
+                if !payload.is_empty() {
+                    return Err(HandoffError::Malformed);
+                }
+                Ok(HandoffMsg::Served)
+            }
             _ => Err(HandoffError::Malformed),
         }
     }
@@ -351,6 +407,10 @@ impl HandoffMsg {
             HandoffMsg::Cutover { .. } => "CUTOVER",
             HandoffMsg::CutoverAck => "CUTOVER_ACK",
             HandoffMsg::Abort => "ABORT",
+            HandoffMsg::BulkStaged => "BULK_STAGED",
+            HandoffMsg::Prepared => "PREPARED",
+            HandoffMsg::Commit => "COMMIT",
+            HandoffMsg::Served => "SERVED",
         }
     }
 }
@@ -572,6 +632,41 @@ pub async fn send_cutover<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let cursor = drain_delta(stream, ring, end_offset, chunk_max).await?;
+    write_msg(
+        stream,
+        &HandoffMsg::Cutover {
+            final_offset: cursor,
+        },
+    )
+    .await?;
+    match read_msg(stream).await? {
+        HandoffMsg::CutoverAck => Ok(cursor),
+        HandoffMsg::Abort => Err(HandoffError::Aborted),
+        other => Err(HandoffError::Unexpected {
+            expected: "CUTOVER_ACK",
+            got: other.label(),
+        }),
+    }
+}
+
+/// Ship the buffered delta ring `(end_offset, head]` over `stream` as [`Frame::StreamPut`] /
+/// `StreamDel` frames and return the final cursor (`== E` when the caller QUIESCED first so `head`
+/// is stable). Does NOT send the [`HandoffMsg::Cutover`] frame -- the caller decides the handshake
+/// that follows (a legacy [`send_cutover`] CUTOVER_ACK, or a PR-4 [`send_delta_await_prepared`]
+/// PREPARED). Fail-closed on a ring OVERFLOW ([`HandoffError::DeltaOverflow`]): the tail has an
+/// unfillable gap, so we ABORT (best-effort telling the peer) rather than ship a torn tail. The
+/// borrow discipline (decide the step under the ring borrow, DROP it before any `.await`) is
+/// preserved exactly as the pre-refactor loop had it, so no `Ref` crosses an await point.
+async fn drain_delta<S>(
+    stream: &mut S,
+    ring: &Rc<RefCell<ReplRing>>,
+    end_offset: ReplOffset,
+    chunk_max: usize,
+) -> Result<ReplOffset, HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut cursor = end_offset;
     loop {
         // Decide the next step UNDER the ring borrow, then DROP the borrow (the block ends) before
@@ -621,7 +716,61 @@ where
             cursor = cursor.max_with(off);
         }
     }
+    Ok(cursor)
+}
 
+// ---------------------------------------------------------------------------------------------
+// #391 PR-4: the receiver-authoritative cross-process COMMIT protocol (the WRITE-AUTHORITY
+// transfer). The already-built `CutoverBarrier` + `Cutover`/`CutoverAck` are only an IN-RECEIVER
+// "I applied through E" decision; they do NOT move write authority between the two processes. These
+// frames do: the OLD releases write authority ONLY on `Commit`, and the NEW serves NOTHING until
+// `Commit`, so a crash at any instant loses no acked write and never split-brains.
+// ---------------------------------------------------------------------------------------------
+
+/// SENDER (OLD): after shipping the frozen bulk (Phase 1), AWAIT the receiver's [`HandoffMsg::BulkStaged`]
+/// so the receiver's HEAVY bulk fsync completes BEFORE the sender begins the write-outage quiesce
+/// (Refinement A). The caller quiesces ONLY after this returns `Ok`, keeping the heavy fsync outside
+/// the outage. An `Abort` / unexpected frame / socket error is a fail-closed abort (the OLD store is
+/// untouched, so the caller resumes full serving).
+///
+/// # Errors
+/// [`HandoffError::Aborted`] on a peer abort, [`HandoffError::Unexpected`] on a wrong frame, or
+/// [`HandoffError::Io`] on a socket failure.
+pub async fn await_bulk_staged<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match read_msg(stream).await? {
+        HandoffMsg::BulkStaged => Ok(()),
+        HandoffMsg::Abort => Err(HandoffError::Aborted),
+        other => Err(HandoffError::Unexpected {
+            expected: "BULK_STAGED",
+            got: other.label(),
+        }),
+    }
+}
+
+/// SENDER (OLD), the outage leg: the caller must have QUIESCED writes (latched `E`) FIRST. Ship the
+/// final delta `(F, E]`, send [`HandoffMsg::Cutover`] with `E`, then AWAIT the receiver's
+/// [`HandoffMsg::Prepared`] (its promise that every acked write `<= E` for this shard is VERIFIED and
+/// fsync'd to staging). Returns `Ok(E)` on `Prepared`. This does NOT itself release write authority:
+/// the caller gathers a `Prepared` from EVERY shard (the [`CutoverBarrier`]) and only THEN commits.
+///
+/// A ring OVERFLOW, an `Abort`, an unexpected frame, or a socket error is a fail-closed abort -- the
+/// OLD store is untouched (read-only) so the caller resumes full serving on every shard.
+///
+/// # Errors
+/// Any [`HandoffError`] on overflow, a socket failure, or a peer abort.
+pub async fn send_delta_await_prepared<S>(
+    stream: &mut S,
+    ring: &Rc<RefCell<ReplRing>>,
+    end_offset: ReplOffset,
+    chunk_max: usize,
+) -> Result<ReplOffset, HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let cursor = drain_delta(stream, ring, end_offset, chunk_max).await?;
     write_msg(
         stream,
         &HandoffMsg::Cutover {
@@ -630,13 +779,83 @@ where
     )
     .await?;
     match read_msg(stream).await? {
-        HandoffMsg::CutoverAck => Ok(cursor),
+        HandoffMsg::Prepared => Ok(cursor),
         HandoffMsg::Abort => Err(HandoffError::Aborted),
         other => Err(HandoffError::Unexpected {
-            expected: "CUTOVER_ACK",
+            expected: "PREPARED",
             got: other.label(),
         }),
     }
+}
+
+/// SENDER/coordinator (OLD): tell this shard's receiver to [`HandoffMsg::Commit`] (flip) and AWAIT
+/// its [`HandoffMsg::Served`]. The caller MUST have already released write authority (made the
+/// quiesce permanent) BEFORE calling this, so that a receiver seeing `Commit` knows the OLD will
+/// never ack another write (this is the structural no-split-brain point). Returns `Ok(())` when the
+/// receiver acknowledges it is serving; the OLD may then drain + exit (PR-6).
+///
+/// A missing `Served` (socket error / timeout the caller wraps) leaves the OLD in read-only degraded
+/// standby (W3): it does NOT resume writes (split-brain) and does NOT destroy (loss).
+///
+/// # Errors
+/// [`HandoffError::Aborted`] / [`HandoffError::Unexpected`] / [`HandoffError::Io`] if the receiver
+/// does not answer `Served`.
+pub async fn send_commit_await_served<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_commit(stream).await?;
+    await_served(stream).await
+}
+
+/// SENDER/coordinator (OLD): WRITE the [`HandoffMsg::Commit`] to this shard's receiver (the caller
+/// must have already released write authority). Split from the `Served` await so a multi-shard
+/// coordinator can commit every shard, promote once, then gather `Served` -- see
+/// [`send_commit_await_served`] for the single-shard convenience.
+///
+/// # Errors
+/// [`HandoffError::Io`] if the frame cannot be written.
+pub async fn send_commit<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_msg(stream, &HandoffMsg::Commit).await
+}
+
+/// SENDER/coordinator (OLD): AWAIT this shard's receiver's [`HandoffMsg::Served`] (it promoted +
+/// is serving). A missing `Served` leaves the OLD in read-only degraded standby (W3): no resume, no
+/// destroy. The drain + `exit(0)` that follows a received `Served` is deferred to PR-6.
+///
+/// # Errors
+/// [`HandoffError::Aborted`] / [`HandoffError::Unexpected`] / [`HandoffError::Io`] if the receiver
+/// does not answer `Served`.
+pub async fn await_served<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match read_msg(stream).await? {
+        HandoffMsg::Served => Ok(()),
+        HandoffMsg::Abort => Err(HandoffError::Aborted),
+        other => Err(HandoffError::Unexpected {
+            expected: "SERVED",
+            got: other.label(),
+        }),
+    }
+}
+
+/// SENDER/coordinator (OLD): tell this shard's receiver to [`HandoffMsg::Abort`] (some shard failed
+/// to prepare, so the whole flip is off). Best-effort -- the receiver also sees the dropped socket --
+/// so a send failure is ignored. The OLD keeps write authority and resumes full serving on this shard.
+///
+/// # Errors
+/// This never returns `Err` for a control-flow decision; the write failure is swallowed because the
+/// receiver treats a dropped socket as an abort too. Returns `Ok(())` always.
+pub async fn send_abort_frame<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = write_msg(stream, &HandoffMsg::Abort).await;
+    Ok(())
 }
 
 /// SENDER convenience: [`send_bulk`] then [`send_cutover`] with NO quiesce between (the simple
@@ -963,14 +1182,47 @@ where
     A: AccountingHook,
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let final_offset = recv_delta_until_cutover(stream, &mut store, end_offset, now, None).await?;
+    write_msg(stream, &HandoffMsg::CutoverAck).await?;
+    Ok(LoadedShard {
+        store,
+        shard,
+        final_offset,
+    })
+}
+
+/// Apply the buffered delta tail into `store` (in offset order from `end_offset`) UNTIL the
+/// [`HandoffMsg::Cutover`] frame, verifying `applied == final_offset` (fail-closed on any gap or an
+/// offset mismatch). Does NOT send the ack: the caller decides the handshake (legacy `CutoverAck`,
+/// or the PR-4 verify+fsync then `Prepared`). When `capture` is `Some`, each applied delta frame is
+/// CLONED into it so the caller can persist exactly the bounded `(F, E]` tail to staging (Refinement
+/// A's small in-outage fsync); a `None` capture is the zero-overhead legacy path.
+///
+/// The clone is taken BEFORE the applier consumes the frame; a stale re-delivery (`Duplicate`) is
+/// still captured (it replays idempotently), so the persisted tail is exactly the frames shipped.
+async fn recv_delta_until_cutover<E, A, S>(
+    stream: &mut S,
+    store: &mut ShardStore<E, A>,
+    end_offset: ReplOffset,
+    now: UnixMillis,
+    mut capture: Option<&mut Vec<Frame>>,
+) -> Result<ReplOffset, HandoffError>
+where
+    E: EvictionHook,
+    A: AccountingHook,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut applier = ReplicaApplier::new(end_offset);
     loop {
         match read_msg(stream).await? {
             HandoffMsg::Frame(frame @ (Frame::StreamPut { .. } | Frame::StreamDel { .. })) => {
-                match applier.apply(&mut store, frame, now) {
+                if let Some(v) = capture.as_deref_mut() {
+                    v.push(frame.clone());
+                }
+                match applier.apply(&mut *store, frame, now) {
                     // In-order apply, or a stale re-delivery (idempotent): keep going.
                     ApplyOutcome::Applied(_) | ApplyOutcome::Duplicate => {}
-                    // A hole in the sequence: the tail is incomplete. Drop the store, abort.
+                    // A hole in the sequence: the tail is incomplete. The caller drops the store.
                     ApplyOutcome::Gap => return Err(HandoffError::DeltaGap),
                 }
             }
@@ -981,12 +1233,7 @@ where
                         got: applier.applied().0,
                     });
                 }
-                write_msg(stream, &HandoffMsg::CutoverAck).await?;
-                return Ok(LoadedShard {
-                    store,
-                    shard,
-                    final_offset,
-                });
+                return Ok(final_offset);
             }
             HandoffMsg::Abort => return Err(HandoffError::Aborted),
             other => {
@@ -997,6 +1244,137 @@ where
             }
         }
     }
+}
+
+/// The RECEIVER's per-shard outcome of the cross-process COMMIT ([`recv_await_commit`]).
+#[derive(Debug)]
+pub enum ShardCommit<E: EvictionHook, A: AccountingHook> {
+    /// The coordinator sent [`HandoffMsg::Commit`]: this shard is adopted. The caller promotes its
+    /// staging to `data_dir` and flips it to serving (the flip gate is PR-5). The [`LoadedShard`] is
+    /// boxed so the two variants are size-balanced (the store is large; the abort arm carries none).
+    Committed(Box<LoadedShard<E, A>>),
+    /// The coordinator sent [`HandoffMsg::Abort`] (some shard failed to prepare): adopt NOTHING. The
+    /// caller drops the store and discards staging.
+    Aborted,
+}
+
+/// A shard the receiver has PREPARED (verified + fsync'd to staging + sent [`HandoffMsg::Prepared`])
+/// and that is now AWAITING the coordinator's cross-shard commit decision. Held by the receiver
+/// between [`recv_prepare_only`] and [`recv_await_commit`] so the coordinator can gather a `Prepared`
+/// from EVERY shard (the all-or-nothing [`CutoverBarrier`]) BEFORE any shard is told to commit.
+#[derive(Debug)]
+pub struct PreparedShard<E: EvictionHook, A: AccountingHook> {
+    /// The fully-received, delta-applied, staged store (adopted only on `Commit`).
+    pub store: ShardStore<E, A>,
+    /// The shard index (from the HELLO).
+    pub shard: u32,
+    /// The final offset the tail was applied through (equals `E`).
+    pub final_offset: ReplOffset,
+}
+
+/// RECEIVER (NEW), the receiver-authoritative PREPARE (#391 PR-4). Takes OWNERSHIP of the bulk-loaded
+/// `store` (whose BULK was already fsync'd to staging in Phase 1, outside the outage). Applies the
+/// final delta `(F, E]`, VERIFIES `applied == E`, runs the `prepare` hook (which fsyncs the BOUNDED
+/// delta to staging), and sends [`HandoffMsg::Prepared`] -- the receiver's promise that every acked
+/// write `<= E` for this shard is now durably staged. Returns a [`PreparedShard`] parked for the
+/// commit decision; it serves NOTHING yet.
+///
+/// Any verify failure, `prepare` (fsync) failure, delta gap, offset mismatch, or socket error is a
+/// fail-closed abort (the store is dropped here; the OLD keeps serving). This does NOT itself await
+/// the commit: the coordinator gathers `Prepared` from EVERY shard first, then [`recv_await_commit`].
+///
+/// # Errors
+/// Any [`HandoffError`] from the delta apply/verify or the `prepare` hook.
+pub async fn recv_prepare_only<E, A, S, P>(
+    stream: &mut S,
+    mut store: ShardStore<E, A>,
+    shard: u32,
+    end_offset: ReplOffset,
+    now: UnixMillis,
+    prepare: P,
+) -> Result<PreparedShard<E, A>, HandoffError>
+where
+    E: EvictionHook,
+    A: AccountingHook,
+    S: AsyncRead + AsyncWrite + Unpin,
+    P: FnOnce(&ShardStore<E, A>, &[Frame]) -> Result<(), HandoffError>,
+{
+    let mut deltas: Vec<Frame> = Vec::new();
+    let final_offset =
+        recv_delta_until_cutover(stream, &mut store, end_offset, now, Some(&mut deltas)).await?;
+    // VERIFY + FSYNC (the receiver-authoritative barrier): the hook re-checks + fsyncs the bounded
+    // delta to staging. Only after it returns Ok is every acked write <= E for this shard durable, so
+    // ONLY THEN do we promise PREPARED. A hook error is fail-closed: tell the sender, drop the store.
+    if let Err(e) = prepare(&store, &deltas) {
+        return Err(abort_with(stream, e).await);
+    }
+    write_msg(stream, &HandoffMsg::Prepared).await?;
+    Ok(PreparedShard {
+        store,
+        shard,
+        final_offset,
+    })
+}
+
+/// RECEIVER (NEW): AWAIT the coordinator's cross-shard commit decision for a [`PreparedShard`] (#391
+/// PR-4). This is the receiver's half of the WRITE-AUTHORITY transfer:
+///
+/// - [`HandoffMsg::Commit`] -> [`ShardCommit::Committed`]: every acked write `<= E` is durably staged
+///   AND the OLD has released write authority (it sent `Commit` only after making its quiesce
+///   permanent), so the caller may promote staging + serve. NOTHING is served before this.
+/// - [`HandoffMsg::Abort`] / socket error -> [`ShardCommit::Aborted`] (or `Err`): adopt NOTHING, drop
+///   the store, discard staging. On a dropped socket (coordinator crash before `Commit`) this
+///   fail-closes to `Err`, so the receiver serves nothing -- no split-brain.
+///
+/// # Errors
+/// [`HandoffError::Unexpected`] on a wrong frame, or [`HandoffError::Io`] if the coordinator vanished
+/// before deciding (the receiver adopts nothing).
+pub async fn recv_await_commit<E, A, S>(
+    stream: &mut S,
+    prepared: PreparedShard<E, A>,
+) -> Result<ShardCommit<E, A>, HandoffError>
+where
+    E: EvictionHook,
+    A: AccountingHook,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match read_msg(stream).await? {
+        HandoffMsg::Commit => Ok(ShardCommit::Committed(Box::new(LoadedShard {
+            store: prepared.store,
+            shard: prepared.shard,
+            final_offset: prepared.final_offset,
+        }))),
+        HandoffMsg::Abort => Ok(ShardCommit::Aborted),
+        other => Err(HandoffError::Unexpected {
+            expected: "COMMIT/ABORT",
+            got: other.label(),
+        }),
+    }
+}
+
+/// RECEIVER (NEW): signal the sender it may begin the write-outage quiesce, because the HEAVY bulk
+/// fsync (state@F) is now durably on staging (Refinement A, Phase 1). Sent after the receiver's own
+/// bulk fsync completes and BEFORE it receives the delta.
+///
+/// # Errors
+/// [`HandoffError::Io`] if the signal cannot be written.
+pub async fn send_bulk_staged<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_msg(stream, &HandoffMsg::BulkStaged).await
+}
+
+/// RECEIVER (NEW): tell the sender this process has promoted staging + is serving
+/// ([`HandoffMsg::Served`]), so the OLD may drain + exit (PR-6). Sent after a `Commit` is adopted.
+///
+/// # Errors
+/// [`HandoffError::Io`] if the signal cannot be written.
+pub async fn send_served<S>(stream: &mut S) -> Result<(), HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_msg(stream, &HandoffMsg::Served).await
 }
 
 /// RECEIVER convenience: [`recv_bulk`] then [`recv_cutover`], for the simple no-quiesce case (the
@@ -1132,6 +1510,11 @@ mod tests {
             },
             HandoffMsg::CutoverAck,
             HandoffMsg::Abort,
+            // #391 PR-4 commit-protocol control frames (payload-free sequence points).
+            HandoffMsg::BulkStaged,
+            HandoffMsg::Prepared,
+            HandoffMsg::Commit,
+            HandoffMsg::Served,
         ]
     }
 
