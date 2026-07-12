@@ -72,6 +72,16 @@ pub struct ShardConfig {
 pub struct ShardSet {
     shutdown: Arc<AtomicBool>,
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// The RESP client listener raw fd(s) captured at bind time (#638, streamed live-cutover): the
+    /// single round-robin acceptor's listener (one fd), or in shard-owner mode (#517) one fd per
+    /// shard in shard order. Exposed via [`Self::client_listener_fds`] so the in-server cutover host
+    /// can pass the listen socket to the spawned receiver sibling for the inherited-listener no-RST
+    /// handoff ([`crate::tokio_rt::command_inherit_listener`]). This is a NON-owning record (an
+    /// integer per listener): the acceptor thread(s) keep the listener(s) open for the process
+    /// lifetime, so these fds stay valid; nothing here ever closes them. Empty on the io_uring boot
+    /// ([`Self::from_parts`]) until that path captures its listeners too.
+    #[cfg(unix)]
+    client_listener_fds: Vec<std::os::fd::RawFd>,
 }
 
 /// The grace window a shard waits for its in-flight connection tasks to finish
@@ -91,7 +101,14 @@ impl ShardSet {
         shutdown: Arc<AtomicBool>,
         handles: Vec<std::thread::JoinHandle<()>>,
     ) -> Self {
-        ShardSet { shutdown, handles }
+        ShardSet {
+            shutdown,
+            handles,
+            // The io_uring boot does not (yet) capture its client-listener fd(s) here; the streamed
+            // cutover host is gated to the tokio boot for now (#638), so an empty record is correct.
+            #[cfg(unix)]
+            client_listener_fds: Vec::new(),
+        }
     }
 
     /// Signal all shards to stop accepting and drain, then wait for their threads.
@@ -124,6 +141,20 @@ impl ShardSet {
     #[must_use]
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shutdown)
+    }
+
+    /// The RESP client listener raw fd(s) captured at bind time (#638, streamed live-cutover).
+    ///
+    /// In the DEFAULT single-acceptor mode this is exactly one fd (the round-robin listener); in
+    /// shard-owner mode (#517) it is one fd per shard, in shard order. The streamed live-cutover host
+    /// passes these to the receiver-sibling spawn so the listen socket is INHERITED (dup2'd) across
+    /// the flip for the no-RST handoff -- the acceptor thread(s) keep the listener(s) OPEN for the
+    /// process lifetime, so the fds are valid at spawn time and the caller must NOT close them (it is
+    /// a non-owning copy). Empty on the io_uring boot path until it captures its listeners too.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn client_listener_fds(&self) -> Vec<std::os::fd::RawFd> {
+        self.client_listener_fds.clone()
     }
 }
 
@@ -248,6 +279,14 @@ mod tokio_bootstrap {
 
         let mut handles = Vec::with_capacity(total + 1);
 
+        // The RESP client listener raw fd(s), captured at bind time BEFORE the listener is moved into
+        // its acceptor thread (#638): the streamed-cutover host reads these back via
+        // [`ShardSet::client_listener_fds`] to hand the listen socket to a receiver sibling (no-RST
+        // inherited-listener handoff). The acceptor keeps the listener OPEN, so the fd stays valid;
+        // this is a non-owning integer copy, never closed here.
+        #[cfg(unix)]
+        let mut client_listener_fds: Vec<std::os::fd::RawFd> = Vec::with_capacity(total);
+
         // THE ACCEPTOR(S). A plain OS thread (no tokio runtime): a blocking `std` accept loop with a
         // shutdown-aware poll. `tokio::sync::mpsc::UnboundedSender::send` does not require a runtime,
         // so the hand-off is valid from this sync context.
@@ -259,6 +298,12 @@ mod tokio_bootstrap {
             // rejects the socket-activation combo; only once every port is bound do we spawn.
             let listeners = bind_shard_owner_listeners(cfg.bind, total)?;
             for (index, (listener, sender)) in listeners.into_iter().zip(conn_senders).enumerate() {
+                // Capture this shard's listener fd (#638) before the listener moves into its acceptor.
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd as _;
+                    client_listener_fds.push(listener.as_raw_fd());
+                }
                 let shutdown = Arc::clone(&shutdown);
                 let acceptor = std::thread::Builder::new()
                     .name(format!("ironcache-acceptor-{index}"))
@@ -268,6 +313,12 @@ mod tokio_bootstrap {
         } else {
             // DEFAULT: one listener, round-robin each accepted connection to the next shard's channel.
             let listener = listener_for(cfg.bind)?;
+            // Capture the single client-listener fd (#638) before the listener moves into the acceptor.
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd as _;
+                client_listener_fds.push(listener.as_raw_fd());
+            }
             let shutdown = Arc::clone(&shutdown);
             let acceptor = std::thread::Builder::new()
                 .name("ironcache-acceptor".to_string())
@@ -355,7 +406,12 @@ mod tokio_bootstrap {
             handles.push(handle);
         }
 
-        Ok(ShardSet { shutdown, handles })
+        Ok(ShardSet {
+            shutdown,
+            handles,
+            #[cfg(unix)]
+            client_listener_fds,
+        })
     }
 
     /// The single acceptor's loop: accept on the one listener and round-robin each
@@ -615,5 +671,48 @@ mod tests {
         let s = ShardId { index: 2, total: 4 };
         assert_eq!(s.index, 2);
         assert_eq!(s.total, 4);
+    }
+
+    /// #638 PR-1: [`ShardSet::client_listener_fds`] exposes the RESP client listener fd captured at
+    /// bind time, and the listener is STILL ALIVE (adoptable) -- the acceptor keeps it open, so a
+    /// later cutover host can hand it to a receiver sibling for the no-RST inherited-listener handoff.
+    #[cfg(all(unix, feature = "tokio"))]
+    #[test]
+    fn client_listener_fds_exposes_a_live_listener() {
+        use crate::TokioRuntime;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Bind an ephemeral loopback port (0) so the test never collides with a fixed port.
+        let cfg = ShardConfig {
+            shards: 1,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            shard_owner_ports: false,
+        };
+        let serve = |_rt: TokioRuntime,
+                     _s: tokio::net::TcpStream,
+                     _shard: ShardId,
+                     _sd: Arc<AtomicBool>| async {};
+        let drain = |_idx: usize, _inbox: (), _sd: Arc<AtomicBool>| async {};
+        let set = run_shards(&cfg, serve, vec![()], drain).expect("run_shards binds one listener");
+
+        let fds = set.client_listener_fds();
+        assert_eq!(
+            fds.len(),
+            1,
+            "the default single-acceptor mode exposes exactly one client listener fd"
+        );
+        let fd = fds[0];
+        assert!(fd >= 0, "the exposed value is a real file descriptor");
+        // The listener is STILL ALIVE / adoptable: the acceptor thread holds it open, so F_GETFD
+        // succeeds on the fd we handed out (a closed fd would return EBADF, i.e. < 0).
+        // SAFETY: F_GETFD only reads the descriptor's flags; it neither takes ownership of the fd
+        // nor mutates the socket, so it cannot disturb the acceptor that owns it.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "the exposed client-listener fd is live (F_GETFD ok), so a sibling can inherit it"
+        );
+
+        set.shutdown_and_join().expect("clean shutdown");
     }
 }

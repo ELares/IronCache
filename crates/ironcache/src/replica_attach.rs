@@ -125,7 +125,7 @@ use crate::serve::ShardStoreImpl;
 /// so the replica still resumes incrementally from disk) or, with no disk backlog (the DEFAULT),
 /// [`drain_and_ship`] reports [`ShipOutcome::ResyncNeeded`] and the replica re-full-syncs (the MVP
 /// full-resync-on-gap policy, correct though not optimal).
-const TAIL_RING_CAP: usize = 65_536;
+pub(crate) const TAIL_RING_CAP: usize = 65_536;
 
 /// How many tail ops to ship per [`drain_and_ship`] pass (a bounded batch so a borrow is held
 /// only for an O(batch) copy off the ring before the sends).
@@ -206,7 +206,7 @@ fn any_importing_slot(map: &ironcache_cluster::SlotMap) -> Option<u16> {
 /// `None` (the DEFAULT, or no data_dir) leaves the in-memory-only tail, byte-identical to pre-HA-7e.
 /// A directory-creation failure inside `DiskBacklog::open` also yields `None` (the safe degradation:
 /// replication still runs, just without the wider window).
-fn build_disk_backlog(ctx: &ServerContext, shard_index: usize) -> Option<DiskBacklog> {
+pub(crate) fn build_disk_backlog(ctx: &ServerContext, shard_index: usize) -> Option<DiskBacklog> {
     let max_bytes = ctx.boot.repl_backlog_disk_bytes;
     if max_bytes == 0 {
         return None; // disabled: in-memory-only, byte-identical.
@@ -280,6 +280,11 @@ pub(crate) fn spawn_on_shard(
     store_rc
         .borrow_mut()
         .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+    // #638 PR-1: also stash this shard's ring in the serve-layer RING thread-local so the streamed
+    // live-cutover's `ensure_shard_ring` REUSES this raft-installed ring instead of installing a
+    // SECOND observer (which would drop this box and break replication). Runs on the shard thread, so
+    // the thread-local is this shard's. Idempotent per shard via `PRIMARY_STARTED`, so it stashes once.
+    crate::serve::stash_shard_ring(Rc::clone(&ring));
 
     // The replication id this primary advertises in `FullSync` AND the resume HISTORY token the
     // resume gate verifies against. It MUST identify the replication HISTORY (which restarts on every

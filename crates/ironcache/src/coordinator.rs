@@ -1608,15 +1608,19 @@ async fn receive_shard_from_handoff(
     let dbs = ctx.databases;
     let store_rc = shard_store(dbs, policy, reserved_bits);
     let now = UnixMillis(shard_env().borrow().now_unix_millis());
-    // CONNECT to the sender's handoff socket (one stream per shard). The exact stream<->shard
-    // multiplexing across a live 2-process cutover is the orchestrator's concern (PR-6); here the
-    // receiver connects and the sender's HELLO carries the shard id the transport verifies.
+    // CONNECT to the sender's PER-SHARD handoff socket `<base>.<shard_index>` (#638 PR-1): shard i
+    // binds/connects its own suffixed path so its stream is reactor-bound to shard i and never
+    // crosses a thread (deterministic i<->i pairing). The sender's HELLO still carries the shard id
+    // the transport verifies. The base `plan.socket` stays the well-known rendezvous both ends agree
+    // on; only the per-shard suffix is derived (inside `connect_handoff_for_shard`).
     tracing::debug!(
         shard = shard_index,
-        socket = %plan.socket.display(),
-        "ironcache: receiver role connecting to handoff socket for shard boot-load"
+        base_socket = %plan.socket.display(),
+        "ironcache: receiver role connecting to per-shard handoff socket (<base>.<shard>) for shard boot-load"
     );
-    let mut stream = crate::upgrade::drive::connect_handoff(&plan.socket, plan.timeout).await?;
+    let mut stream =
+        crate::upgrade::drive::connect_handoff_for_shard(&plan.socket, shard_index, plan.timeout)
+            .await?;
     receive_shard_into(
         &mut stream,
         &store_rc,
