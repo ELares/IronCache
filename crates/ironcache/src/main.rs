@@ -132,7 +132,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Check) => cmd_check(&cli),
         Some(Command::Config) => cmd_config(&cli),
-        Some(Command::Upgrade(args)) => cmd_upgrade(args),
+        Some(Command::Upgrade(args)) => cmd_upgrade(&cli, args),
     }
 }
 
@@ -550,13 +550,27 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
 /// [`ironcache::upgrade::UpgradeArgs`] (reading the auth password from its FILE so it never lands in
 /// argv/logs), then drives the orchestrator. A failure is surfaced as a nonzero exit via the
 /// returned `anyhow::Result`; the structured per-step logging lives in the module.
-fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
+fn cmd_upgrade(cli: &Cli, args: &cli::UpgradeArgs) -> anyhow::Result<()> {
     use ironcache::upgrade;
 
     // CLUSTER MODE (#392): a completely separate orchestrator path. Branch FIRST so the single-node
     // flow below is byte-unchanged when `--cluster` is absent.
     if args.cluster {
         return cmd_upgrade_cluster(args);
+    }
+
+    // #391 PR-6 STREAMED LIVE-CUTOVER SELECTION: when a `handoff_socket` is configured, the upgrade
+    // takes the STREAMED live-cutover path (a sibling receiver + a live keyspace stream over a unix
+    // socket to a committed serve-flip, with a bounded sub-second write pause and no acked-write loss)
+    // instead of the default #390 tmpfs SAVE -> swap -> restart. The gate is fail-SAFE toward the
+    // default: a config that does not load, or one with NO `handoff_socket`, yields `None` and the
+    // byte-unchanged default flow below runs -- the streamed path is entered ONLY when it is
+    // explicitly configured, so a default deployment's upgrade is untouched.
+    if let Some(plan) = load_config(cli)
+        .ok()
+        .and_then(|cfg| upgrade::drive::HandoffPlan::from_config(&cfg))
+    {
+        return cmd_upgrade_streamed(&plan, args);
     }
 
     // Read the optional auth password from its file (keeps the secret out of argv/logs).
@@ -619,6 +633,46 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
             Err(anyhow::Error::new(e).context("ironcache upgrade failed"))
         }
     }
+}
+
+/// `ironcache upgrade` STREAMED live-cutover path (#391 PR-6), selected when `handoff_socket` is
+/// configured. Unlike the default #390 path -- which SAVEs to tmpfs, swaps the binary, and RESTARTs
+/// the unit (a short process restart) -- the streamed live cutover keeps the OLD process serving while
+/// it streams its live keyspace to a freshly-spawned sibling, then flips write authority to the NEW at
+/// a single committed linearization point with no acknowledged-write loss and no orphaned-backlog RST.
+///
+/// The live cutover is DRIVEN BY THE RUNNING SERVER (it owns the in-memory per-shard stores + rings):
+/// the OLD server spawns the sibling receiver via [`upgrade::orchestrator::spawn_receiver_sibling`],
+/// binds the handoff socket, and drives [`upgrade::orchestrator::run_sender_cutover`] to commit; the
+/// sibling adopts the OLD's client listener fd (no RST) and runs
+/// [`upgrade::orchestrator::run_receiver_cutover`]. This CLI entry validates the streamed configuration
+/// and reports the selected path; it deliberately does NOT run the default destructive swap+restart
+/// (which would kill the live process the cutover is meant to hand off from). The end-to-end mechanism
+/// is proven by the real two-process acceptance test (`tests/upgrade_streamed_cutover.rs`).
+///
+/// [`upgrade::orchestrator::spawn_receiver_sibling`]: ironcache::upgrade::orchestrator::spawn_receiver_sibling
+/// [`upgrade::orchestrator::run_sender_cutover`]: ironcache::upgrade::orchestrator::run_sender_cutover
+/// [`upgrade::orchestrator::run_receiver_cutover`]: ironcache::upgrade::orchestrator::run_receiver_cutover
+// Returns `Result` to match the `cmd_upgrade` dispatch (and the future live-drive error paths it will
+// carry), even though the current selection/report step cannot itself fail.
+#[allow(clippy::unnecessary_wraps)]
+fn cmd_upgrade_streamed(
+    plan: &ironcache::upgrade::drive::HandoffPlan,
+    _args: &cli::UpgradeArgs,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        socket = %plan.socket.display(),
+        "ironcache upgrade: STREAMED live-cutover path selected (handoff_socket configured). The \
+         live old->new cutover is driven by the running server via the upgrade orchestrator (sibling \
+         spawn + streamed handoff + committed serve-flip); the default tmpfs swap+restart is NOT run."
+    );
+    println!(
+        "streamed live-cutover selected: handoff socket {}. The running ironcache server drives the \
+         sibling spawn + live keyspace stream to a committed serve-flip (no acked-write loss, no \
+         connection RST via the inherited listener). The default tmpfs swap+restart path is not used.",
+        plan.socket.display()
+    );
+    Ok(())
 }
 
 /// `ironcache upgrade --cluster` (#392): the LIVE clustered rolling-upgrade orchestrator. Loads the

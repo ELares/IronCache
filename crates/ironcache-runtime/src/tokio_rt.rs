@@ -157,9 +157,29 @@ pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpList
     Ok(socket.into())
 }
 
-/// Choose the RESP listener: ADOPT a systemd socket-activation inherited fd if one was passed
-/// (`LISTEN_FDS`, #389 -- the listen queue survives an upgrade restart, no `ECONNREFUSED`), else
-/// SELF-BIND `addr` with `SO_REUSEPORT`.
+/// The environment variable a #391 PR-6 streamed-handoff ORCHESTRATOR passes its client-listener fd
+/// in. MUST match `ironcache::upgrade::orchestrator::HANDOFF_LISTEN_FD_ENV`. When set to a file
+/// descriptor number, the boot ADOPTS that inherited listen socket via [`adopt_listener_fd`] -- the
+/// SAME never-closed-listener path systemd socket-activation (#389) uses -- so the listen backlog
+/// survives the live cutover and NO client connection is reset across the flip (Decision 1).
+pub const HANDOFF_LISTEN_FD_ENV: &str = "IRONCACHE_HANDOFF_LISTEN_FD";
+
+/// The orchestrator-held client-listener fd (#391 PR-6), parsed from [`HANDOFF_LISTEN_FD_ENV`], or
+/// `None` when unset / malformed / negative (the default boot). Pure + tiny so [`listener_for`] can
+/// consult it before the systemd and self-bind paths.
+#[cfg(unix)]
+fn orchestrator_listen_fd() -> Option<std::os::fd::RawFd> {
+    let raw = std::env::var(HANDOFF_LISTEN_FD_ENV).ok()?;
+    raw.trim()
+        .parse::<std::os::fd::RawFd>()
+        .ok()
+        .filter(|fd| *fd >= 0)
+}
+
+/// Choose the RESP listener: ADOPT a #391 PR-6 orchestrator-held inherited fd
+/// (`IRONCACHE_HANDOFF_LISTEN_FD`, the streamed-cutover no-RST path) if one was passed, else ADOPT a
+/// systemd socket-activation inherited fd if one was passed (`LISTEN_FDS`, #389 -- the listen queue
+/// survives an upgrade restart, no `ECONNREFUSED`), else SELF-BIND `addr` with `SO_REUSEPORT`.
 ///
 /// FAIL-OPEN: not socket-activated, a malformed `LISTEN_*` environment, or an unusable inherited fd
 /// all fall back to self-bind, so a non-socket-activated boot is byte-unchanged. The binary emits
@@ -179,6 +199,21 @@ pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpList
 /// Returns the `io::Error` only if the self-bind itself fails (e.g. the address is in use).
 #[cfg(unix)]
 pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    // #391 PR-6 ORCHESTRATOR-HELD LISTENER (Decision 1, no-RST): a streamed-handoff sibling the OLD
+    // spawned is handed the OLD's client listen socket at a well-known fd (dup2'd into place with
+    // close-on-exec cleared) and told its number via `IRONCACHE_HANDOFF_LISTEN_FD`. ADOPT it through
+    // the SAME never-closed-listener path #389 uses, so the listen backlog survives the flip and no
+    // client queued/arriving is reset. A validation failure falls through to the systemd/self-bind
+    // paths below; the var is absent on every default boot, so those paths are byte-unchanged.
+    if let Some(fd) = orchestrator_listen_fd() {
+        match adopt_listener_fd(fd) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => eprintln!(
+                "streamed-handoff: inherited client listener fd {fd} could not be adopted ({e}); \
+                 FELL BACK to the systemd/self-bind listener path"
+            ),
+        }
+    }
     match crate::listen_fds::from_env() {
         // Socket-activated: adopt the RESP `ListenStream` fd -- the one NAMED `resp` when
         // `LISTEN_FDNAMES` disambiguates a multi-socket unit, else the first passed fd (fd 3, the
@@ -204,6 +239,49 @@ pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 #[cfg(not(unix))]
 pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     bind_reuseport_std(addr)
+}
+
+/// Duplicate `listen_fd` onto `child_fd` in a spawned child so it INHERITS the listen socket for the
+/// #391 PR-6 no-RST live cutover (Decision 1). Installs a [`std::os::unix::process::CommandExt::pre_exec`]
+/// hook on `cmd` that runs in the FORKED CHILD between `fork` and `exec` and, using ONLY
+/// async-signal-safe `dup2`/`fcntl`, places the listen socket at `child_fd` with close-on-exec CLEARED
+/// so it survives the `exec`. The child then adopts `child_fd` via [`adopt_listener_fd`] (the caller
+/// advertises the number, e.g. in `IRONCACHE_HANDOFF_LISTEN_FD`), so the listen backlog is never
+/// closed and no client is reset across the flip.
+///
+/// The `unsafe` `pre_exec` lives HERE, in the runtime crate that permits `unsafe`, so the
+/// `#![forbid(unsafe_code)]` `ironcache` binary crate can drive the sibling spawn without an unsafe
+/// block of its own.
+#[cfg(unix)]
+pub fn command_inherit_listener(
+    cmd: &mut std::process::Command,
+    listen_fd: std::os::fd::RawFd,
+    child_fd: std::os::fd::RawFd,
+) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the closure runs in the forked child between `fork` and `exec`, single-threaded
+    // (async-signal context). It calls ONLY async-signal-safe `dup2`/`fcntl` to place the inherited
+    // listen socket at `child_fd` with close-on-exec cleared; no allocation, no locks, no other
+    // runtime state is touched, so it is sound in the post-fork pre-exec window.
+    unsafe {
+        cmd.pre_exec(move || {
+            if listen_fd == child_fd {
+                // Same fd: clear close-on-exec IN PLACE so `exec` does not close it.
+                let flags = libc::fcntl(child_fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if libc::dup2(listen_fd, child_fd) < 0 {
+                // `dup2` clears close-on-exec on the NEW fd, so `child_fd` survives the exec while the
+                // original (close-on-exec) inherited copy is closed by exec.
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Apply `SO_KEEPALIVE` with `secs` idle time to a tokio [`TcpStream`] at ACCEPT (Redis
@@ -330,6 +408,42 @@ mod tests {
         adopted.set_nonblocking(false).unwrap();
         let _client = std::net::TcpStream::connect(addr).unwrap();
         let (_conn, _peer) = adopted.accept().expect("the adopted listener accepts");
+    }
+
+    /// #391 PR-6 NO-RST (Decision 1): a connection already queued in the LISTEN BACKLOG survives the
+    /// live cutover because the listen socket is INHERITED (dup'd into the sibling), never closed.
+    /// Model the flip: queue a client in the backlog (connect but do NOT accept), ADOPT a dup of the
+    /// listen fd (what the spawned sibling does via `IRONCACHE_HANDOFF_LISTEN_FD`), DROP the OLD
+    /// listener handle (the OLD stops accepting), then accept on the adopted listener -- the
+    /// pre-existing backlog connection is served and a byte round-trips, so it was NOT `ECONNRESET`.
+    #[cfg(unix)]
+    #[test]
+    fn inherited_listener_serves_backlog_without_rst() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::IntoRawFd;
+        let original = bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+        original.set_nonblocking(false).unwrap();
+        let addr = original.local_addr().unwrap();
+        // A client queued in the backlog BEFORE the flip (the OLD never accepts it).
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        // THE FLIP: the sibling adopts a dup of the OLD's listen fd (the socket is never closed).
+        let fd = original.try_clone().unwrap().into_raw_fd();
+        let adopted = adopt_listener_fd(fd).expect("adopts the inherited listener");
+        adopted.set_nonblocking(false).unwrap();
+        // The OLD stops accepting (drop its handle); the socket lives on via the adopted dup.
+        drop(original);
+        // The NEW serves the pre-existing backlog connection: no RST across the flip.
+        let (mut server_conn, _peer) = adopted
+            .accept()
+            .expect("the adopted listener serves the queued backlog connection");
+        client.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        server_conn.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            &buf, b"ping",
+            "the backlog connection round-trips across the inherited-listener flip (no RST)"
+        );
     }
 
     /// #389 fail-closed: `adopt_listener_fd` REJECTS a fd that is not a TCP STREAM socket (a

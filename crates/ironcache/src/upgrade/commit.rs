@@ -412,6 +412,64 @@ where
     Some(store)
 }
 
+/// Whether a PROMOTED cutover dir carries a bounded DELTA log for `shard` (`delta-shard-<n>.icd`).
+/// The boot loader ([`crate::coordinator`]) uses this cheap probe to decide whether to merge a delta
+/// tail after the bulk load; a normal (non-cutover) `data_dir` has no such file, so the boot path is
+/// byte-unchanged.
+#[must_use]
+pub fn has_promoted_delta(dir: &Path, shard: u32) -> bool {
+    dir.join(delta_file_name(shard)).exists()
+}
+
+/// MERGE a PROMOTED cutover DELTA log `(F, E]` for `shard` into an ALREADY bulk-loaded `store` (#391
+/// PR-6 boot recovery -- the W2 durable-recovery merge wired into the live boot loader). After the
+/// boot loader restores the bulk (state@F) from the promoted `dir`, this replays the bounded delta so
+/// the recovered store is state@E, exactly what a NEW that crashed AFTER `Commit` must come back with.
+///
+/// The delta is TRUSTED (CRC-verified by [`decode_delta_log`]), so it is applied by effect
+/// (`insert_object` / `delete`), not offset-gated -- the same merge [`reconstruct_shard`] does, but
+/// against the live boot store rather than a fresh one. Returns the number of ops applied. `Ok(0)`
+/// when there is no delta file (the common, non-cutover boot). `now` drops an already-expired key on
+/// load, matching the durable load path.
+///
+/// # Errors
+/// [`HandoffError::Io`] if the delta file exists but cannot be read; [`HandoffError::Aborted`] if it
+/// is present but torn / undecodable (fail-closed, so a corrupt tail is never silently half-applied).
+pub fn replay_promoted_delta<E, A>(
+    store: &mut ShardStore<E, A>,
+    dir: &Path,
+    shard: u32,
+    now: UnixMillis,
+) -> Result<usize, HandoffError>
+where
+    E: EvictionHook,
+    A: AccountingHook,
+{
+    let delta_path = dir.join(delta_file_name(shard));
+    let bytes = match std::fs::read(&delta_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(HandoffError::io(&e)),
+    };
+    let (_shard, ops) = decode_delta_log(&bytes).ok_or(HandoffError::Aborted)?;
+    let applied = ops.len();
+    for frame in ops {
+        match frame {
+            Frame::StreamPut {
+                db, kvobj_bytes, ..
+            } => {
+                let obj = decode_kvobj(&kvobj_bytes).ok_or(HandoffError::Aborted)?;
+                store.insert_object(db, obj);
+            }
+            Frame::StreamDel { db, key, .. } => {
+                store.delete(db, &key, now);
+            }
+            _ => return Err(HandoffError::Aborted), // a non-tail frame in a delta log is corrupt.
+        }
+    }
+    Ok(applied)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The per-shard drivers (up to PREPARED), for the PR-6 orchestrator. The COMMIT/ABORT phase after
 // the barrier uses the `stream` frames directly (`send_commit` / `await_served` /
