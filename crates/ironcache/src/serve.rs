@@ -277,6 +277,22 @@ pub fn run_server_observed(
     // of two. A process-global boot fact like `policy_name`, off the command hot path.
     STORE_SLOTS_PER_DB.store(config.slots_per_db as usize, Ordering::Relaxed);
 
+    // #391 PR-5 RECEIVER SERVE GATE: a streamed-handoff RECEIVER boot must NOT serve any client
+    // command until the cross-shard cutover has COMMITTED (all shards). Flip the process-global serve
+    // gate to `false` HERE -- ONCE, at boot, before any shard spawns or the acceptor starts -- so the
+    // NEW rejects every client command with `-LOADING` (the top-of-`route_and_dispatch` gate) until
+    // the PR-4 `Committed` flip (`upgrade::commit::begin_serving_on_commit`). The condition is EXACTLY
+    // PR-2's receiver gate (`handoff_role == receiver` AND a `handoff_socket`); a normal (sender /
+    // no-socket) boot leaves the gate `true`, so the default datapath is BYTE-UNCHANGED and
+    // `is_serving()` is never taken. The orchestrator that actually spawns the sibling in this role
+    // (and keeps its acceptor closed until the flip) is PR-6; until then this branch is dormant on
+    // every real deployment.
+    if config.handoff_role == ironcache_config::HandoffRole::Receiver
+        && config.handoff_socket.is_some()
+    {
+        set_serving(false);
+    }
+
     // The cluster node id (CLUSTER_CONTRACT.md #70), leaked to a 'static str at boot exactly
     // like `policy_name`. It is resolved ONCE at the run_server level (NOT per shard) so it is
     // IDENTICAL across every shard, and shared by value via the cloned ServerContext.
@@ -1442,6 +1458,43 @@ pub(crate) fn scan_reserved_bits(total_shards: usize) -> u32 {
 /// value never changes at runtime (it is structurally restart-required, like `databases`).
 static STORE_SLOTS_PER_DB: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(ironcache_store::DEFAULT_SLOTS_PER_DB);
+
+/// The process-GLOBAL client SERVE gate (#391 PR-5): whether THIS process may serve client commands
+/// yet. `true` on every normal (non-handoff) boot, so the default datapath is byte-unchanged and the
+/// hot-path read ([`is_serving`], at the top of [`route_and_dispatch`]) is a single relaxed load that
+/// is NEVER taken. Set to `false` ONCE at boot (in [`run_server_observed`]) when this process is the
+/// streamed-handoff RECEIVER (`handoff_role == receiver` + a socket): the NEW must NOT serve any
+/// client command until the cross-shard cutover has COMMITTED across ALL shards, so a client never
+/// reads a half-loaded or not-yet-committed store. Flipped back to `true` EXACTLY ONCE, on the
+/// receiver-authoritative `Committed` transition (PR-4 [`crate::upgrade::commit::begin_serving_on_commit`]).
+///
+/// This is a SINGLE process-global (deliberately NOT a per-shard thread-local like [`LOADING`]): one
+/// bool for the whole node makes the client-visible flip ALL-OR-NOTHING with no per-shard stagger --
+/// the cross-shard barrier already decided all-or-nothing before this flips, so every shard reads the
+/// one flag and starts serving in the same instant. Relaxed ordering suffices: the boot store
+/// happens-before every shard spawn, and the commit flip is a single monotonic `false -> true` edge
+/// gating a RETRYABLE `-LOADING`, not a data dependency (the durable store was promoted BEFORE the
+/// flip, so a stale read racing the flip at worst returns one more retryable `-LOADING`).
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether THIS process may serve client commands yet (#391 PR-5): the HOT-PATH read the global serve
+/// gate at the top of [`route_and_dispatch`] consults. A single relaxed [`SERVING`] load, `true` on
+/// every non-handoff boot, so the default datapath pays one predictable-not-taken branch per command
+/// and is byte-unchanged. `pub(crate)` for the dispatch gate.
+#[must_use]
+pub(crate) fn is_serving() -> bool {
+    SERVING.load(Ordering::Relaxed)
+}
+
+/// Flip the process-GLOBAL serve gate (#391 PR-5). Two callers, both OFF the hot path:
+/// [`run_server_observed`] sets it `false` at boot in the RECEIVER role (the NEW must not serve until
+/// commit), and the receiver-authoritative COMMIT path
+/// ([`crate::upgrade::commit::begin_serving_on_commit`]) sets it `true` EXACTLY ONCE on the PR-4
+/// `Committed` transition -- the all-or-nothing client-visible flip. A single relaxed store; the gate
+/// read is [`is_serving`].
+pub(crate) fn set_serving(serving: bool) {
+    SERVING.store(serving, Ordering::Relaxed);
+}
 
 /// Build a FRESH [`ShardStoreImpl`] with this shard's configured eviction policy, accounting,
 /// and scan-band width, WITHOUT caching it in the thread-local (unlike [`shard_store`], which
@@ -3758,6 +3811,29 @@ async fn route_and_dispatch(
     defer_hops: bool,
     deferred_hop: &mut coordinator::HopOutcome,
 ) -> bool {
+    // -- THE GLOBAL SERVE GATE (#391 PR-5 streamed live-cutover). Until THIS process has COMMITTED the
+    // cross-shard cutover, reject EVERY client command with `-LOADING` -- BEFORE the command name is
+    // even classified -- so a client never reads a half-loaded or not-yet-committed store. `is_serving`
+    // is a single process-global relaxed load that is `true` on every normal (non-handoff) boot, so the
+    // default datapath pays one predictable-not-taken branch and is BYTE-UNCHANGED; it is `false` ONLY
+    // on a streamed-handoff RECEIVER boot, and flips to `true` EXACTLY ONCE, atomically for all shards
+    // (one global bool, no per-shard stagger), on the PR-4 `Committed` transition
+    // (`upgrade::commit::begin_serving_on_commit`). That flip happens only AFTER the OLD released write
+    // authority (permanent quiesce, PR-4), so no write is ever double-acked across the cutover. This
+    // reuses PR-3's retryable `-LOADING` (`ErrorReply::loading`); the connection stays OPEN (returns
+    // `false`) so the client retries against whichever process ends up authoritative. In production the
+    // orchestrator (PR-6) keeps the NEW's acceptor closed until the flip, so this gate is
+    // defense-in-depth that never fires on the normal path.
+    if !is_serving() {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::loading()),
+            conn.proto,
+        );
+        return false;
+    }
+
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
 
