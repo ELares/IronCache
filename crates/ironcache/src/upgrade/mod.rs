@@ -41,6 +41,7 @@ pub mod drive;
 pub mod fetch;
 pub mod health;
 pub mod minisign;
+pub mod orchestrator;
 pub mod pause;
 pub mod proc;
 pub mod save;

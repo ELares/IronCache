@@ -1500,6 +1500,33 @@ fn load_shard_on_boot(
              ceiling and the eviction policy could not free enough); the node is over budget"
         );
     }
+
+    // #391 PR-6 DURABLE-RECOVERY MERGE (W2): when this boot loaded from a PROMOTED streamed-cutover
+    // dir, the bulk above is state@F; MERGE the bounded promoted delta log `(F, E]` so the recovered
+    // store is state@E -- exactly what a NEW that crashed AFTER `Commit` must come back with (the
+    // cutover promotes bulk + delta together, and today's loader read only the bulk). A normal
+    // (non-cutover) `data_dir` has NO delta file, so this is a cheap existence probe that no-ops and
+    // the default boot is byte-unchanged. Single-node upgrade keeps the shard layout, so shard N's
+    // delta aligns with shard N's bulk. A torn delta is logged LOUDLY (fail-closed: the tail is not
+    // half-applied) but does not block boot (matching the bulk loader's lenient torn-file posture).
+    let shard_u32 = u32::try_from(shard_index).unwrap_or(u32::MAX);
+    if crate::upgrade::commit::has_promoted_delta(load_dir, shard_u32) {
+        let mut store = store_rc.borrow_mut();
+        match crate::upgrade::commit::replay_promoted_delta(&mut store, load_dir, shard_u32, now) {
+            Ok(applied) if applied > 0 => tracing::info!(
+                shard = shard_index,
+                applied,
+                "ironcache: merged promoted streamed-cutover delta log (recovered state@E)"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                shard = shard_index,
+                error = %e,
+                "ironcache: promoted streamed-cutover delta log is torn; recovered the bulk only \
+                 (state@F). This is a NEW-crash-after-commit recovery with a corrupt tail."
+            ),
+        }
+    }
 }
 
 /// #391 PR-2: the RECEIVER-role boot decision for [`run_drain_loop`], resolving to whether the shard's
