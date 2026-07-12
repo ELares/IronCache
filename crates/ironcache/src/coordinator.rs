@@ -44,6 +44,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+// #391 PR-2 RECEIVER-role boot substitution. The streamed handoff rides an AF_UNIX socket, so the
+// receive path is unix-only; these types back the receive-load helpers + their socket-pair tests.
+#[cfg(unix)]
+use crate::upgrade::stream::HandoffError;
+#[cfg(unix)]
+use ironcache_repl::ReplOffset;
+#[cfg(unix)]
+use ironcache_storage::{AccountingHook, EvictionHook};
+#[cfg(unix)]
+use ironcache_store::ShardStore;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio::io::{AsyncRead, AsyncWrite};
+
 /// The bounded depth of each shard's cross-shard inbound queue (COORDINATOR.md #107).
 ///
 /// A bounded channel gives back-pressure for free: when a shard's queue is full, the
@@ -178,6 +193,11 @@ pub fn inbox_depths(inbox: &Inbox) -> Vec<u64> {
 /// when the loop suspends on `recv()` nothing of this shard's state is borrowed and an
 /// interleaved connection task can borrow freely (the same contract the expiry timer
 /// follows). See the module docs.
+// This is the per-shard boot sequence + the steady-state AND post-shutdown drain loops in one
+// function (they share every captured handle); it sits at the line budget by nature, so the #391
+// PR-2 receiver-role branch tips it just over -- allow it, matching the house style for the other
+// long boot/serve functions (serve.rs / replica_attach.rs).
+#[allow(clippy::too_many_lines)]
 pub async fn run_drain_loop(
     shard_index: usize,
     mut rx: mpsc::Receiver<ShardWork>,
@@ -211,14 +231,26 @@ pub async fn run_drain_loop(
         ctx.runtime.clone(),
     );
 
+    // #391 PR-2 RECEIVER-ROLE BOOT SUBSTITUTION (see [`resolve_receive_role`]): when this process was
+    // booted as the streamed-handoff receiver, THIS shard PULLS + INSTALLS its store over the socket
+    // instead of loading from disk. `Ok(false)` on the DEFAULT path (the common case, and every
+    // non-unix build), so the disk-load block below runs exactly as today (one cheap branch). A
+    // receive FAILURE returns `Err(())`: we install nothing and return WITHOUT signaling this shard
+    // ready, so `/readyz` never reports a half-loaded receiver as ready (data-safe; PR-6 turns this
+    // into an explicit unserving abort/exit).
+    let Ok(received) = resolve_receive_role(&ctx, shard_index).await else {
+        return;
+    };
+
     // PERSISTENCE LOAD-ON-BOOT (#58): when a data_dir is configured, THIS shard loads ITS OWN
     // committed snapshot file (`dump-shard-<shard_index>.icss`) into its store BEFORE the drain
     // loop services any remote work and before the shard accepts connections (the drain loop is
     // spawned ahead of the serve loop). A missing / torn / wrong-version file loads NOTHING (the
     // shard starts empty, today's behavior). With persistence OFF (`None`) this whole block is
     // skipped, so the boot path is byte-unchanged. The store borrow is taken + released inside the
-    // synchronous load (no `.await` held across it).
-    if let Some(persist) = persist.as_ref() {
+    // synchronous load (no `.await` held across it). SKIPPED in the receiver role (`received`): the
+    // store was already installed from the stream above, so a disk load would clobber it.
+    if let Some(persist) = persist.as_ref().filter(|_| !received) {
         load_shard_on_boot(&ctx, persist, shard_index);
         // LASTSAVE seed (durability footgun fix #2): once, on shard 0, seed the node-level last-save
         // time from the LOADED snapshot's `dump.manifest` save timestamp, so `LASTSAVE` and the INFO
@@ -1449,6 +1481,149 @@ fn load_shard_on_boot(
     }
 }
 
+/// #391 PR-2: the RECEIVER-role boot decision for [`run_drain_loop`], resolving to whether the shard's
+/// store was loaded over the streamed-handoff socket (vs. the default disk load).
+///
+/// Returns:
+/// - `Ok(false)` when this process is NOT the streamed-handoff receiver (no `handoff_socket`, or the
+///   default sender role) -- the caller then takes the unchanged disk load. This is the common path
+///   and the ONLY one a default deployment (or any non-unix build) ever takes.
+/// - `Ok(true)` when this shard's store was pulled over the socket and INSTALLED (adopted) into its
+///   thread-local store on the fully verified, cutover-acked path.
+/// - `Err(())` when the receive FAILED at any point: NOTHING was installed (the live store handle is
+///   untouched) and the caller must abort this shard's boot WITHOUT serving or signaling readiness.
+///
+/// SCOPE (PR-2 is the LOAD + install only): a received shard MUST NOT start serving client traffic
+/// yet. The global serving gate + the serve-flip are PR-5, and the orchestrator that spawns the
+/// sibling (and keeps its client acceptor closed until the flip) is PR-6; no live deployment enters
+/// receive mode before PR-6 wires that spawn, so this path is dormant until then.
+///
+/// The streamed handoff is AF_UNIX-only, so the receive machinery is `#[cfg(unix)]`; on other
+/// platforms the sibling stub always returns `Ok(false)` (disk load).
+#[cfg(unix)]
+async fn resolve_receive_role(ctx: &ServerContext, shard_index: usize) -> Result<bool, ()> {
+    let Some(plan) = crate::upgrade::drive::HandoffPlan::receiver_from_config(&ctx.boot) else {
+        return Ok(false); // not the receiver -> the caller takes the unchanged disk load.
+    };
+    match receive_shard_from_handoff(ctx, &plan, shard_index).await {
+        Ok(final_offset) => {
+            tracing::info!(
+                shard = shard_index,
+                final_offset = final_offset.0,
+                "ironcache: shard loaded via streamed handoff (receiver role); store installed"
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::error!(
+                shard = shard_index,
+                error = %e,
+                "ironcache: streamed-handoff receive-load FAILED; installing nothing (data-safe \
+                 abort, shard left unready). TODO(#391 PR-6): abort the sibling unserving."
+            );
+            Err(())
+        }
+    }
+}
+
+/// The non-unix stub of [`resolve_receive_role`]: the streamed handoff rides an AF_UNIX socket, so on
+/// a non-unix build there is never a receiver role -- this always resolves to `Ok(false)` (disk load),
+/// keeping the boot path byte-unchanged there.
+#[cfg(not(unix))]
+async fn resolve_receive_role(_ctx: &ServerContext, _shard_index: usize) -> Result<bool, ()> {
+    Ok(false)
+}
+
+/// #391 PR-2: connect to the handoff socket for THIS shard and pull its store into the thread-local
+/// [`ShardStoreImpl`], adopting ONLY on the fully verified, cutover-acked path.
+///
+/// The receiver dials the sender's node-local socket (retrying while it is not yet bound, bounded by
+/// the plan timeout), then drives the transport's [`recv_shard_timed`](crate::upgrade::drive::recv_shard_timed)
+/// bulk + delta + cutover into a FRESH store (offset-gated apply, `first == F+1` contiguity,
+/// `applied == final_offset`, CRC + db-count verified inside the transport). Only that Ok result is
+/// installed; on ANY error nothing is installed and the live store is untouched (see
+/// [`receive_shard_into`]). `now` is read from THIS shard's Env clock (the determinism seam,
+/// ADR-0003), and `make_store` builds the SAME concrete [`ShardStoreImpl`] the live serve path uses,
+/// so the installed store is type-identical.
+///
+/// # Errors
+/// Any [`HandoffError`] from the connect or the transport (socket error, timeout, verify/contiguity
+/// failure, or a peer abort).
+#[cfg(unix)]
+async fn receive_shard_from_handoff(
+    ctx: &ServerContext,
+    plan: &crate::upgrade::drive::HandoffPlan,
+    shard_index: usize,
+) -> Result<ReplOffset, HandoffError> {
+    let reserved_bits = crate::serve::scan_reserved_bits(ctx.shards);
+    let policy = ctx.info.maxmemory_policy;
+    let dbs = ctx.databases;
+    let store_rc = shard_store(dbs, policy, reserved_bits);
+    let now = UnixMillis(shard_env().borrow().now_unix_millis());
+    // CONNECT to the sender's handoff socket (one stream per shard). The exact stream<->shard
+    // multiplexing across a live 2-process cutover is the orchestrator's concern (PR-6); here the
+    // receiver connects and the sender's HELLO carries the shard id the transport verifies.
+    tracing::debug!(
+        shard = shard_index,
+        socket = %plan.socket.display(),
+        "ironcache: receiver role connecting to handoff socket for shard boot-load"
+    );
+    let mut stream = crate::upgrade::drive::connect_handoff(&plan.socket, plan.timeout).await?;
+    receive_shard_into(
+        &mut stream,
+        &store_rc,
+        move || crate::serve::fresh_shard_store(dbs, policy, reserved_bits),
+        dbs,
+        now,
+        plan.timeout,
+    )
+    .await
+}
+
+/// #391 PR-2 (the testable seam): pull a shard's store from `stream` into a LOCAL fresh store and, on
+/// the fully verified cutover-acked path ONLY, INSTALL it as the thread-local store `store_rc`.
+///
+/// This is the one place the receiver adopts: [`recv_shard_timed`](crate::upgrade::drive::recv_shard_timed)
+/// builds the fresh store, enforcing db-count, `first == F+1` contiguity, `applied == final_offset`,
+/// and the CRC/version envelope, and DROPS its partial store on any error (adopt nothing). Only its
+/// `Ok(LoadedShard)` is swapped into `store_rc` in ONE statement -- mirroring the HA-7d full-sync
+/// atomic store swap ([`crate::replica_attach`]) -- so a mid-stream error leaves `store_rc` exactly as
+/// it was (never half-populated). Generic over the store hooks + stream so it is driven directly over
+/// a `UnixStream::pair` in the unit tests, and concretely over the real socket by
+/// [`receive_shard_from_handoff`].
+///
+/// # Errors
+/// Any [`HandoffError`] from the transport; on error nothing is installed.
+#[cfg(unix)]
+async fn receive_shard_into<E, A, S, M>(
+    stream: &mut S,
+    store_rc: &Rc<RefCell<ShardStore<E, A>>>,
+    make_store: M,
+    expected_databases: u32,
+    now: UnixMillis,
+    timeout: Duration,
+) -> Result<ReplOffset, HandoffError>
+where
+    E: EvictionHook,
+    A: AccountingHook,
+    S: AsyncRead + AsyncWrite + Unpin,
+    M: FnMut() -> ShardStore<E, A>,
+{
+    // Build into a LOCAL LoadedShard (never adopted until fully verified + cutover-acked).
+    let loaded = crate::upgrade::drive::recv_shard_timed(
+        stream,
+        make_store,
+        expected_databases,
+        now,
+        timeout,
+    )
+    .await?;
+    // ADOPT: install the verified store as THIS shard's thread-local store in one statement. On any
+    // error above we returned early and never reached here, so the live handle stays untouched.
+    *store_rc.borrow_mut() = loaded.store;
+    Ok(loaded.final_offset)
+}
+
 /// The coarse poll cadence the periodic-save loop ticks on while the save policy is OFF (or between
 /// the per-interval deadlines), so a runtime `CONFIG SET save` is noticed within a bounded delay
 /// even when the node booted with the policy disabled. A second is a fine granularity for a cadence
@@ -2074,5 +2249,267 @@ mod tests {
     #[should_panic(expected = "at least one shard")]
     fn build_inboxes_rejects_zero() {
         let _ = build_inboxes(0);
+    }
+}
+
+/// #391 PR-2 RECEIVER-role load tests: the boot-substitution install step ([`receive_shard_into`])
+/// driven over a `UnixStream::pair` by the merged PR-1 frozen sender (`send_shard_from_frozen` /
+/// `send_bulk_from_frozen`), in ONE process (no sibling). The data-safety focus: a successful receive
+/// installs EXACTLY the sender's keyspace (value + encoding + absolute TTL) as the thread-local store,
+/// and on ANY error NOTHING is installed (the live store is never left half-populated). The wire-level
+/// contiguity / `first == F+1` / `applied == final_offset` gates live in and are exercised by
+/// `upgrade::stream`; here we prove the ADOPT-ONLY-ON-ACK / DROP-ON-ERROR install contract this PR
+/// adds, plus a real receiver-side verify failure (a db-count mismatch) that installs nothing.
+#[cfg(all(test, unix))]
+mod receiver_load_tests {
+    use super::*;
+    use crate::upgrade::stream::{freeze_cut, send_bulk_from_frozen, send_shard_from_frozen};
+    use ironcache_repl::{ReplId, ReplObserver, ReplRing};
+    use ironcache_storage::{ExpireWrite, NewValue, Store};
+    use ironcache_store::SnapshotCursor;
+    use std::collections::HashMap;
+    use tokio::net::UnixStream;
+
+    const DBS: u32 = 4;
+    const NOW: UnixMillis = UnixMillis(1_000);
+    /// A far-future absolute TTL deadline, so no key lazily expires at [`NOW`] and the tests can assert
+    /// the deadline round-trips VERBATIM (proving no rebase to load time).
+    const TTL_AT: UnixMillis = UnixMillis(NOW.0 + 10_000_000);
+    /// A deadline far above a healthy socket-pair handoff (ms), so the timer never fires on a green run.
+    const GENEROUS: Duration = Duration::from_secs(10);
+
+    fn replid() -> ReplId {
+        ReplId::from_bytes([0xCD; 20])
+    }
+
+    /// A fresh store with an OBSERVED ring installed BEFORE the writes (so every write is tracked as a
+    /// delta `StreamOp`), returned with its ring for the frozen sender.
+    fn observed(dbs: u32) -> (ShardStore, Rc<RefCell<ReplRing>>) {
+        let ring = ReplRing::new(4096, ReplOffset::ZERO);
+        let mut store = ShardStore::new(dbs);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        (store, ring)
+    }
+
+    /// Populate `store` with `n` keys spread across databases, mixing INT-encodable and RAW values
+    /// (so the round-trip proves ENCODING fidelity) and giving every third key an ABSOLUTE TTL.
+    fn populate(store: &mut ShardStore, n: u32) {
+        for i in 0..n {
+            let db = i % DBS;
+            let key = format!("k{i}");
+            let val = if i % 2 == 0 {
+                format!("{}", i * 7) // an integer string -> int encoding
+            } else {
+                format!("val-{i}") // a non-numeric string -> raw encoding
+            };
+            let exp = if i % 3 == 0 {
+                ExpireWrite::Set(TTL_AT)
+            } else {
+                ExpireWrite::Clear
+            };
+            store.upsert(
+                db,
+                key.as_bytes(),
+                NewValue::Bytes(val.as_bytes()),
+                exp,
+                NOW,
+            );
+        }
+    }
+
+    /// Dump a store's whole keyspace as `(db, key) -> encoded-KvObj`. The encoded bytes carry value +
+    /// type + encoding + ABSOLUTE TTL, so map equality proves full-fidelity convergence in ONE assert.
+    fn dump_map(store: &ShardStore, now: UnixMillis) -> HashMap<(u32, Vec<u8>), Vec<u8>> {
+        let mut m = HashMap::new();
+        let dbs = store.databases();
+        let mut c = SnapshotCursor::START;
+        while !c.is_done(dbs) {
+            let (chunk, next) = store.snapshot_chunk(c, 256, now);
+            c = next;
+            for (db, key, kv) in chunk {
+                m.insert((db, key.into_vec()), ironcache_repl::encode_kvobj(&kv));
+            }
+        }
+        m
+    }
+
+    /// Dump a store's whole keyspace as `(db, key) -> KvObj` (to read an absolute-TTL deadline back).
+    fn kv_map(
+        store: &ShardStore,
+        now: UnixMillis,
+    ) -> HashMap<(u32, Vec<u8>), ironcache_store::KvObj> {
+        let mut m = HashMap::new();
+        let dbs = store.databases();
+        let mut c = SnapshotCursor::START;
+        while !c.is_done(dbs) {
+            let (chunk, next) = store.snapshot_chunk(c, 256, now);
+            c = next;
+            for (db, key, kv) in chunk {
+                m.insert((db, key.into_vec()), kv);
+            }
+        }
+        m
+    }
+
+    /// SUCCESS: a full frozen handoff installs EXACTLY the sender's keyspace as the thread-local store
+    /// -- value + encoding + absolute TTL -- and REPLACES the whole store (a pre-existing sentinel is
+    /// gone), adopting through the sender's exact cut offset.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_role_load_installs_exact_keyspace_with_encoding_and_ttl() {
+        let (mut src, ring) = observed(DBS);
+        populate(&mut src, 40);
+
+        // The receiver's live store handle, pre-seeded with a STALE sentinel to prove the install
+        // REPLACES the whole store (adopt, not merge).
+        let mut recv_store = ShardStore::new(DBS);
+        recv_store.upsert(
+            0,
+            b"sentinel",
+            NewValue::Bytes(b"stale"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        let store_rc = Rc::new(RefCell::new(recv_store));
+
+        let (mut a, mut b) = UnixStream::pair().expect("socket pair");
+        let sender = send_shard_from_frozen(&mut a, &mut src, &ring, 0, replid(), NOW, 4);
+        let receiver = receive_shard_into(
+            &mut b,
+            &store_rc,
+            || ShardStore::new(DBS),
+            DBS,
+            NOW,
+            GENEROUS,
+        );
+        let (sres, rres) = tokio::join!(sender, receiver);
+
+        let final_off = sres.expect("sender completes");
+        let recv_off = rres.expect("receiver installs the store");
+        assert_eq!(
+            recv_off, final_off,
+            "the receiver adopted through the sender's exact cut offset"
+        );
+
+        // The installed store equals the sender's keyspace across value + encoding + absolute TTL.
+        let want = dump_map(&src, NOW);
+        let got = dump_map(&store_rc.borrow(), NOW);
+        assert_eq!(
+            got, want,
+            "installed store == sender keyspace (value + encoding + absolute TTL)"
+        );
+        // The stale sentinel is GONE: the install replaced the whole store, it did not merge.
+        assert!(
+            store_rc.borrow_mut().read(0, b"sentinel", NOW).is_none(),
+            "install REPLACED the whole thread-local store (sentinel gone), not merged"
+        );
+        // An absolute TTL deadline survived VERBATIM (k0 carries TTL_AT; no rebase to load time).
+        let kv = kv_map(&store_rc.borrow(), NOW);
+        assert_eq!(
+            kv.get(&(0u32, b"k0".to_vec())).and_then(|o| o.expire_at),
+            Some(TTL_AT),
+            "the absolute TTL deadline round-trips verbatim (no rebase)"
+        );
+    }
+
+    /// DROP-ON-ERROR (mid-stream): the sender streams the BULK then DROPS the socket WITHOUT the
+    /// cutover, so the receiver's cutover read hits EOF after a partial load. NOTHING is installed --
+    /// the live store keeps its pre-existing keyspace exactly (never left half-populated).
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_role_load_drops_store_on_midstream_error() {
+        let (mut src, ring) = observed(DBS);
+        populate(&mut src, 40);
+
+        // Pre-seed the receiver's live store with a known keyspace that MUST survive a failed receive.
+        let mut recv_store = ShardStore::new(DBS);
+        recv_store.upsert(
+            0,
+            b"keep",
+            NewValue::Bytes(b"safe"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        let store_rc = Rc::new(RefCell::new(recv_store));
+        let before = dump_map(&store_rc.borrow(), NOW);
+
+        let (mut a, mut b) = UnixStream::pair().expect("socket pair");
+        // The sender ships the BULK (chunk_max = 1 -> many frames, a real partial transfer), then DROPS
+        // `a` with NO cutover; the receiver's `recv_cutover` then sees EOF mid-stream and aborts.
+        let sender = async move {
+            let (frozen, cut) = freeze_cut(&mut src, &ring);
+            let _ = send_bulk_from_frozen(&mut a, &frozen, 0, DBS, replid(), cut, NOW, 1).await;
+            // `a` drops here (no `send_cutover`) -> the receiver's cutover read hits EOF.
+        };
+        let receiver = receive_shard_into(
+            &mut b,
+            &store_rc,
+            || ShardStore::new(DBS),
+            DBS,
+            NOW,
+            GENEROUS,
+        );
+        let ((), rres) = tokio::join!(sender, receiver);
+
+        assert!(
+            rres.is_err(),
+            "a mid-stream drop (bulk received, no cutover) aborts the receive-load"
+        );
+        assert_eq!(
+            dump_map(&store_rc.borrow(), NOW),
+            before,
+            "the live store is UNCHANGED on a mid-stream error (never left half-populated)"
+        );
+        assert_eq!(
+            store_rc
+                .borrow_mut()
+                .read(0, b"keep", NOW)
+                .unwrap()
+                .as_bytes(),
+            b"safe",
+            "the pre-existing keyspace survives the failed receive intact"
+        );
+    }
+
+    /// FAIL-CLOSED VERIFY: a receiver expecting more databases than the sender advertises aborts the
+    /// receive at the HELLO (before any key is loaded), installing NOTHING. This exercises a real
+    /// receiver-side verification failure (the db-count gate) end-to-end through the install seam.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_role_load_fail_closed_on_db_count_mismatch_installs_nothing() {
+        let (mut src, ring) = observed(DBS);
+        populate(&mut src, 12);
+
+        // The receiver expects TWICE the sender's database count.
+        let mut recv_store = ShardStore::new(DBS * 2);
+        recv_store.upsert(
+            0,
+            b"keep",
+            NewValue::Bytes(b"safe"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        let store_rc = Rc::new(RefCell::new(recv_store));
+        let before = dump_map(&store_rc.borrow(), NOW);
+
+        let (mut a, mut b) = UnixStream::pair().expect("socket pair");
+        let sender = send_shard_from_frozen(&mut a, &mut src, &ring, 0, replid(), NOW, 4);
+        let receiver = receive_shard_into(
+            &mut b,
+            &store_rc,
+            || ShardStore::new(DBS * 2),
+            DBS * 2,
+            NOW,
+            GENEROUS,
+        );
+        let (sres, rres) = tokio::join!(sender, receiver);
+
+        assert!(
+            rres.is_err(),
+            "a db-count mismatch fails the receive-load closed"
+        );
+        assert!(sres.is_err(), "the sender observes the receiver's abort");
+        assert_eq!(
+            dump_map(&store_rc.borrow(), NOW),
+            before,
+            "a fail-closed verify installs NOTHING (the live store is untouched)"
+        );
     }
 }

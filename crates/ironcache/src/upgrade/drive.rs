@@ -72,7 +72,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
-use ironcache_config::Config;
+use ironcache_config::{Config, HandoffRole};
 use ironcache_repl::{ReplId, ReplOffset, ReplRing};
 use ironcache_storage::{AccountingHook, EvictionHook, UnixMillis};
 use ironcache_store::ShardStore;
@@ -125,6 +125,20 @@ impl HandoffPlan {
             timeout: DEFAULT_HANDOFF_TIMEOUT,
             chunk_max: DEFAULT_HANDOFF_CHUNK_MAX,
         })
+    }
+
+    /// The RECEIVER-role gate (#391 PR-2): resolve a handoff plan ONLY when this process was booted
+    /// as the streamed-handoff RECEIVER, i.e. a `handoff_socket` is set AND
+    /// `handoff_role == receiver`. `None` in every other case -- no socket, or the default
+    /// [`HandoffRole::Sender`] role -- so the receiver boot-substitution in
+    /// [`crate::coordinator::run_drain_loop`] is skipped and the shard loads from disk exactly as
+    /// today. This is the single branch that decides receive-over-socket vs. load-from-disk at boot.
+    #[must_use]
+    pub fn receiver_from_config(config: &Config) -> Option<Self> {
+        if config.handoff_role != HandoffRole::Receiver {
+            return None;
+        }
+        Self::from_config(config)
     }
 }
 
@@ -447,6 +461,50 @@ mod tests {
         assert_eq!(plan.socket, PathBuf::from("/run/ironcache/handoff.sock"));
         assert_eq!(plan.timeout, DEFAULT_HANDOFF_TIMEOUT);
         assert_eq!(plan.chunk_max, DEFAULT_HANDOFF_CHUNK_MAX);
+    }
+
+    /// The RECEIVER-role gate (#391 PR-2): `receiver_from_config` is `Some` ONLY when a socket is set
+    /// AND the role is `receiver`. The default role (`sender`) and the no-socket case both yield
+    /// `None`, so the default boot keeps calling `load_shard_on_boot` unchanged; only a process
+    /// explicitly booted as the receiver takes the socket boot-substitution.
+    #[test]
+    fn receiver_plan_is_some_only_with_socket_and_receiver_role() {
+        // Default config: no socket, default sender role -> no receive plan (disk-load boot).
+        assert!(
+            HandoffPlan::receiver_from_config(&Config::default()).is_none(),
+            "default config (no socket, sender role) -> no receive plan -> disk load unchanged"
+        );
+
+        // A socket but the DEFAULT sender role -> still no receive plan (the old process streams; it
+        // does not receive), so its own boot loads from disk as before.
+        let socket_only = Config {
+            handoff_socket: Some(PathBuf::from("/run/ironcache/handoff.sock")),
+            ..Config::default()
+        };
+        assert!(
+            HandoffPlan::receiver_from_config(&socket_only).is_none(),
+            "a socket with the sender role is NOT a receiver -> disk load unchanged"
+        );
+
+        // The receiver role but NO socket -> no plan (nothing to connect to).
+        let role_only = Config {
+            handoff_role: HandoffRole::Receiver,
+            ..Config::default()
+        };
+        assert!(
+            HandoffPlan::receiver_from_config(&role_only).is_none(),
+            "the receiver role without a socket has no rendezvous -> no receive plan"
+        );
+
+        // Socket AND receiver role -> a receive plan carrying the socket.
+        let receiver = Config {
+            handoff_socket: Some(PathBuf::from("/run/ironcache/handoff.sock")),
+            handoff_role: HandoffRole::Receiver,
+            ..Config::default()
+        };
+        let plan = HandoffPlan::receiver_from_config(&receiver)
+            .expect("socket + receiver role yields a receive plan");
+        assert_eq!(plan.socket, PathBuf::from("/run/ironcache/handoff.sock"));
     }
 
     /// The cross-shard flip is ALL-OR-NOTHING: every shard Ok -> Commit; a single Err -> Abort
