@@ -274,6 +274,28 @@ pub enum TlsMode {
     On,
 }
 
+/// WHICH end of a STREAMED upgrade handoff (#391) this process is when a [`Config::handoff_socket`]
+/// is set. The default ([`HandoffRole::Sender`]) is the OLD process (the one already running and
+/// serving), so a node that simply has a handoff socket configured behaves exactly as before; only a
+/// process explicitly booted as [`HandoffRole::Receiver`] takes the receiver boot-substitution path
+/// (pulling its per-shard store over the socket instead of loading from disk).
+///
+/// * [`Sender`](HandoffRole::Sender) (DEFAULT): the old process. It binds the socket and STREAMS its
+///   live keyspace to the receiver; its own boot still loads from disk as before. This is the role a
+///   node has whenever it was NOT explicitly told to receive, so the default path is byte-unchanged.
+/// * [`Receiver`](HandoffRole::Receiver) (OPT-IN, set by the orchestrator on the spawned sibling):
+///   the new process. Each shard PULLS its store over the handoff socket and adopts it ONLY on the
+///   fully verified, cutover-acked path, instead of `load_shard_on_boot` from the durable snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HandoffRole {
+    /// The OLD (sender) process (the default): binds the socket + streams; boot loads from disk.
+    #[default]
+    Sender,
+    /// The NEW (receiver) sibling: pulls each shard's store over the socket at boot (adopt-on-ack).
+    Receiver,
+}
+
 /// WHICH async I/O backend the per-shard runtime uses (PROD-10 / #28,
 /// docs/design/IOURING_DATAPATH.md). The default ([`RuntimeBackend::Tokio`]) is the portable
 /// epoll/kqueue backend that runs on every platform and is byte-unchanged.
@@ -557,6 +579,13 @@ pub struct Config {
     /// The durable `data_dir` snapshot always remains a valid fallback, so a bad/absent socket
     /// degrades cleanly to the durable path (never data loss).
     pub handoff_socket: Option<PathBuf>,
+    /// WHICH end of the STREAMED handoff (#391) this process is: the OLD sender (default) or the NEW
+    /// receiver. Only meaningful together with [`Self::handoff_socket`]; a [`HandoffRole::Receiver`]
+    /// process pulls each shard's store over the socket at boot instead of loading from disk. The
+    /// orchestrator (a later PR) sets this on the spawned sibling. Defaults to [`HandoffRole::Sender`]
+    /// so a node that merely has a socket configured (or none) boots exactly as before (disk load).
+    /// TOML (`handoff_role = "receiver"`) + the `IRONCACHE_HANDOFF_ROLE` env var.
+    pub handoff_role: HandoffRole,
     /// The ACL FILE path (#106, Redis `aclfile`). When set, the server LOADS the `user <name>
     /// <rules>...` lines from it at boot (so ACL users survive a restart) and `ACL SAVE`
     /// writes the live registry back to it. `None` (the default) means NO aclfile: the ACL
@@ -792,6 +821,10 @@ impl Default for Config {
             // No streamed-handoff socket by default (#391): the streamed old->new transfer is opt-in;
             // with it unset an upgrade uses the SAVE-first / tmpfs reload path, byte-unchanged.
             handoff_socket: None,
+            // The default handoff role is SENDER (#391): a process is the receiver ONLY when the
+            // orchestrator explicitly boots it as one, so the default boot path (disk load) is
+            // byte-unchanged whether or not a handoff socket is configured.
+            handoff_role: HandoffRole::Sender,
             // No aclfile by default (#106): the ACL registry is the single all-permissive
             // `default` user (plus any requirepass), so the default deployment is byte-identical.
             // Setting it loads users at boot and makes ACL SAVE persistent.
@@ -1638,6 +1671,10 @@ pub struct ConfigOverlay {
     /// `IRONCACHE_HANDOFF_SOCKET` env var. `None` leaves the lower layer (default `None` = the
     /// streamed path disabled).
     pub handoff_socket: Option<PathBuf>,
+    /// The streamed-handoff role (#391): `sender` (default) or `receiver`. TOML
+    /// (`handoff_role = "receiver"`) + the `IRONCACHE_HANDOFF_ROLE` env var. `None` leaves the lower
+    /// layer (default [`HandoffRole::Sender`], the byte-unchanged disk-load boot).
+    pub handoff_role: Option<HandoffRole>,
     /// The ACL file path (#106). TOML (`aclfile = "..."`, a string path) + the
     /// `IRONCACHE_ACLFILE` env var. `None` leaves the lower layer (default `None` = no aclfile).
     pub aclfile: Option<PathBuf>,
@@ -1757,6 +1794,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "data_dir",
     "upgrade_handoff_dir",
     "handoff_socket",
+    "handoff_role",
     "aclfile",
     "tls",
     "tls_cert_path",
@@ -2116,6 +2154,16 @@ impl ConfigOverlay {
         if let Ok(v) = env_var("IRONCACHE_HANDOFF_SOCKET") {
             o.handoff_socket = Some(PathBuf::from(v));
         }
+        // The streamed-handoff role (#391) is a single scalar token (sender/receiver,
+        // case-insensitive), env-encodable so the orchestrator can inject `receiver` on the spawned
+        // sibling; an unrecognized token hard-fails boot rather than silently picking a role (mirrors
+        // `tls`). The receiver role only DOES anything when a handoff socket is also configured.
+        if let Ok(v) = env_var("IRONCACHE_HANDOFF_ROLE") {
+            o.handoff_role = Some(parse_handoff_role(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "handoff_role",
+                reason: format!("not a handoff role (expected sender/receiver): {v}"),
+            })?);
+        }
         // The ACL file path (#106) is a single scalar path, env-encodable for per-pod injection.
         // Taken verbatim (no parse can fail); a missing/unreadable file hard-fails at boot LOAD.
         if let Ok(v) = env_var("IRONCACHE_ACLFILE") {
@@ -2368,6 +2416,9 @@ impl ConfigOverlay {
         if let Some(ref v) = self.handoff_socket {
             cfg.handoff_socket = Some(v.clone());
         }
+        if let Some(v) = self.handoff_role {
+            cfg.handoff_role = v;
+        }
         if let Some(ref v) = self.aclfile {
             cfg.aclfile = Some(v.clone());
         }
@@ -2436,6 +2487,19 @@ pub fn parse_tls_mode(s: &str) -> Option<TlsMode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "off" | "no" | "false" | "0" => Some(TlsMode::Off),
         "on" | "yes" | "true" | "1" => Some(TlsMode::On),
+        _ => None,
+    }
+}
+
+/// Parse a streamed-handoff role token (#391), accepting `sender` / `receiver` case-insensitively
+/// with surrounding whitespace trimmed. Returns `None` on any other token (the caller maps it to a
+/// config error). Used by the `IRONCACHE_HANDOFF_ROLE` env var; TOML deserializes [`HandoffRole`]
+/// directly (lowercase-renamed serde).
+#[must_use]
+pub fn parse_handoff_role(s: &str) -> Option<HandoffRole> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "sender" => Some(HandoffRole::Sender),
+        "receiver" => Some(HandoffRole::Receiver),
         _ => None,
     }
 }
