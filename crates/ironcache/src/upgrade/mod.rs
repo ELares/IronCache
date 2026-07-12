@@ -37,6 +37,14 @@
 /// commit state machine + Refinement A staging fsync (bulk early / delta in-outage) + the atomic
 /// staging -> data_dir promote, wired to the PR-3 quiesce and closing the W5 internal-mutator window.
 pub mod commit;
+/// The #638 per-shard cutover COORDINATION (slice 2): a `Send`-clean [`cutover_coord::CutoverCoord`]
+/// (a report channel shard->host carrying only `Copy`/`Send` offsets + errors, plus a `watch<Phase>`
+/// host->shards) + the per-shard `spawn_local` cutover TASK that runs the tested per-shard sender
+/// primitives on a live server's `!Send` thread-local store/ring + the `Send`-only host coordinator
+/// that folds the gathered `Prepared` results through [`commit::decide_cutover`]. Lets the streamed
+/// live cutover run across a live server's per-shard threads without the `!Send` store/ring/stream
+/// ever crossing a thread.
+pub mod cutover_coord;
 pub mod drive;
 pub mod fetch;
 pub mod health;

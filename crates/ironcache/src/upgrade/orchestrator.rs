@@ -259,7 +259,11 @@ where
 
 /// Phase 1 for ONE shard: atomic freeze-cut `F` + frozen bulk, then await the receiver's `BulkStaged`
 /// (its heavy fsync), clearing the freeze flag in ALL cases. Returns the floor `F`.
-async fn sender_phase1_bulk<E, A, S>(
+///
+/// `pub(crate)` so BOTH the single-thread [`run_sender_cutover`] sequencer (kept for the existing
+/// hero tests) AND the #638 per-shard [`super::cutover_coord::run_shard_cutover_task`] drive the SAME
+/// proven Phase-1 step -- the two sender paths share this one primitive so they cannot drift.
+pub(crate) async fn sender_phase1_bulk<E, A, S>(
     s: &mut SenderShard<E, A, S>,
     replid: ReplId,
     now: UnixMillis,
