@@ -223,6 +223,53 @@ pub async fn connect_handoff(path: &Path, timeout: Duration) -> Result<UnixStrea
     }
 }
 
+/// Derive the PER-SHARD handoff socket path from a base: `<base>.<shard_index>` (#391/#638).
+///
+/// A multi-shard streamed live-cutover rendezvouses ONE unix socket PER shard so shard `i`'s tokio
+/// stream is bound + accepted ON shard `i`'s runtime and never crosses a thread (deterministic
+/// i<->i pairing, no central accept). This is the SINGLE place that derivation lives, so the
+/// sender's per-shard bind and the receiver's per-shard connect always agree. The existing
+/// single-path callers keep passing the base path directly and are unaffected.
+#[cfg(unix)]
+#[must_use]
+pub fn per_shard_handoff_path(base: &Path, shard_index: usize) -> PathBuf {
+    // Append `.<i>` to the WHOLE base path (not just its file name), so `/run/ic/handoff.sock`
+    // becomes `/run/ic/handoff.sock.0`; the base stays a well-known, node-local rendezvous.
+    let mut raw = base.as_os_str().to_owned();
+    raw.push(format!(".{shard_index}"));
+    PathBuf::from(raw)
+}
+
+/// SENDER side: bind the per-shard handoff socket `<base>.<shard_index>` (see
+/// [`per_shard_handoff_path`]). Delegates to [`bind_handoff_listener`] on the derived path, so the
+/// stale-file cleanup + [`HandoffError::Io`] mapping are identical to the single-path bind.
+///
+/// # Errors
+/// [`HandoffError::Io`] if the per-shard socket cannot be bound.
+#[cfg(unix)]
+pub fn bind_handoff_listener_for_shard(
+    base: &Path,
+    shard_index: usize,
+) -> Result<UnixListener, HandoffError> {
+    bind_handoff_listener(&per_shard_handoff_path(base, shard_index))
+}
+
+/// RECEIVER side: connect to the per-shard handoff socket `<base>.<shard_index>` (see
+/// [`per_shard_handoff_path`]), retrying until it is bound, bounded by `timeout`. Delegates to
+/// [`connect_handoff`] on the derived path so the retry + timeout behavior is identical.
+///
+/// # Errors
+/// [`HandoffError::Timeout`] if the per-shard socket never becomes connectable before the deadline;
+/// [`HandoffError::Io`] on a non-retryable connect error.
+#[cfg(unix)]
+pub async fn connect_handoff_for_shard(
+    base: &Path,
+    shard_index: usize,
+    timeout: Duration,
+) -> Result<UnixStream, HandoffError> {
+    connect_handoff(&per_shard_handoff_path(base, shard_index), timeout).await
+}
+
 // ---------------------------------------------------------------------------------------------
 // Caller-side TIMEOUT wrappers around every transport leg. A fired timeout DROPS (cancels) the
 // in-flight future: the sender is read-only so the OLD store is intact and it keeps serving; the
@@ -814,6 +861,51 @@ mod socket_tests {
             );
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// PER-SHARD socket multiplexing (#638 PR-1): the helper derives `<base>.<i>`, distinct paths per
+    /// shard, and a bind + connect round-trips over each shard's OWN suffixed path (deterministic
+    /// i<->i pairing). Two shards bind + connect independently, proving the per-shard variants wrap
+    /// the derivation correctly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_shard_paths_derive_and_bind_connect_independently() {
+        let base = sock_path("pershard");
+
+        // Derivation: `<base>.<i>`, and distinct per shard.
+        assert_eq!(
+            per_shard_handoff_path(&base, 0),
+            PathBuf::from(format!("{}.0", base.display())),
+            "shard 0 derives <base>.0"
+        );
+        assert_eq!(
+            per_shard_handoff_path(&base, 3),
+            PathBuf::from(format!("{}.3", base.display())),
+            "shard 3 derives <base>.3"
+        );
+        assert_ne!(
+            per_shard_handoff_path(&base, 0),
+            per_shard_handoff_path(&base, 1),
+            "different shards derive different socket paths"
+        );
+
+        // Each shard binds + connects its OWN suffixed path (the i<->i pairing), concurrently.
+        let l0 = bind_handoff_listener_for_shard(&base, 0).expect("bind shard 0's socket");
+        let l1 = bind_handoff_listener_for_shard(&base, 1).expect("bind shard 1's socket");
+        let (c0, a0) = tokio::join!(
+            connect_handoff_for_shard(&base, 0, GENEROUS),
+            accept_handoff(&l0, GENEROUS)
+        );
+        c0.expect("shard 0 connects to <base>.0");
+        a0.expect("shard 0 accepts on <base>.0");
+        let (c1, a1) = tokio::join!(
+            connect_handoff_for_shard(&base, 1, GENEROUS),
+            accept_handoff(&l1, GENEROUS)
+        );
+        c1.expect("shard 1 connects to <base>.1");
+        a1.expect("shard 1 accepts on <base>.1");
+
+        let _ = std::fs::remove_file(per_shard_handoff_path(&base, 0));
+        let _ = std::fs::remove_file(per_shard_handoff_path(&base, 1));
     }
 
     /// The RENDEZVOUS timeout itself: [`connect_handoff`] to a socket that is NEVER bound aborts with

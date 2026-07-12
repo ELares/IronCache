@@ -959,6 +959,17 @@ thread_local! {
     // concrete ShardStore implements the Store + Admit waist traits the generic
     // dispatch runs against.
     static STORE: RefCell<Option<Rc<RefCell<ShardStoreImpl>>>> = const { RefCell::new(None) };
+    // The shard's per-shard replication tail RING (#391/#638), the delta buffer the store's write
+    // observer feeds. Held as Rc<RefCell<..>> exactly like STORE, symmetric and core-local (per
+    // shard, shared-nothing ADR-0002); the SAME Rc is shared by the store's boxed observer and any
+    // reader (the raft repl listener, or the streamed live-cutover sender). `None` on the DEFAULT
+    // serving path: a non-raft, non-cutover shard installs NO observer, so this stays empty and the
+    // hot path is byte-unchanged. It becomes `Some` when a ring is installed -- by
+    // [`crate::replica_attach`] in raft mode (which stashes here) or by [`ensure_shard_ring`] at
+    // cutover start -- and [`shard_ring`] reads it back so a second install can REUSE the existing
+    // ring instead of clobbering the live observer.
+    static RING: RefCell<Option<Rc<RefCell<ironcache_repl::ReplRing>>>> =
+        const { RefCell::new(None) };
     // The shard's per-shard TTL timing wheel (#51), held as Rc<RefCell<..>> exactly
     // like STORE/ENV so it is core-local and unsynchronized (ADR-0002/0005). The
     // active drain pops due keys from it before each command; TTL-setting commands
@@ -1543,6 +1554,89 @@ pub(crate) fn shard_store(
         }
         Rc::clone(b.as_ref().unwrap())
     })
+}
+
+/// This shard's replication tail ring, if one is installed (#391/#638). Symmetric with
+/// [`shard_store`] but a pure READ: it returns the ring [`crate::replica_attach`] (raft mode) or
+/// [`ensure_shard_ring`] (cutover start) stashed into the [`RING`] thread-local, and `None` on the
+/// DEFAULT serving path where no write observer is installed (so a caller can tell "no ring yet"
+/// from "ring present" without touching the store). Cheap: one thread-local borrow + an `Rc` clone.
+///
+/// `dead_code`-allowed: the PR-4 cutover task is the (single) live caller (via [`ensure_shard_ring`]);
+/// exercised now by the PR-1 unit tests.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn shard_ring() -> Option<Rc<RefCell<ironcache_repl::ReplRing>>> {
+    RING.with(|cell| cell.borrow().clone())
+}
+
+/// Record `ring` as THIS shard's installed replication tail ring in the [`RING`] thread-local.
+///
+/// Called on the shard thread right after a write observer feeding `ring` is set on the store, so
+/// [`shard_ring`] / [`ensure_shard_ring`] can later find and REUSE it instead of installing a second
+/// observer (which would drop the live observer box and break replication). Two installers stash
+/// here: [`crate::replica_attach`] in raft mode, and [`ensure_shard_ring`] for the streamed cutover.
+pub(crate) fn stash_shard_ring(ring: Rc<RefCell<ironcache_repl::ReplRing>>) {
+    RING.with(|cell| *cell.borrow_mut() = Some(ring));
+}
+
+/// Idempotently ensure THIS shard has an always-on replication tail ring, returning it (#638 PR-1).
+///
+/// The streamed live-cutover's `freeze_cut` needs the shard's write observer active BEFORE it
+/// latches the cut, so every post-freeze write lands in the ring at an offset above the cut. On a
+/// non-raft node there is NO ring on the default serving path; this installs one ON DEMAND, at
+/// cutover start only, so the steady-state serving path pays nothing (no observer, byte-unchanged).
+///
+/// Idempotent + raft-safe:
+/// - If a ring is ALREADY stashed ([`shard_ring`] is `Some`) -- a prior `ensure_shard_ring`, or the
+///   raft/replica attach ([`crate::replica_attach`], which stashes at install) -- REUSE it and return
+///   the SAME `Rc`. Never install a second observer over a live one.
+/// - Otherwise build a fresh DISK-BACKED ring (the [`crate::replica_attach::build_disk_backlog`]
+///   config, so a long Phase-1 bulk under sustained write load cannot overflow the delta window and
+///   force an abort), set it as the store's write observer, stash it, and return it. The
+///   [`ShardStore::write_observer_active`] guard makes the `set_write_observer` a no-op-if-already-active
+///   belt-and-braces against clobbering, even though the `shard_ring` reuse above already covers the
+///   production installers.
+///
+/// Runs on the shard thread (the thread-local store + ring are `!Send`); call it as the FIRST
+/// synchronous action of a shard's cutover task, before any await.
+///
+/// `dead_code`-allowed: the PR-4 cutover task is the (single) live caller; exercised now by the PR-1
+/// unit tests (idempotency, raft-reuse, and post-install ring advance).
+#[allow(dead_code)]
+pub(crate) fn ensure_shard_ring(
+    ctx: &ServerContext,
+    shard_index: usize,
+) -> Rc<RefCell<ironcache_repl::ReplRing>> {
+    // Reuse an already-installed ring (raft/replica attach stashes here; so does a prior ensure).
+    if let Some(existing) = shard_ring() {
+        return existing;
+    }
+    let store = shard_store(
+        ctx.databases,
+        ctx.info.maxmemory_policy,
+        scan_reserved_bits(ctx.shards),
+    );
+    // A DISK-backed ring so the (F, E] delta window cannot overflow under sustained write load during
+    // a long bulk phase (the same config the raft primary observer uses); `None` disk (no data_dir /
+    // the size knob at 0) degrades to the in-memory-only tail, exactly like the raft path.
+    let disk = crate::replica_attach::build_disk_backlog(ctx, shard_index);
+    let ring = ironcache_repl::ReplRing::with_disk(
+        crate::replica_attach::TAIL_RING_CAP,
+        ironcache_repl::ReplOffset::ZERO,
+        disk,
+    );
+    {
+        let mut s = store.borrow_mut();
+        // Defense in depth: only flip the observer on when the store has none. In production an
+        // active observer always has a stashed ring (handled by the reuse above), so this is reached
+        // with no observer; the guard makes a double-install impossible regardless.
+        if !s.write_observer_active() {
+            s.set_write_observer(ironcache_repl::ReplObserver::boxed(Rc::clone(&ring)));
+        }
+    }
+    stash_shard_ring(Rc::clone(&ring));
+    ring
 }
 
 pub(crate) fn shard_wheel() -> Rc<RefCell<TimingWheel>> {
@@ -8575,6 +8669,97 @@ mod tests {
         assert!(is_shard_loading(), "the core-local flag flips on");
         set_shard_loading(false);
         assert!(!is_shard_loading(), "the core-local flag flips back off");
+    }
+
+    #[test]
+    fn ensure_shard_ring_installs_once_and_reuses() {
+        // #638 PR-1: the on-demand always-on ring installer is IDEMPOTENT (installs once; the second
+        // call reuses the SAME ring), and a write after install advances the ring head (the observer
+        // is live). A fresh non-raft shard starts with NO ring, so the default serving path is
+        // byte-unchanged until a cutover calls this.
+        let ctx = guardrail_ctx(0, 0);
+
+        assert!(
+            shard_ring().is_none(),
+            "a fresh non-raft shard has no ring (no observer on the default serving path)"
+        );
+
+        // First install: a ring appears and the store's write observer is now active.
+        let r1 = ensure_shard_ring(&ctx, 0);
+        assert!(shard_ring().is_some(), "ensure_shard_ring installs a ring");
+        let store = shard_store(
+            ctx.databases,
+            ctx.info.maxmemory_policy,
+            scan_reserved_bits(ctx.shards),
+        );
+        assert!(
+            store.borrow().write_observer_active(),
+            "the store's write observer is active after ensure_shard_ring"
+        );
+
+        // Second call REUSES the same ring (installs once): the SAME Rc, no second observer.
+        let r2 = ensure_shard_ring(&ctx, 0);
+        assert!(
+            Rc::ptr_eq(&r1, &r2),
+            "ensure_shard_ring is idempotent: the second call reuses the first ring"
+        );
+
+        // A write after install advances the ring head: the observer feeds the reused ring.
+        let head_before = r1.borrow().head();
+        store.borrow_mut().upsert(
+            0,
+            b"k",
+            NewValue::Bytes(b"v"),
+            ExpireWrite::Clear,
+            UnixMillis(1_000),
+        );
+        assert!(
+            r1.borrow().head() > head_before,
+            "a write after install advances ring.head() (the ring is live)"
+        );
+    }
+
+    #[test]
+    fn ensure_shard_ring_reuses_preinstalled_raft_ring_without_clobber() {
+        // #638 PR-1 (risk 5): in raft mode a ring is ALREADY installed by replica_attach (which now
+        // stashes into RING). ensure_shard_ring must REUSE it, NOT install a second observer -- a
+        // double-install would drop the replica's observer box and break replication.
+        use ironcache_repl::{ReplObserver, ReplOffset, ReplRing};
+        let ctx = guardrail_ctx(0, 0);
+
+        // Simulate the raft/replica attach: install an observer ring on the store AND stash it into
+        // RING, exactly what replica_attach::spawn_on_shard now does at the observer install.
+        let store = shard_store(
+            ctx.databases,
+            ctx.info.maxmemory_policy,
+            scan_reserved_bits(ctx.shards),
+        );
+        let preinstalled = ReplRing::new(4096, ReplOffset::ZERO);
+        store
+            .borrow_mut()
+            .set_write_observer(ReplObserver::boxed(Rc::clone(&preinstalled)));
+        stash_shard_ring(Rc::clone(&preinstalled));
+
+        // ensure_shard_ring returns the SAME Rc: reuse, not clobber.
+        let got = ensure_shard_ring(&ctx, 0);
+        assert!(
+            Rc::ptr_eq(&got, &preinstalled),
+            "the pre-installed (raft) ring is reused, not clobbered"
+        );
+
+        // The reused ring still tracks writes: the ORIGINAL observer is intact (never replaced).
+        let head_before = preinstalled.borrow().head();
+        store.borrow_mut().upsert(
+            0,
+            b"k",
+            NewValue::Bytes(b"v"),
+            ExpireWrite::Clear,
+            UnixMillis(1_000),
+        );
+        assert!(
+            preinstalled.borrow().head() > head_before,
+            "the reused ring still observes writes: replication was not clobbered"
+        );
     }
 
     #[test]
