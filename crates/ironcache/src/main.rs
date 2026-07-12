@@ -19,6 +19,7 @@ use cli::{Cli, Command};
 // tests can boot the real `run_server`; the binary consumes the same modules here.
 use ironcache::metrics_http::{self, MetricsState, ReadyState};
 use ironcache::serve;
+use ironcache::upgrade::cutover_coord::CutoverAction;
 use ironcache_config::{Config, ConfigOverlay};
 use ironcache_observe::MetricsRegistry;
 use std::path::Path;
@@ -358,24 +359,206 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     // each shard signals the `/readyz` countdown itself once its `load_shard_on_boot` returns (#152).
     // The raft-leader gate, when applicable, is evaluated live by `/readyz` from the raft handle.
     live.store(true, std::sync::atomic::Ordering::SeqCst);
-    tracing::info!("ironcache: ready (PING -> +PONG). Ctrl-C to stop.");
-    serve::wait_for_signal(&flag);
+    tracing::info!(
+        "ironcache: ready (PING -> +PONG). Ctrl-C to stop. SIGUSR1 -> streamed cutover."
+    );
+
+    // THE SIGNAL LOOP (#139 shutdown + #638 SIGUSR1 streamed live cutover). `wait_for_signal` blocks
+    // until a signal arrives and reports whether it was a SHUTDOWN (SIGINT/SIGTERM: it has ALREADY set
+    // the flag + armed the second-signal force-exit watcher, byte-identical to before) or a CUTOVER
+    // (SIGUSR1). A cutover runs the in-server host BEFORE any shutdown flag; on a COMMIT it sets the
+    // flag so the normal graceful drain runs (shard 0 exits(0)); on a non-commit it resumes serving
+    // and loops back to wait for the next signal (the OLD keeps full authority).
+    loop {
+        match serve::wait_for_signal(&flag) {
+            serve::SignalOutcome::Shutdown => break,
+            serve::SignalOutcome::Cutover => {
+                match drive_cutover(&cfg, &set, &handles.cutover_control) {
+                    CutoverAction::SetShutdownFlag => {
+                        // The cutover already committed BEFORE this flag, so DRAIN_GRACE never bounds it;
+                        // shard 0's drain loop now observes the flag and exits(0) after the normal drain.
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    CutoverAction::Resume => {
+                        tracing::warn!(
+                            "ironcache: streamed cutover did not commit; resuming service (the OLD keeps \
+                         serving). Waiting for the next signal."
+                        );
+                    }
+                }
+            }
+        }
+    }
     tracing::info!("ironcache: shutting down");
 
-    // GRACEFUL STOP (#139, SHUTDOWN.md). `wait_for_signal` has set the shutdown flag (and armed the
-    // second-signal force-exit watcher). `shutdown_and_join` now drives the bounded per-shard drain
-    // AND the SIGNAL-DRIVEN SAVE-ON-EXIT: when a save policy is configured, shard 0's drain loop
-    // performs a final save (reusing the atomic SAVE path) then `exit(0)`s (the orchestrator
-    // contract); the bootstrap awaits each shard's drain task (bounded by the drain grace) before
-    // joining, so the join naturally waits for shard 0's save to commit rather than racing it. With
-    // NO save policy (the default / NOSAVE posture) no save runs and this is the unchanged clean stop
-    // -> the function returns Ok and `main` exits 0.
+    // GRACEFUL STOP (#139, SHUTDOWN.md). The shutdown flag is set (by `wait_for_signal` on
+    // SIGINT/SIGTERM, or above on a committed cutover). `shutdown_and_join` now drives the bounded
+    // per-shard drain AND the SIGNAL-DRIVEN SAVE-ON-EXIT: when a save policy is configured, shard 0's
+    // drain loop performs a final save (reusing the atomic SAVE path) then `exit(0)`s (the
+    // orchestrator contract); the bootstrap awaits each shard's drain task (bounded by the drain
+    // grace) before joining, so the join naturally waits for shard 0's save to commit rather than
+    // racing it. With NO save policy (the default / NOSAVE posture) no save runs and this is the
+    // unchanged clean stop -> the function returns Ok and `main` exits 0.
     if set.shutdown_and_join().is_err() {
         // A shard thread panicked; surface it as a non-zero exit rather than
         // pretending shutdown was clean.
         anyhow::bail!("one or more shard threads panicked during shutdown");
     }
     Ok(())
+}
+
+/// Drive the in-server STREAMED LIVE CUTOVER host (#638 slice-3), returning the lifecycle
+/// [`CutoverAction`] `main` takes. Selected when a SIGUSR1 arrives: spawn the receiver sibling
+/// (inheriting the client listener fd for the no-RST handoff), deliver each shard its
+/// [`CutoverStart`](ironcache::upgrade::cutover_coord::CutoverStart) over its dedicated control
+/// channel, and drive the cross-shard barrier to a commit-or-abort decision.
+///
+/// FAIL-SAFE toward keep-serving: NO `handoff_socket` configured, a runtime-build failure, or ANY
+/// host error yields [`CutoverAction::Resume`] (the OLD keeps serving); only a clean COMMIT yields
+/// [`CutoverAction::SetShutdownFlag`]. Crash-simple: an error NEVER exits.
+#[cfg(unix)]
+fn drive_cutover(
+    cfg: &Config,
+    set: &ironcache_runtime::bootstrap::ShardSet,
+    control: &[tokio::sync::mpsc::Sender<ironcache::upgrade::cutover_coord::CutoverStart>],
+) -> CutoverAction {
+    use ironcache::upgrade::drive::HandoffPlan;
+
+    // The OPT-IN gate: with NO `handoff_socket` there is no streamed cutover to run -- log + resume.
+    let Some(plan) = HandoffPlan::from_config(cfg) else {
+        tracing::warn!(
+            "ironcache: SIGUSR1 cutover requested but no handoff_socket is configured; ignoring \
+             (the server keeps serving)"
+        );
+        return CutoverAction::Resume;
+    };
+    // The host coordinator drives async on its OWN current-thread runtime on this (idle) main thread.
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        tracing::error!("ironcache: could not build the cutover host runtime; resuming service");
+        return CutoverAction::Resume;
+    };
+    let result = rt.block_on(run_cutover_host(&plan, set, control));
+    match ironcache::upgrade::cutover_coord::cutover_action(&result) {
+        CutoverAction::SetShutdownFlag => {
+            tracing::info!(
+                "ironcache: streamed cutover COMMITTED; the new sibling now serves on the inherited \
+                 listener. Draining in-flight connections and exiting."
+            );
+            CutoverAction::SetShutdownFlag
+        }
+        CutoverAction::Resume => {
+            match &result {
+                Ok(_) => {
+                    tracing::warn!("ironcache: streamed cutover aborted; the OLD keeps serving");
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "ironcache: streamed cutover ended without a confirmed commit (degraded standby, \
+                     W3); NOT exiting. Operator recovery: restart the OLD or the NEW."
+                ),
+            }
+            CutoverAction::Resume
+        }
+    }
+}
+
+/// The non-unix stub: the streamed handoff rides an AF_UNIX socket, so there is no cutover off unix
+/// (and `wait_for_signal` never returns `Cutover` there). Keeps the `main` seam uniform.
+#[cfg(not(unix))]
+fn drive_cutover(
+    _cfg: &Config,
+    _set: &ironcache_runtime::bootstrap::ShardSet,
+    _control: &[tokio::sync::mpsc::Sender<ironcache::upgrade::cutover_coord::CutoverStart>],
+) -> CutoverAction {
+    CutoverAction::Resume
+}
+
+/// The #638 slice-3 in-server cutover HOST drive (async, on the main thread's own runtime).
+///
+/// 1. Bind every per-shard handoff listener on THIS (host) runtime BEFORE spawning the sibling, so
+///    the sibling's per-shard connect (which retries) always finds a bound socket.
+/// 2. Spawn the receiver sibling, inheriting the SINGLE client listener fd (no-RST inherited
+///    listener). The trigger is gated to the single-listener default here; the shard-owner (#517)
+///    N-listener fd-array inherit is a documented follow-up.
+/// 3. Build the `Send` [`CutoverCoord`](ironcache::upgrade::cutover_coord::CutoverCoord), accept each
+///    shard's connection, convert it to a reactor-free `std` stream, and deliver each shard its
+///    [`CutoverStart`](ironcache::upgrade::cutover_coord::CutoverStart) over its dedicated control
+///    channel (the drain loop's 3rd arm re-adopts the stream + spawns the per-shard task).
+/// 4. Drive the cross-shard barrier to a commit-or-abort decision.
+///
+/// CRASH-SIMPLE: every fallible step maps to an `Err`, never an unwrap; the caller treats any error
+/// as keep-serving (never exit).
+///
+/// # Errors
+/// A [`HandoffError`](ironcache::upgrade::stream::HandoffError) on any bind/spawn/accept/deliver
+/// failure, or when the barrier could not confirm every shard `Served` (W3 degraded standby).
+#[cfg(unix)]
+async fn run_cutover_host(
+    plan: &ironcache::upgrade::drive::HandoffPlan,
+    set: &ironcache_runtime::bootstrap::ShardSet,
+    control: &[tokio::sync::mpsc::Sender<ironcache::upgrade::cutover_coord::CutoverStart>],
+) -> Result<
+    ironcache::upgrade::orchestrator::SenderDecision,
+    ironcache::upgrade::stream::HandoffError,
+> {
+    use ironcache::upgrade::cutover_coord::{CutoverStart, drive_sender_cutover_host, new_cutover};
+    use ironcache::upgrade::drive::bind_handoff_listener_for_shard;
+    use ironcache::upgrade::orchestrator::spawn_receiver_sibling;
+    use ironcache::upgrade::stream::HandoffError;
+
+    let n = control.len();
+
+    // Step 1: bind every per-shard handoff listener up front (fail fast; no half-bound state).
+    let mut listeners = Vec::with_capacity(n);
+    for i in 0..n {
+        listeners.push(bind_handoff_listener_for_shard(&plan.socket, i)?);
+    }
+
+    // Step 2: spawn the receiver sibling, re-executing THIS binary with the same server args plus the
+    // receiver-role env, inheriting the single client listener fd (no-RST). `current_exe` + the
+    // original argv reproduce the serve invocation; `spawn_receiver_sibling` adds the handoff env.
+    let program = std::env::current_exe().map_err(|e| HandoffError::Io(e.to_string()))?;
+    let args_owned: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+    // The single-acceptor default has exactly one client listener fd; pass it for the inherited-listener
+    // handoff. (Shard-owner mode's N fds are a documented follow-up; `first()` covers the default.)
+    let listen_fd = set.client_listener_fds().first().copied();
+    let _child = spawn_receiver_sibling(&program, &args, &plan.socket, listen_fd)
+        .map_err(|e| HandoffError::Io(e.to_string()))?;
+
+    // Step 3: the Send coord (shards clone it; the host owns the barrier end), then accept + deliver.
+    let (coord, host) = new_cutover(n);
+    for (i, listener) in listeners.iter().enumerate() {
+        let (stream, _addr) = tokio::time::timeout(plan.timeout, listener.accept())
+            .await
+            .map_err(|_| HandoffError::Timeout { phase: "accept" })?
+            .map_err(|e| HandoffError::Io(e.to_string()))?;
+        // Convert to a reactor-free std stream so it can cross to the shard thread; the shard re-adopts
+        // it onto its own runtime (design risk 4: no stream is polled on a foreign runtime).
+        let std_stream = stream
+            .into_std()
+            .map_err(|e| HandoffError::Io(e.to_string()))?;
+        let start = CutoverStart {
+            coord: std::sync::Arc::clone(&coord),
+            shard: u32::try_from(i).unwrap_or(u32::MAX),
+            chunk_max: plan.chunk_max,
+            stream: std_stream,
+        };
+        if control[i].send(start).await.is_err() {
+            // The shard's control receiver is gone (it already stopped): abort the whole cutover.
+            return Err(HandoffError::Aborted);
+        }
+    }
+    // Only the per-shard tasks hold coord clones now; drop the host's so a dead shard closes the
+    // report channel and the barrier fail-closes to Abort rather than hanging.
+    drop(coord);
+
+    // Step 4: drive the cross-shard barrier to a commit-or-abort decision.
+    drive_sender_cutover_host(host).await
 }
 
 fn cmd_cli(host: &str, port: u16) -> anyhow::Result<()> {

@@ -158,6 +158,67 @@ pub fn new_cutover(n_shards: usize) -> (Arc<CutoverCoord>, CutoverHost) {
     (coord, host)
 }
 
+/// The #638 slice-3 CUTOVER CONTROL message: the payload the host delivers to ONE shard's DEDICATED
+/// cutover control channel (the 3rd select arm in [`crate::coordinator::run_drain_loop`], SEPARATE
+/// from the data inbox so the trigger never queues behind cross-shard data traffic -- no head-of-line
+/// blocking). It carries ONLY `Send` data: the shard's [`CutoverCoord`] clone, its index, the bulk
+/// `chunk_max`, and its ACCEPTED handoff stream as a reactor-free `std`
+/// [`std::os::unix::net::UnixStream`].
+///
+/// The host accepts the per-shard handoff stream on ITS OWN runtime and converts it via
+/// `into_std` so it is reactor-free and can cross the host->shard thread boundary; the shard's
+/// control arm re-adopts it onto its OWN runtime via `tokio::net::UnixStream::from_std`, keeping the
+/// tokio stream reactor-bound to the shard (design risk 4: a stream accepted on the host runtime
+/// cannot be polled on a shard runtime). The arm then `spawn_local`s [`run_shard_cutover_task`] with
+/// it, so the per-shard `!Send` store/ring/stream never leave the thread; only the `Send`
+/// [`CutoverCoord`] coordinates the cross-shard barrier.
+#[cfg(unix)]
+pub struct CutoverStart {
+    /// The `Send` cutover coord this shard drives its phase barrier through (one clone per shard).
+    pub coord: Arc<CutoverCoord>,
+    /// This shard's index (the HELLO shard id); equals the drain loop's `shard_index`.
+    pub shard: u32,
+    /// The bulk snapshot chunk size (`HandoffPlan::chunk_max`).
+    pub chunk_max: usize,
+    /// This shard's accepted handoff stream, as a reactor-free `std` stream so it crosses the host ->
+    /// shard thread boundary; the shard re-adopts it onto its own runtime.
+    pub stream: std::os::unix::net::UnixStream,
+}
+
+/// Off unix there is NO streamed cutover (the handoff rides an AF_UNIX socket), so the control
+/// message is UNINHABITED: the per-shard control channel exists for a uniform `run_drain_loop`
+/// signature but can never carry a value, and the shard's control arm matches it away.
+#[cfg(not(unix))]
+pub enum CutoverStart {}
+
+/// The main-thread host's post-drive LIFECYCLE decision (#638 slice-3): map the host coordinator's
+/// terminal result to what the process should do next. Factored out of `main` so the branch is
+/// unit-tested in the library (the binary's `main` seam is otherwise not directly testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverAction {
+    /// The cutover COMMITTED: set the shutdown flag so the NORMAL graceful drain runs and shard 0
+    /// exits(0). The cutover already completed BEFORE the flag, so `DRAIN_GRACE` never bounds it.
+    SetShutdownFlag,
+    /// The cutover did NOT commit -- a clean [`SenderDecision::Aborted`] (every shard already resumed
+    /// full serving) OR a W3 degraded-standby error (some shards released authority but a `Served` was
+    /// missing): DO NOT shut down. The caller resumes waiting for the next signal. CRASH-SIMPLE: an
+    /// error NEVER exits and NEVER resumes-after-release here (the shards made their own local
+    /// commit/abort decision); the host just declines to touch the lifecycle.
+    Resume,
+}
+
+/// Map the host coordinator's [`drive_sender_cutover_host`] result to the [`CutoverAction`] the
+/// process takes. `Committed` -> set the shutdown flag (graceful drain + shard-0 exit); a clean
+/// `Aborted` OR any error -> resume (never exit on error: the W3 degraded-standby is a
+/// keep-serving/standby outcome, not a shutdown).
+#[must_use]
+pub fn cutover_action(result: &Result<SenderDecision, HandoffError>) -> CutoverAction {
+    match result {
+        Ok(SenderDecision::Committed) => CutoverAction::SetShutdownFlag,
+        Ok(SenderDecision::Aborted) | Err(_) => CutoverAction::Resume,
+    }
+}
+
 /// Await until the shard's phase watch satisfies `pred`, returning the matching [`Phase`]. A dropped
 /// host (the `watch` sender gone) is treated as [`Phase::Decide`]`(`[`Outcome::Abort`]`)`: the shard
 /// resumes rather than hangs -- and it is SAFE, because a host that already decided `Commit` broadcast
@@ -968,5 +1029,139 @@ mod tests {
                 "shard {i} observed the Abort decision"
             );
         }
+    }
+
+    // ---- slice-3 wiring: the main-branch decision + the control-channel delivery ----
+
+    /// THE MAIN-BRANCH LIFECYCLE DECISION: `Committed` -> set the shutdown flag (graceful drain +
+    /// shard-0 exit(0)); a clean `Aborted` OR any W3 error -> resume (never exit on error). This pins
+    /// the exact branch `main` takes after the host drive, factored into [`cutover_action`] so it is
+    /// tested in the library rather than the untestable binary seam.
+    #[test]
+    fn cutover_action_maps_committed_to_shutdown_and_the_rest_to_resume() {
+        assert_eq!(
+            cutover_action(&Ok(SenderDecision::Committed)),
+            CutoverAction::SetShutdownFlag,
+            "a committed cutover sets the shutdown flag (the cutover ran BEFORE the flag)"
+        );
+        assert_eq!(
+            cutover_action(&Ok(SenderDecision::Aborted)),
+            CutoverAction::Resume,
+            "a clean abort resumes: the OLD keeps serving, every shard already resumed"
+        );
+        assert_eq!(
+            cutover_action(&Err(HandoffError::Aborted)),
+            CutoverAction::Resume,
+            "a W3 degraded-standby error NEVER exits: it resumes waiting (crash-simple)"
+        );
+    }
+
+    /// SLICE-3 CONTROL-CHANNEL DELIVERY: prove the wiring the drain loop's 3rd select arm adds -- a
+    /// [`CutoverStart`] delivered on the DEDICATED per-shard control channel is consumed by the arm,
+    /// its host-accepted `std` stream is RE-ADOPTED onto this runtime (`from_std`, the cross-thread
+    /// handoff), and `spawn_local` runs the REAL [`run_shard_cutover_task`], which then drives a full
+    /// single-shard cutover to Commit against the mock receiver + the `Send` host coordinator. This
+    /// exercises the delivery + adopt + spawn contract in isolation (no full server): the same steps
+    /// `crate::coordinator::spawn_shard_cutover` performs, minus the `ServerContext`-derived
+    /// `ensure`/now/replid (a seeded test store+ring stands in for `ensure_shard_ring`/`shard_store`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn cutover_control_channel_delivery_spawns_the_task_and_commits() {
+        const PER: u32 = 96;
+        crate::serve::unquiesce_shard();
+
+        let root = tmp_root("ctl");
+        let _ = std::fs::remove_dir_all(&root);
+        let staging = Staging::new(root.join("staging")).expect("staging");
+        let data_dir = root.join("data");
+
+        let (store, ring) = seeded(PER, "ctl");
+        let reference = dump_map(&store.borrow(), NOW);
+
+        // A REAL std socketpair, mirroring the host's `into_std` of an accepted tokio stream: the
+        // sender end rides the CutoverStart across the (would-be) thread boundary; the receiver end is
+        // adopted for the mock receiver driver.
+        let (sender_std, recv_std) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        sender_std
+            .set_nonblocking(true)
+            .expect("sender nonblocking");
+        recv_std.set_nonblocking(true).expect("recv nonblocking");
+        let recv_tokio = tokio::net::UnixStream::from_std(recv_std).expect("adopt recv end");
+
+        let (coord, host) = new_cutover(1);
+        // The DEDICATED control channel: the SAME type + role run_drain_loop's 3rd arm consumes.
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<CutoverStart>(1);
+        ctl_tx
+            .send(CutoverStart {
+                coord,
+                shard: 0,
+                chunk_max: CHUNK,
+                stream: sender_std,
+            })
+            .await
+            .expect("deliver the CutoverStart on the control channel");
+
+        let local = tokio::task::LocalSet::new();
+        let (task_res, host_res, adopted) = local
+            .run_until(async move {
+                // THE ARM: receive the CutoverStart, re-adopt its std stream onto THIS runtime, and
+                // spawn_local the real per-shard cutover task.
+                let start = ctl_rx
+                    .recv()
+                    .await
+                    .expect("the control arm receives the delivered CutoverStart");
+                let CutoverStart {
+                    coord,
+                    shard,
+                    chunk_max,
+                    stream,
+                } = start;
+                let stream = tokio::net::UnixStream::from_std(stream)
+                    .expect("re-adopt the sender stream onto this runtime");
+                let ensure = move || (store, ring);
+                let task = tokio::task::spawn_local(run_shard_cutover_task(
+                    coord,
+                    shard,
+                    stream,
+                    ensure,
+                    replid(),
+                    NOW,
+                    chunk_max,
+                ));
+
+                // Drive the host + the mock receiver concurrently with the spawned task.
+                let host_fut = drive_sender_cutover_host(host);
+                let mut recv_streams = vec![recv_tokio];
+                let recv_fut = drive_receiver_commit_no_flip(
+                    &mut recv_streams,
+                    || ShardStore::new(DBS),
+                    &staging,
+                    &data_dir,
+                );
+                tokio::join!(task, host_fut, recv_fut)
+            })
+            .await;
+
+        assert!(
+            task_res.is_ok(),
+            "the spawned per-shard cutover task ran to completion (no panic)"
+        );
+        assert_eq!(
+            host_res.expect("host drove to a decision"),
+            SenderDecision::Committed,
+            "the delivered + spawned task drove a full single-shard cutover to Commit"
+        );
+        assert_eq!(adopted.len(), 1, "the receiver adopted the one shard");
+        assert_eq!(
+            &dump_map(&adopted[0].store, NOW),
+            &reference,
+            "the adopted NEW store == the OLD keyspace @ E (delivery preserved the data path)"
+        );
+        assert!(
+            crate::serve::is_shard_loading(),
+            "the OLD shard quiesced permanently after commit (the spawned task ran the quiesce)"
+        );
+
+        crate::serve::unquiesce_shard();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
