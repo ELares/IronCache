@@ -89,6 +89,50 @@ pub struct ShardSet {
 /// drain). Kept here so the bound is one constant; the binary may make it a knob.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// The SHORT drain grace used ONLY on a committed streamed-cutover exit (#638). A cutover is a
+/// HANDOFF, not a leisurely shutdown: once the flip has COMMITTED (writes are quiesced past the cut
+/// E, write authority is released to the NEW, and the NEW is already serving the data), the OLD must
+/// close its client connections PROMPTLY so a client retrying `-LOADING` reconnects to the NEW
+/// immediately, instead of the OLD holding the quiesced connection open for the full [`DRAIN_GRACE`].
+/// It is a few hundred ms -- long enough to flush the final in-flight replies, short enough to keep
+/// the client-visible write stall sub-second. Data-safe: no acked write can be lost (writes are
+/// already quiesced at E), and any idempotent in-flight READ dropped on close simply retries on the
+/// NEW.
+pub const CUTOVER_DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+/// Set once, by the binary, IMMEDIATELY before it flips the shutdown flag on a COMMITTED streamed
+/// cutover (#638). It selects the [`CUTOVER_DRAIN_GRACE`] fast drain (below) instead of
+/// [`DRAIN_GRACE`], and lets the save-on-exit host SKIP the redundant final save (the NEW already
+/// durably promoted state@E). A process-global because the process is exiting immediately after a
+/// commit and the flag is never cleared; the normal SIGINT/SIGTERM shutdown NEVER sets it, so that
+/// path keeps the full [`DRAIN_GRACE`] byte-for-byte.
+static CUTOVER_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Mark this shutdown as a COMMITTED streamed-cutover handoff (#638): the drain paths use the SHORT
+/// [`CUTOVER_DRAIN_GRACE`] and the save host skips the redundant final save. Called by the binary on
+/// the committed-cutover branch ONLY, before it flips the shutdown flag.
+pub fn mark_cutover_exit() {
+    CUTOVER_EXIT.store(true, Ordering::SeqCst);
+}
+
+/// Whether this process is exiting on a COMMITTED streamed cutover ([`mark_cutover_exit`]). `false`
+/// on the normal SIGINT/SIGTERM graceful shutdown (which keeps the full [`DRAIN_GRACE`]).
+#[must_use]
+pub fn is_cutover_exit() -> bool {
+    CUTOVER_EXIT.load(Ordering::Relaxed)
+}
+
+/// The drain grace this stop should use: the SHORT [`CUTOVER_DRAIN_GRACE`] on a committed cutover
+/// handoff, else the full [`DRAIN_GRACE`] (the unchanged SIGINT/SIGTERM behavior).
+#[must_use]
+pub fn active_drain_grace() -> Duration {
+    if is_cutover_exit() {
+        CUTOVER_DRAIN_GRACE
+    } else {
+        DRAIN_GRACE
+    }
+}
+
 impl ShardSet {
     /// Construct a [`ShardSet`] from its shared shutdown flag and the spawned thread
     /// handles. Used by an alternate per-shard bootstrap (the io_uring boot,
@@ -167,7 +211,9 @@ pub fn available_shards() -> usize {
 
 #[cfg(feature = "tokio")]
 mod tokio_bootstrap {
-    use super::{Arc, AtomicBool, DRAIN_GRACE, Duration, Ordering, ShardConfig, ShardId, ShardSet};
+    use super::{
+        Arc, AtomicBool, Duration, Ordering, ShardConfig, ShardId, ShardSet, active_drain_grace,
+    };
     use crate::TokioRuntime;
     use crate::tokio_rt::listener_for;
     use std::cell::Cell;
@@ -374,11 +420,13 @@ mod tokio_bootstrap {
                             // on shard 0). The drain loop now watches the shutdown flag and RETURNS
                             // promptly on a graceful stop (shard 0 runs its save then `exit(0)`s, the
                             // others finish a brief bounded post-flag drain), so this join adds no
-                            // steady-state shutdown latency. It is still BOUNDED by the SAME
-                            // [`DRAIN_GRACE`] as a final backstop: a wedged drain task can never trap
-                            // shutdown -- on the deadline we proceed and the drop cancels whatever is
-                            // left (the prior committed snapshot stays valid).
-                            let drain_grace = tokio::time::sleep(DRAIN_GRACE);
+                            // steady-state shutdown latency. It is still BOUNDED by the active drain
+                            // grace as a final backstop: a wedged drain task can never trap shutdown --
+                            // on the deadline we proceed and the drop cancels whatever is left (the
+                            // prior committed snapshot stays valid). On a committed cutover exit (#638)
+                            // this is the SHORT `CUTOVER_DRAIN_GRACE` (the NEW already promoted
+                            // state@E); on a normal SIGINT/SIGTERM stop it is the full `DRAIN_GRACE`.
+                            let drain_grace = tokio::time::sleep(active_drain_grace());
                             tokio::pin!(drain_grace);
                             tokio::select! {
                                 _ = drain_task => {}
@@ -629,13 +677,17 @@ mod tokio_bootstrap {
     }
 
     /// Await the shard's in-flight connection tasks until the live count reaches
-    /// zero or the [`DRAIN_GRACE`] window elapses, then return. Bounded by design
-    /// (SHUTDOWN.md): a slow/stuck client cannot block shutdown forever.
+    /// zero or the active drain grace window elapses, then return. Bounded by design
+    /// (SHUTDOWN.md): a slow/stuck client cannot block shutdown forever. On a normal
+    /// SIGINT/SIGTERM stop the window is the full [`DRAIN_GRACE`] (unchanged); on a
+    /// COMMITTED streamed-cutover exit (#638) it is the SHORT `CUTOVER_DRAIN_GRACE`, so
+    /// the OLD closes its (already-quiesced) client connections promptly and a client
+    /// retrying `-LOADING` reconnects to the NEW immediately (sub-second write stall).
     async fn drain_live_tasks(live: &LiveTasks, shard: ShardId) {
         if live.get() == 0 {
             return;
         }
-        let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
+        let deadline = tokio::time::Instant::now() + active_drain_grace();
         let tick = Duration::from_millis(20);
         while live.get() > 0 {
             if tokio::time::Instant::now() >= deadline {
