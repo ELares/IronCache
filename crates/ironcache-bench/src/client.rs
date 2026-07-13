@@ -73,18 +73,44 @@ impl Conn {
     /// e.g. `["GET", "k:1"]` => `*2\r\n$3\r\nGET\r\n$3\r\nk:1\r\n`.
     pub async fn send_command(&mut self, args: &[&[u8]]) -> Result<()> {
         let mut out = Vec::with_capacity(16 + args.iter().map(|a| a.len() + 16).sum::<usize>());
-        out.extend_from_slice(b"*");
-        out.extend_from_slice(args.len().to_string().as_bytes());
-        out.extend_from_slice(b"\r\n");
-        for a in args {
-            out.extend_from_slice(b"$");
-            out.extend_from_slice(a.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(a);
-            out.extend_from_slice(b"\r\n");
-        }
+        encode_command_into(&mut out, args);
         self.stream.write_all(&out).await?;
         Ok(())
+    }
+
+    /// Pipeline `commands` back-to-back: encode ALL of them into ONE buffer, issue a
+    /// SINGLE `write_all` (one syscall on the wire, so the server reads and can batch
+    /// them), then read exactly `commands.len()` replies in order. This is classic RESP
+    /// pipelining: it amortizes the per-op round-trip/syscall over the whole batch, which
+    /// is what lets the throughput pass measure batching wins instead of being syscall-
+    /// bound at one op per round-trip.
+    ///
+    /// The read buffer already carries any trailing pipelined bytes across replies (see
+    /// [`Conn::read_reply`]), so `commands.len()` sequential `read_reply` calls drain the
+    /// batch's responses correctly even when several arrive in one socket read.
+    ///
+    /// Returns the `commands.len()` replies in send order. An empty `commands` slice is a
+    /// no-op that writes nothing and returns no replies.
+    pub async fn pipeline(&mut self, commands: &[&[&[u8]]]) -> Result<Vec<Reply>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Build the whole batch into one buffer so it goes out in a single write.
+        let cap: usize = commands
+            .iter()
+            .map(|args| 16 + args.iter().map(|a| a.len() + 16).sum::<usize>())
+            .sum();
+        let mut out = Vec::with_capacity(cap);
+        for args in commands {
+            encode_command_into(&mut out, args);
+        }
+        self.stream.write_all(&out).await?;
+        // One reply per command, in order. read_reply keeps the carry-over buffer in sync.
+        let mut replies = Vec::with_capacity(commands.len());
+        for _ in 0..commands.len() {
+            replies.push(self.read_reply().await?);
+        }
+        Ok(replies)
     }
 
     /// Issue `GET key` and read one reply.
@@ -137,6 +163,22 @@ impl Conn {
         }
         self.buf.extend_from_slice(&chunk[..n]);
         Ok(())
+    }
+}
+
+/// Encode `args` as a RESP array of bulk strings, APPENDING to `out` (it is not
+/// cleared, so several commands can be encoded back-to-back into one buffer for a
+/// pipelined write). e.g. `["GET", "k:1"]` => `*2\r\n$3\r\nGET\r\n$3\r\nk:1\r\n`.
+pub(crate) fn encode_command_into(out: &mut Vec<u8>, args: &[&[u8]]) {
+    out.extend_from_slice(b"*");
+    out.extend_from_slice(args.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for a in args {
+        out.extend_from_slice(b"$");
+        out.extend_from_slice(a.len().to_string().as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(a);
+        out.extend_from_slice(b"\r\n");
     }
 }
 
@@ -332,5 +374,81 @@ mod tests {
             parse_reply(b"?bogus\r\n", &mut pos),
             ParseOutcome::Protocol(_)
         ));
+    }
+
+    #[test]
+    fn encode_command_appends_one_resp_frame() {
+        // The single-command encoder is exactly the wire shape send_command uses.
+        let mut out = Vec::new();
+        encode_command_into(&mut out, &[b"GET", b"k:1"]);
+        assert_eq!(out, b"*2\r\n$3\r\nGET\r\n$3\r\nk:1\r\n");
+    }
+
+    #[test]
+    fn encode_command_pipelines_n_frames_into_one_buffer() {
+        // The pipeline path encodes N commands into ONE buffer (one write). Prove the
+        // buffer is exactly the N frames concatenated, in order, with no separators.
+        let mut out = Vec::new();
+        encode_command_into(&mut out, &[b"SET", b"k:1", b"vv"]);
+        encode_command_into(&mut out, &[b"GET", b"k:2"]);
+        encode_command_into(&mut out, &[b"GET", b"k:3"]);
+        let expected: &[u8] = b"*3\r\n$3\r\nSET\r\n$3\r\nk:1\r\n$2\r\nvv\r\n\
+            *2\r\n$3\r\nGET\r\n$3\r\nk:2\r\n\
+            *2\r\n$3\r\nGET\r\n$3\r\nk:3\r\n";
+        assert_eq!(out, expected);
+        // The buffer parses as exactly three complete, well-formed commands back-to-back:
+        // walk it with the request framer used by the test stub's counterpart.
+        let mut pos = 0usize;
+        let mut frames = 0usize;
+        while pos < out.len() {
+            let start = pos;
+            // Each command is a top-level array; parse_reply is a REPLY parser, but the
+            // array/bulk framing is identical, so it advances past one full command frame.
+            match parse_reply(&out, &mut pos) {
+                ParseOutcome::Done(_) => frames += 1,
+                other => panic!(
+                    "frame {frames} did not parse cleanly at {start}: {:?}",
+                    matches!(other, ParseOutcome::NeedMore)
+                ),
+            }
+        }
+        assert_eq!(
+            frames, 3,
+            "buffer must hold exactly three RESP command frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_sends_n_commands_and_reads_n_replies() {
+        // End-to-end: against the in-test stub, one pipeline of N commands must come back
+        // as N replies (a bulk for each GET, +OK for each SET), read from the carry-over
+        // buffer that drains several replies out of one socket read.
+        let stub = crate::testutil::spawn(None).await;
+        let mut conn = Conn::connect("127.0.0.1", stub.port).await.unwrap();
+        let batch: [&[&[u8]]; 4] = [
+            &[b"GET", b"k:1"],
+            &[b"SET", b"k:2", b"vv"],
+            &[b"GET", b"k:3"],
+            &[b"SET", b"k:4", b"vv"],
+        ];
+        let replies = conn.pipeline(&batch).await.unwrap();
+        assert_eq!(replies.len(), 4, "N commands must yield N replies");
+        // Stub canned replies: GET -> bulk "val", SET -> +OK. Order is preserved.
+        assert_eq!(replies[0], Reply::Bulk(Some(b"val".to_vec())));
+        assert_eq!(replies[1], Reply::Simple(b"OK".to_vec()));
+        assert_eq!(replies[2], Reply::Bulk(Some(b"val".to_vec())));
+        assert_eq!(replies[3], Reply::Simple(b"OK".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn pipeline_empty_batch_is_a_noop() {
+        let stub = crate::testutil::spawn(None).await;
+        let mut conn = Conn::connect("127.0.0.1", stub.port).await.unwrap();
+        let empty: [&[&[u8]]; 0] = [];
+        let replies = conn.pipeline(&empty).await.unwrap();
+        assert!(
+            replies.is_empty(),
+            "an empty batch writes nothing and returns no replies"
+        );
     }
 }

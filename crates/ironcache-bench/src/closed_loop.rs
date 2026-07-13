@@ -45,9 +45,14 @@ pub async fn run(
     duration: Duration,
     seed: u64,
     workload: Workload,
+    pipeline: usize,
 ) -> std::io::Result<ClosedLoopResult> {
     let env = Arc::new(SystemEnv::new());
     let connections = connections.max(1);
+    // Pipeline depth: 1 is the classic one-op-per-round-trip loop (byte-identical to the
+    // pre-feature hot path). N>1 sends N commands in ONE write and reads N replies, which
+    // amortizes the per-op syscall/round-trip so the throughput pass can measure batching.
+    let pipeline = pipeline.max(1);
     let workload = Arc::new(workload);
     let host = host.to_string();
 
@@ -62,7 +67,16 @@ pub async fn run(
         // Per-connection seeded stream: distinct, reproducible.
         let stream_seed = seed.wrapping_add(conn_index as u64);
         handles.push(tokio::spawn(async move {
-            connection_loop(&host, port, deadline, stream_seed, &workload, &env).await
+            connection_loop(
+                &host,
+                port,
+                deadline,
+                stream_seed,
+                &workload,
+                &env,
+                pipeline,
+            )
+            .await
         }));
     }
 
@@ -93,6 +107,7 @@ pub async fn run(
             duration_secs: duration.as_secs_f64(),
         },
         connections,
+        pipeline,
         total_ops,
         elapsed_secs,
         qps,
@@ -102,6 +117,11 @@ pub async fn run(
 /// One connection's hot loop: issue ops back-to-back until the deadline, returning
 /// the number of completed ops. The deadline is checked against `env.now()` after
 /// each op (cheap monotonic read), so the loop stops promptly when `D` elapses.
+///
+/// At `pipeline == 1` this is the exact one-op-per-round-trip loop (byte-identical to
+/// the pre-feature hot path). At `pipeline == N` each iteration draws N ops, sends the
+/// N commands in ONE write, and reads N replies (RESP pipelining), counting `ops += N`;
+/// the deadline is checked between batches (a partial final batch is fine).
 async fn connection_loop(
     host: &str,
     port: u16,
@@ -109,27 +129,79 @@ async fn connection_loop(
     stream_seed: u64,
     workload: &Workload,
     env: &SystemEnv,
+    pipeline: usize,
 ) -> std::io::Result<u64> {
     let mut conn = Conn::connect(host, port).await?;
     let mut rng = SplitMix64::new(stream_seed);
     let value = workload.value_bytes();
     let mut ops: u64 = 0;
 
+    if pipeline <= 1 {
+        // Depth 1: the original hot path, unchanged.
+        loop {
+            if env.now() >= deadline {
+                break;
+            }
+            match workload.next_op(&mut rng) {
+                Op::Get(idx) => {
+                    let key = workload.key_bytes(idx);
+                    conn.get(&key).await?;
+                }
+                Op::Set(idx) => {
+                    let key = workload.key_bytes(idx);
+                    conn.set(&key, &value).await?;
+                }
+            }
+            ops += 1;
+        }
+        return Ok(ops);
+    }
+
+    // Depth N: draw N ops, build N commands, pipeline them in one write, read N replies.
+    // The per-iteration `keys` buffer owns the key bytes so the borrowed `&[&[u8]]` batch
+    // slices stay valid for the single `pipeline` call; both are reused each iteration to
+    // avoid reallocating in the hot loop.
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(pipeline);
+    let mut is_set: Vec<bool> = Vec::with_capacity(pipeline);
     loop {
         if env.now() >= deadline {
             break;
         }
-        match workload.next_op(&mut rng) {
-            Op::Get(idx) => {
-                let key = workload.key_bytes(idx);
-                conn.get(&key).await?;
-            }
-            Op::Set(idx) => {
-                let key = workload.key_bytes(idx);
-                conn.set(&key, &value).await?;
+        keys.clear();
+        is_set.clear();
+        for _ in 0..pipeline {
+            match workload.next_op(&mut rng) {
+                Op::Get(idx) => {
+                    keys.push(workload.key_bytes(idx));
+                    is_set.push(false);
+                }
+                Op::Set(idx) => {
+                    keys.push(workload.key_bytes(idx));
+                    is_set.push(true);
+                }
             }
         }
-        ops += 1;
+        // Borrow the owned key bytes into the RESP arg slices for this batch.
+        let batch: Vec<[&[u8]; 3]> = keys
+            .iter()
+            .zip(is_set.iter())
+            .map(|(key, &set)| {
+                if set {
+                    [b"SET".as_slice(), key.as_slice(), value.as_slice()]
+                } else {
+                    // GET is a 2-arg command; pad the unused slot with an empty slice and
+                    // pass only the first two args below.
+                    [b"GET".as_slice(), key.as_slice(), b"".as_slice()]
+                }
+            })
+            .collect();
+        let cmds: Vec<&[&[u8]]> = batch
+            .iter()
+            .zip(is_set.iter())
+            .map(|(args, &set)| if set { &args[..3] } else { &args[..2] })
+            .collect();
+        let replies = conn.pipeline(&cmds).await?;
+        ops += replies.len() as u64;
     }
     Ok(ops)
 }
@@ -152,6 +224,7 @@ mod tests {
             Duration::from_millis(200),
             0x00AB_CDEF,
             wl,
+            1,
         )
         .await
         .expect("closed-loop run");
@@ -159,12 +232,42 @@ mod tests {
         assert!(res.total_ops > 0, "should complete some ops");
         assert!(res.qps > 0.0, "QPS should be positive");
         assert_eq!(res.connections, 4);
+        assert_eq!(res.pipeline, 1);
         assert_eq!(res.params.mode, "closed");
         // The stub's reply counter should be at least the ops we counted (the client
         // counts a completed reply per op).
         assert!(
             stub.replies.load(std::sync::atomic::Ordering::Relaxed) >= res.total_ops,
             "stub replied to every counted op"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_loop_pipeline_depth_counts_every_op_and_records_depth() {
+        // A depth-8 run against the stub must still count one op per completed reply and
+        // echo the pipeline depth. The stub replies one frame per request even when a
+        // batch arrives coalesced in a single read, so ops must equal the stub's replies.
+        let stub = testutil::spawn(None).await;
+        let wl = Workload::new(1000, 0.99, 0.9, 128);
+        let res = run(
+            "127.0.0.1",
+            stub.port,
+            4,
+            Duration::from_millis(200),
+            0x00AB_CDEF,
+            wl,
+            8,
+        )
+        .await
+        .expect("closed-loop pipelined run");
+
+        assert!(res.total_ops > 0, "should complete some ops");
+        assert!(res.qps > 0.0, "QPS should be positive");
+        assert_eq!(res.pipeline, 8, "the depth is recorded in the result");
+        // Depth-N counts N per batch, one per reply: it never exceeds the stub's replies.
+        assert!(
+            stub.replies.load(std::sync::atomic::Ordering::Relaxed) >= res.total_ops,
+            "stub replied to every counted op even under pipelining"
         );
     }
 }

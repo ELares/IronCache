@@ -79,6 +79,10 @@ pub struct ClosedLoopResult {
     pub params: RunParams,
     /// The number of concurrent connections.
     pub connections: usize,
+    /// The RESP pipeline depth: how many commands each connection sends per write (and
+    /// reads back per batch). `1` is the classic one-op-per-round-trip loop; `N > 1`
+    /// amortizes the per-op syscall/round-trip. Recorded so a bench run is self-describing.
+    pub pipeline: usize,
     /// Total completed ops across all connections.
     pub total_ops: u64,
     /// Wall seconds actually elapsed (measured via `ironcache_env`, not the nominal
@@ -94,11 +98,12 @@ impl ClosedLoopResult {
     pub fn to_json(&self) -> String {
         format!(
             concat!(
-                "{{{},\"connections\":{},\"total_ops\":{},",
+                "{{{},\"connections\":{},\"pipeline\":{},\"total_ops\":{},",
                 "\"elapsed_secs\":{:.4},\"qps\":{:.2}}}"
             ),
             self.params.members(),
             self.connections,
+            self.pipeline,
             self.total_ops,
             self.elapsed_secs,
             self.qps,
@@ -215,6 +220,7 @@ mod tests {
         let r = ClosedLoopResult {
             params: sample_params("closed"),
             connections: 50,
+            pipeline: 16,
             total_ops: 1_000_000,
             elapsed_secs: 1.0,
             qps: 1_000_000.0,
@@ -224,6 +230,7 @@ mod tests {
         assert!(j.contains("\"mode\":\"closed\""));
         assert!(j.contains("\"seed\":1234"));
         assert!(j.contains("\"connections\":50"));
+        assert!(j.contains("\"pipeline\":16"));
         assert!(j.contains("\"total_ops\":1000000"));
         assert!(j.contains("\"qps\":1000000.00"));
         assert!(j.contains("\"keyspace\":1000000"));

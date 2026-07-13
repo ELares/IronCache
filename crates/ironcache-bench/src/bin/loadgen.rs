@@ -127,6 +127,17 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     connections: usize,
 
+    /// RESP pipeline depth for the CLOSED-loop pass: how many commands each connection
+    /// sends in ONE write (and reads back per batch) before drawing the next batch.
+    /// `1` (the default) is the classic one-op-per-round-trip loop, byte-identical to the
+    /// pre-feature behavior. `N > 1` amortizes the per-op syscall/round-trip, which is the
+    /// prerequisite for measuring where batching/io_uring lifts throughput (a non-pipelined
+    /// loadgen is syscall-bound at one op per round-trip). Affects `--mode closed` ONLY;
+    /// the open-loop pass keeps its coordinated-omission-free one-request-per-intended-tick
+    /// timing at depth 1 regardless of this flag.
+    #[arg(long, default_value_t = 1)]
+    pipeline: usize,
+
     /// Target request rate in ops/sec (open mode only).
     #[arg(long, default_value_t = 50_000.0, value_parser = finite_f64)]
     rate: f64,
@@ -177,6 +188,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 duration,
                 args.seed,
                 workload,
+                args.pipeline,
             )
             .await?;
             res.to_json()

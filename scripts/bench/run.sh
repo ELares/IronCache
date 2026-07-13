@@ -46,11 +46,13 @@ cd "${REPO_ROOT}"
 # the canonical "memory at fixed hit ratio" benchmark (uniform keys are rejected as
 # unlike cache reality).
 #
-# NOTE on concurrency / pipeline depth: within-connection pipeline depth > 1 is a
-# DEFERRED loadgen feature (BENCHMARK.md's pipeline-depth sweep is therefore only
-# partially covered here). Until it lands, "concurrency" is expressed purely via
-# --connections, so the standard run fans out across connections rather than
-# pipelining within one.
+# NOTE on concurrency / pipeline depth: the standard run fans out across --connections
+# and, by default, sends one op per round-trip (PIPELINE=1). Within-connection RESP
+# pipelining is now available via the loadgen's --pipeline flag (exposed here as the
+# PIPELINE knob) and applies to the CLOSED-loop peak-QPS pass only; the open-loop
+# latency pass stays at depth 1 to keep its coordinated-omission-free timing. Set
+# PIPELINE=N to amortize the per-op syscall/round-trip (the prerequisite for measuring
+# where batching/io_uring lifts throughput); the manifest records the depth used.
 # ---------------------------------------------------------------------------
 SEED="${SEED:-6342047879154770157}"     # 0x5DEE_CE66_D1CE_5EED, the loadgen default seed, fixed.
 KEYSPACE="${KEYSPACE:-1000000}"          # distinct keys.
@@ -59,6 +61,7 @@ READ_RATIO="${READ_RATIO:-0.9}"          # 90% GET / 10% SET; the locked hit-rat
 VALUE_SIZE="${VALUE_SIZE:-128}"          # SET value bytes.
 DURATION_SECS="${DURATION_SECS:-10}"     # measured-pass duration.
 CONNECTIONS="${CONNECTIONS:-50}"         # load fan-out (closed) / dispatch pool (open).
+PIPELINE="${PIPELINE:-1}"                # closed-loop RESP pipeline depth (1 = one op per round-trip).
 RATE="${RATE:-50000}"                    # open-loop target ops/sec.
 WARMUP_SECS="${WARMUP_SECS:-3}"          # write-only warmup to populate the hot keyset.
 
@@ -345,9 +348,9 @@ echo "[bench] pass 1/3: memory model -> $(basename "${MEMORY_JSON}")"
 "${MEMMODEL_BIN}" >"${MEMORY_JSON}"
 
 # 2. Closed-loop: peak QPS. The op-mix is the locked READ_RATIO (90% GET).
-echo "[bench] pass 2/3: closed-loop peak QPS -> $(basename "${CLOSED_JSON}")"
+echo "[bench] pass 2/3: closed-loop peak QPS -> $(basename "${CLOSED_JSON}") (pipeline=${PIPELINE})"
 run_loadgen --mode closed --read-ratio "${READ_RATIO}" --duration-secs "${DURATION_SECS}" \
-  --connections "${CONNECTIONS}" --out "${CLOSED_JSON}"
+  --connections "${CONNECTIONS}" --pipeline "${PIPELINE}" --out "${CLOSED_JSON}"
 
 # 3. Open-loop: latency tail at a constant rate + the HdrHistogram artifact.
 echo "[bench] pass 3/3: open-loop latency tail @ ${RATE} ops/sec -> $(basename "${OPEN_JSON}")"
@@ -405,7 +408,7 @@ cat >"${MANIFEST}" <<EOF
     "warmup_secs": ${WARMUP_SECS},
     "connections": ${CONNECTIONS},
     "rate": ${RATE},
-    "pipeline_depth": 1
+    "pipeline_depth": ${PIPELINE}
   },
   "artifacts": {
     "memory": "memory.json",
@@ -464,7 +467,7 @@ fi
 if [[ "${SMOKE}" == "1" ]]; then
   echo "  mode:           SMOKE (NOT publishable)"
 fi
-echo "  knobs:          keyspace=${KEYSPACE} theta=${THETA} read_ratio=${READ_RATIO} value_size=${VALUE_SIZE} dur=${DURATION_SECS}s conns=${CONNECTIONS} rate=${RATE} (pipeline_depth=1)"
+echo "  knobs:          keyspace=${KEYSPACE} theta=${THETA} read_ratio=${READ_RATIO} value_size=${VALUE_SIZE} dur=${DURATION_SECS}s conns=${CONNECTIONS} rate=${RATE} (pipeline_depth=${PIPELINE})"
 echo "  ---"
 echo "  closed-loop peak QPS:   ${QPS}"
 echo "  open-loop p50/p99/p999: ${O_P50} / ${O_P99} / ${O_P999} us  (target ${RATE} ops/sec, achieved ${O_ACH}, saturated=${O_SAT})"
