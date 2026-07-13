@@ -10,6 +10,9 @@
 //! and writes the encoded reply.
 
 use crate::coordinator;
+// #510: `Bytes` wraps the per-batch read buffer for zero-copy argument slicing; `Buf`
+// brings `Bytes::advance` into scope for the per-frame cursor advance in the serve loops.
+use bytes::{Buf, Bytes};
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng, SystemEnv};
 use ironcache_eviction::{Policy, map_policy_name};
@@ -19,7 +22,7 @@ use ironcache_runtime::{Runtime, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     ConnState, CounterDeltas, DecodeOutcome, EXPIRE_CYCLE_INTERVAL, Limits, MAX_RECLAIM_PER_CYCLE,
-    ProtoVersion, Request, ScanCursor, TimingWheel, UnixMillis, decode, dispatch_with_cmd,
+    ProtoVersion, Request, ScanCursor, TimingWheel, UnixMillis, decode_shared, dispatch_with_cmd,
     drain_due_keys, route,
 };
 use ironcache_storage::CountingAccounting;
@@ -1961,11 +1964,12 @@ async fn serve_connection(
     let timer_rt = TokioRuntime::new();
 
     'conn: loop {
-        // Drain every complete request currently buffered (pipelining), building
-        // one combined output buffer, then flush once. A running cursor (`consumed_total`) advances
-        // per command and the read buffer is drained ONCE after the batch, instead of per command:
-        // draining per command memmoves all remaining pipelined bytes to the front each time, which is
-        // O(P^2) over a depth-P pipeline. `decode` parses a `&[u8]`, so we hand it `read_buf[cursor..]`.
+        // Drain every complete request currently buffered (pipelining), building one combined output
+        // buffer, then flush once. #510: the batch's bytes are wrapped as a shared `Bytes` and each
+        // decoded frame ADVANCES that view (`decode_shared` slices args zero-copy from it), so there
+        // is no per-command `read_buf` drain (which would memmove all remaining pipelined bytes to the
+        // front each time -- O(P^2) over a depth-P pipeline); the unconsumed tail is restored to
+        // `read_buf` once after the batch.
         out.clear();
         // OUTPUT-BUFFER hard cap (PROD-SAFETY #5 / #529): read the live cap ONCE per batch (one cold
         // relaxed load, off the per-command hot path) and enforce it in TWO places -- after each
@@ -1976,9 +1980,15 @@ async fn serve_connection(
         // semantics (a `CONFIG SET output-buffer-limit` applies from the next batch), so both checks
         // use one consistent value. `0` disables the cap (the pre-fix unbounded behavior).
         let obl = ctx.runtime.output_buffer_limit();
-        let mut consumed_total = 0usize;
+        // #510 ZERO-COPY PARSE: wrap the accumulated read buffer as a shared `Bytes` for the
+        // duration of this batch (O(1) move, no copy) so each decoded argument is a refcounted
+        // SLICE of it rather than a fresh per-arg heap allocation + memcpy -- the deep-pipeline
+        // win. `read_buf` is emptied here; the unconsumed trailing frame is moved back into it
+        // after the batch. We `advance` `batch` past each consumed frame in place of a running
+        // `consumed_total` cursor (the old per-batch `drain` is likewise replaced below).
+        let mut batch = Bytes::from(std::mem::take(&mut read_buf));
         loop {
-            match decode(&read_buf[consumed_total..], &limits) {
+            match decode_shared(&batch, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     // SLOWLOG TIMING HOOK (PROD-7). When the SLOWLOG is ENABLED (threshold >= 0) read
                     // the monotonic clock ONCE before dispatch; when DISABLED (-1, the default) this
@@ -2058,7 +2068,7 @@ async fn serve_connection(
                             slow_threshold,
                             proto: conn.proto,
                         });
-                        consumed_total += consumed;
+                        batch.advance(consumed);
                         continue;
                     }
                     // BARRIER (any synchronous / control / home / fan-out command): if a run of hops is
@@ -2123,7 +2133,7 @@ async fn serve_connection(
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
-                    consumed_total += consumed;
+                    batch.advance(consumed);
                     // -- BLOCKING PARK (PROD-9). The blocking-command interception in
                     // `route_and_dispatch` set `block_request`: the command's non-blocking attempt
                     // found every key empty (or WAIT's quorum not yet met), so PARK this connection
@@ -2135,12 +2145,13 @@ async fn serve_connection(
                     // `block_request == None` on the hot path (every non-blocking command), so this
                     // is a single `is_some` check then skipped.
                     if let Some(park) = block_request {
-                        // The running cursor deferred the read-buffer drain; apply it now so
-                        // `run_block_park` (which owns `read_buf` during the park + re-decodes bytes
-                        // that arrive) sees the buffer starting at the next UNprocessed byte. The
-                        // blocking command's own bytes are included in `consumed_total`.
-                        read_buf.drain(..consumed_total);
-                        consumed_total = 0;
+                        // #510: `batch` was already advanced past the blocking command (above), so it
+                        // now holds exactly the UNprocessed tail. Move that tail into `read_buf` so
+                        // `run_block_park` -- which owns `read_buf` during the park and re-decodes
+                        // bytes that arrive -- starts at the next unprocessed byte. `read_buf` was
+                        // emptied when `batch` was formed, so this restores it. (`batch` itself is
+                        // re-formed from `read_buf` after the park returns, below.)
+                        read_buf.extend_from_slice(&batch);
                         // Flush the pipelined replies that preceded the blocking command, so a
                         // blocked client still receives the earlier commands' replies before it
                         // parks (FIFO, never a blocking command holding up prior replies).
@@ -2174,8 +2185,10 @@ async fn serve_connection(
                             break 'conn;
                         }
                         // The park completed (a pop succeeded, or the timeout / quorum reply was
-                        // sent). `out` was flushed inside the park loop, so continue the decode loop
-                        // to process any bytes that arrived while parked (re-decode `read_buf`).
+                        // sent). `out` was flushed inside the park loop. `run_block_park` owned
+                        // `read_buf` and left the still-unprocessed bytes in it, so re-form `batch`
+                        // from it (#510) and continue the decode loop to process whatever arrived.
+                        batch = Bytes::from(std::mem::take(&mut read_buf));
                         continue;
                     }
                     if close {
@@ -2250,11 +2263,11 @@ async fn serve_connection(
             .await;
         }
 
-        // Drain the whole processed batch ONCE (the running-cursor deferral): a single memmove removes
-        // every consumed command, leaving only a partial trailing frame at the front of the buffer.
-        if consumed_total > 0 {
-            read_buf.drain(..consumed_total);
-        }
+        // #510: `batch` now holds exactly the unconsumed trailing bytes (a partial frame, or empty).
+        // Move them back into `read_buf` for the next recv to append to. `read_buf` was emptied when
+        // `batch` was formed at the top of this batch (or by the block-park refresh above), so this
+        // restores it to just the carry-over -- the same buffer state the old post-batch drain left.
+        read_buf.extend_from_slice(&batch);
 
         // OUTPUT-BUFFER hard cap (PROD-SAFETY #5): before flushing, if the pending reply buffer has
         // grown past the configured `output_buffer_limit`, CLOSE the connection rather than let a
@@ -2594,11 +2607,14 @@ async fn serve_connection_uring(
         // appended (#529: bound resident output so one pipelined batch of large-reply commands cannot
         // OOM the host) and again pre-flush after the batch is assembled. `0` disables the cap.
         let obl = ctx.runtime.output_buffer_limit();
-        // Running cursor: advance per command, drain the read buffer ONCE after the batch instead of
-        // per command (per-command drain memmoves the remaining pipelined bytes each time -> O(P^2)).
-        let mut consumed_total = 0usize;
+        // #510 ZERO-COPY PARSE (mirrors the tokio loop): wrap the accumulated read buffer as a
+        // shared `Bytes` for this batch (O(1) move) so each decoded argument is a refcounted SLICE
+        // of it, not a per-arg heap allocation + memcpy. `read_buf` is emptied here and the
+        // unconsumed trailing frame is moved back into it after the batch; we `advance` `batch` per
+        // consumed frame in place of a running cursor (and replace the old post-batch `drain`).
+        let mut batch = Bytes::from(std::mem::take(&mut read_buf));
         loop {
-            match decode(&read_buf[consumed_total..], &limits) {
+            match decode_shared(&batch, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     let slow_threshold = ctx.slowlog.log_slower_than_micros();
                     // COMMANDSTATS timing (#413): capture the monotonic start ALWAYS (one read),
@@ -2671,7 +2687,7 @@ async fn serve_connection_uring(
                             slow_threshold,
                             proto: conn.proto,
                         });
-                        consumed_total += consumed;
+                        batch.advance(consumed);
                         continue;
                     }
                     // BARRIER (any synchronous / control / home / fan-out / blocking command): if a run of
@@ -2733,7 +2749,7 @@ async fn serve_connection_uring(
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
-                    consumed_total += consumed;
+                    batch.advance(consumed);
                     // FIX1: the blocking command parked (`out` is empty). Write its IMMEDIATE
                     // non-blocking reply so it returns at once rather than hanging: the BLPOP-family
                     // pops get the nil-array timeout reply; WAIT gets the CURRENT in-sync replica
@@ -2817,12 +2833,11 @@ async fn serve_connection_uring(
             .await;
         }
 
-        // Drain the whole processed batch ONCE (the running-cursor deferral): one memmove removes all
-        // consumed commands, leaving any partial trailing frame at the front. Done before the flush +
-        // the subscriber-idle / recv paths below (which own `read_buf` and append to it).
-        if consumed_total > 0 {
-            read_buf.drain(..consumed_total);
-        }
+        // #510: `batch` now holds exactly the unconsumed trailing bytes (a partial frame, or empty);
+        // move them back into `read_buf` for the flush + subscriber-idle / recv paths below (which
+        // own `read_buf` and append to it). `read_buf` was emptied when `batch` was formed, so this
+        // restores just the carry-over -- the same buffer state the old post-batch drain left.
+        read_buf.extend_from_slice(&batch);
 
         // OUTPUT-BUFFER hard cap (PROD-SAFETY #5), identical to the tokio path: the pre-flush check,
         // using the `obl` read once at the top of this batch (shared with the intra-batch check).

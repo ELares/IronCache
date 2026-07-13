@@ -104,6 +104,40 @@ enum FrameStep {
 /// the stack and abort the shard (hardening, #138).
 #[must_use]
 pub fn decode(input: &[u8], limits: &Limits) -> DecodeOutcome {
+    // Owned args: each multibulk argument is COPIED out of `input` into its own `Bytes`,
+    // so the returned `Request` is independent of the caller's buffer. This is the
+    // simple, always-correct entry point used by tests and the non-hot decode sites.
+    decode_core(input, limits, |start, end| {
+        Bytes::copy_from_slice(&input[start..end])
+    })
+}
+
+/// Zero-copy decode: like [`decode`], but each multibulk argument is a refcounted
+/// SLICE of `base` ([`Bytes::slice`]) rather than a fresh copy, so a pipelined batch of
+/// N arguments costs N refcount bumps instead of N heap allocations + memcpies (#510,
+/// the deep-pipeline hot path). The returned `Request`'s args SHARE `base`'s allocation;
+/// they stay valid as long as any is held -- refcounting keeps `base` alive across a
+/// MULTI queue or a deferred cross-shard hop, a case a plain borrow could not express.
+/// `base` is the connection read buffer as a shared [`Bytes`]; the caller advances it by
+/// `consumed`. INLINE commands (rare, non-pipelined) still copy: they need per-byte quote
+/// / escape processing that has no verbatim slice in the input.
+#[must_use]
+pub fn decode_shared(base: &Bytes, limits: &Limits) -> DecodeOutcome {
+    decode_core(&base[..], limits, |start, end| base.slice(start..end))
+}
+
+/// The shared decode engine over a byte slice, parameterized by how each multibulk
+/// argument is MATERIALIZED from an absolute `[start, end)` byte range of `input`:
+/// [`decode`] copies the range, [`decode_shared`] slices a shared [`Bytes`]. The
+/// iterative no-op-frame skip (empty/null multibulk, blank inline, RESP3 attribute) and
+/// every hardening limit are identical for both entry points; ONLY argument construction
+/// differs, so the two paths can never diverge on framing.
+#[must_use]
+fn decode_core<F: Fn(usize, usize) -> Bytes>(
+    input: &[u8],
+    limits: &Limits,
+    make_arg: F,
+) -> DecodeOutcome {
     let mut cursor = 0usize;
     loop {
         let rest = &input[cursor..];
@@ -111,7 +145,9 @@ pub fn decode(input: &[u8], limits: &Limits) -> DecodeOutcome {
             return DecodeOutcome::Incomplete;
         }
         let step = match rest[0] {
-            b'*' => decode_multibulk(rest, limits),
+            // `decode_multibulk` reports arg ranges RELATIVE to `rest`; shift by `cursor`
+            // so `make_arg` indexes `input`/`base` from its origin (absolute offsets).
+            b'*' => decode_multibulk(rest, limits, |s, e| make_arg(cursor + s, cursor + e)),
             // RESP3 attribute frames on input are tolerated: parse and skip.
             b'|' => decode_and_skip_attribute(rest, limits),
             // Anything else is an inline command line.
@@ -180,7 +216,11 @@ fn parse_i64(bytes: &[u8]) -> Option<i64> {
     Some(if neg { -acc } else { acc })
 }
 
-fn decode_multibulk(input: &[u8], limits: &Limits) -> FrameStep {
+fn decode_multibulk(
+    input: &[u8],
+    limits: &Limits,
+    make_arg: impl Fn(usize, usize) -> Bytes,
+) -> FrameStep {
     // Header: *<count>\r\n
     let Some(crlf) = find_crlf(input, 1) else {
         return FrameStep::Incomplete;
@@ -230,7 +270,9 @@ fn decode_multibulk(input: &[u8], limits: &Limits) -> FrameStep {
         if input[data_end] != b'\r' || input[data_end + 1] != b'\n' {
             return FrameStep::Error(ErrorReply::protocol("expected CRLF after bulk payload"));
         }
-        args.push(Bytes::copy_from_slice(&input[data_start..data_end]));
+        // Materialize this argument from its `[data_start, data_end)` range: a copy for
+        // [`decode`], a zero-copy shared slice for [`decode_shared`] (#510).
+        args.push(make_arg(data_start, data_end));
         pos = data_end + 2;
     }
     FrameStep::Request {
@@ -726,5 +768,97 @@ mod tests {
             buf.extend_from_slice(b"*0\r\n");
         }
         assert_eq!(decode(&buf, &Limits::default()), DecodeOutcome::Incomplete);
+    }
+
+    // -- #510 zero-copy `decode_shared` -------------------------------------------------
+
+    /// `decode_shared` MUST agree with `decode` on the framing (the exact `Request` +
+    /// `consumed`, or the same Incomplete / Error) for every input: the two paths share
+    /// `decode_core` and differ only in how args are materialized, so they can never
+    /// diverge. This exhaustive equivalence is the safety net that lets the hot serve
+    /// loops switch to the zero-copy path.
+    fn assert_shared_matches_owned(input: &[u8]) {
+        let owned = decode(input, &Limits::default());
+        let shared = decode_shared(&Bytes::copy_from_slice(input), &Limits::default());
+        assert_eq!(shared, owned, "decode_shared diverged for {input:?}");
+    }
+
+    #[test]
+    fn shared_matches_owned_across_frame_shapes() {
+        let cases: &[&[u8]] = &[
+            // Complete multibulk frames of varying arity + payloads.
+            b"*1\r\n$4\r\nPING\r\n",
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+            b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n",
+            // Binary-safe value containing CRLF (length-respected, not line-split).
+            b"*2\r\n$3\r\nSET\r\n$4\r\na\r\nb\r\n",
+            // Empty-string argument ($0).
+            b"*2\r\n$3\r\nSET\r\n$0\r\n\r\n",
+            // Leading no-op frames (empty/null multibulk) skipped before a real frame.
+            b"*0\r\n*1\r\n$4\r\nPING\r\n",
+            b"*-1\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            // A tolerated RESP3 attribute frame skipped ahead of a real frame.
+            b"|1\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$4\r\nPING\r\n",
+            // Inline command (still copies internally, but framing must match).
+            b"PING\r\n",
+            b"SET foo bar\r\n",
+            // Incomplete inputs (need more bytes).
+            b"*1\r\n$4\r\nPI",
+            b"*3\r\n$3\r\nSET\r\n",
+            b"",
+            // Protocol errors.
+            b"*1\r\n$3\r\nPING\r\n", // declared len 3, payload 4 -> CRLF mismatch
+            b"*abc\r\n",
+        ];
+        for input in cases {
+            assert_shared_matches_owned(input);
+        }
+    }
+
+    #[test]
+    fn shared_matches_owned_for_a_deep_pipeline() {
+        // The #510 target: many pipelined frames in one buffer. `decode_shared` must
+        // frame each identically to `decode`, decode after decode, across the batch.
+        let mut buf = Vec::new();
+        for i in 0..64 {
+            let key = format!("k{i}");
+            buf.extend_from_slice(
+                format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key).as_bytes(),
+            );
+        }
+        let limits = Limits::default();
+        let mut off = 0usize;
+        loop {
+            let owned = decode(&buf[off..], &limits);
+            let shared = decode_shared(&Bytes::copy_from_slice(&buf[off..]), &limits);
+            assert_eq!(shared, owned);
+            match owned {
+                DecodeOutcome::Complete { consumed, .. } => off += consumed,
+                _ => break,
+            }
+        }
+        assert_eq!(off, buf.len(), "the whole pipeline framed identically");
+    }
+
+    #[test]
+    fn shared_args_are_zero_copy_slices_of_the_base() {
+        // The args returned by `decode_shared` must POINT INTO the base buffer, not be
+        // fresh copies: verify each arg's byte range lies within the base allocation.
+        let input: &[u8] = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let base = Bytes::copy_from_slice(input);
+        let base_start = base.as_ptr() as usize;
+        let base_end = base_start + base.len();
+        match decode_shared(&base, &Limits::default()) {
+            DecodeOutcome::Complete { request, .. } => {
+                for arg in &request.args {
+                    let arg_start = arg.as_ptr() as usize;
+                    assert!(
+                        arg_start >= base_start && arg_start + arg.len() <= base_end,
+                        "arg {arg:?} is not a slice of the base buffer (a copy leaked in)"
+                    );
+                }
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
     }
 }
