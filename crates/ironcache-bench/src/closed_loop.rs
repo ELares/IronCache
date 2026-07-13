@@ -31,16 +31,26 @@ use crate::workload::{Op, Workload};
 
 /// Run the closed-loop pass and return the throughput result.
 ///
-/// Opens `connections` connections to `host:port`, runs each in its own task
-/// looping ops until `duration` elapses (deadline read from `env.now()`), sums the
-/// completed ops, and computes QPS over the actual elapsed wall time.
+/// Opens `connections` connections spread evenly across `endpoints`, runs each in its
+/// own task looping ops until `duration` elapses (deadline read from `env.now()`), sums
+/// the completed ops, and computes QPS over the actual elapsed wall time.
+///
+/// ## Cluster-aware / zero-hop mode (multiple endpoints)
+///
+/// With ONE endpoint this is the classic single-target load. With `N > 1` endpoints the
+/// generator is CLUSTER-AWARE: connection `i` is bound to `endpoints[i % N]` and draws its
+/// keys from a DISJOINT partition `p = i % N` of the keyspace (`workload.keyspace()` keys
+/// per partition, offset by `p * keyspace`), so every key deterministically lands on the
+/// endpoint that owns it. Against `N` separately-addressable single-shard servers this is
+/// ZERO-HOP -- it measures the ceiling a perfectly-routed client reaches, isolating the
+/// cost of the cross-shard hop that a single-endpoint client pays on a multi-shard node.
+/// The reported `keyspace` is the aggregate across partitions (`per-partition * N`).
 ///
 /// # Errors
 ///
 /// Returns an error if a connection cannot be established or a request/reply fails.
 pub async fn run(
-    host: &str,
-    port: u16,
+    endpoints: &[(String, u16)],
     connections: usize,
     duration: Duration,
     seed: u64,
@@ -53,8 +63,18 @@ pub async fn run(
     // pre-feature hot path). N>1 sends N commands in ONE write and reads N replies, which
     // amortizes the per-op syscall/round-trip so the throughput pass can measure batching.
     let pipeline = pipeline.max(1);
+    // The endpoints to spread connections across (fall back to loopback:6379 if somehow
+    // empty). `n_endpoints` partitions the keyspace: connection `i` owns partition `i % n`.
+    let endpoints: Vec<(String, u16)> = if endpoints.is_empty() {
+        vec![("127.0.0.1".to_string(), 6379)]
+    } else {
+        endpoints.to_vec()
+    };
+    let n_endpoints = endpoints.len();
+    // Each partition draws from `[0, per_partition)` and is offset into a disjoint range,
+    // so the aggregate distinct keyspace is `per_partition * n_endpoints`.
+    let per_partition = workload.keyspace();
     let workload = Arc::new(workload);
-    let host = host.to_string();
 
     let start = env.now();
     let deadline = start.saturating_add(duration);
@@ -63,13 +83,18 @@ pub async fn run(
     for conn_index in 0..connections {
         let env = Arc::clone(&env);
         let workload = Arc::clone(&workload);
-        let host = host.clone();
+        // Bind this connection to its partition's endpoint; draw keys from that partition's
+        // disjoint index range so every request is local to the owning endpoint (zero-hop).
+        let partition = conn_index % n_endpoints;
+        let (host, port) = endpoints[partition].clone();
+        let base = partition as u64 * per_partition;
         // Per-connection seeded stream: distinct, reproducible.
         let stream_seed = seed.wrapping_add(conn_index as u64);
         handles.push(tokio::spawn(async move {
             connection_loop(
                 &host,
                 port,
+                base,
                 deadline,
                 stream_seed,
                 &workload,
@@ -100,7 +125,9 @@ pub async fn run(
         params: RunParams {
             mode: "closed",
             seed,
-            keyspace: workload.keyspace(),
+            // The AGGREGATE distinct keyspace across all partitions (single endpoint => the
+            // per-partition value itself, so this is unchanged for the classic single-target run).
+            keyspace: per_partition.saturating_mul(n_endpoints as u64),
             theta: workload.theta(),
             read_ratio: workload.read_ratio(),
             value_size: workload.value_size(),
@@ -122,9 +149,11 @@ pub async fn run(
 /// the pre-feature hot path). At `pipeline == N` each iteration draws N ops, sends the
 /// N commands in ONE write, and reads N replies (RESP pipelining), counting `ops += N`;
 /// the deadline is checked between batches (a partial final batch is fine).
+#[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     host: &str,
     port: u16,
+    base: u64,
     deadline: ironcache_env::Monotonic,
     stream_seed: u64,
     workload: &Workload,
@@ -135,6 +164,8 @@ async fn connection_loop(
     let mut rng = SplitMix64::new(stream_seed);
     let value = workload.value_bytes();
     let mut ops: u64 = 0;
+    // `base` offsets this connection's per-partition key index into its DISJOINT global range
+    // (zero for a single-endpoint run, so `base + idx == idx` and the key bytes are unchanged).
 
     if pipeline <= 1 {
         // Depth 1: the original hot path, unchanged.
@@ -144,11 +175,11 @@ async fn connection_loop(
             }
             match workload.next_op(&mut rng) {
                 Op::Get(idx) => {
-                    let key = workload.key_bytes(idx);
+                    let key = workload.key_bytes(base + idx);
                     conn.get(&key).await?;
                 }
                 Op::Set(idx) => {
-                    let key = workload.key_bytes(idx);
+                    let key = workload.key_bytes(base + idx);
                     conn.set(&key, &value).await?;
                 }
             }
@@ -172,11 +203,11 @@ async fn connection_loop(
         for _ in 0..pipeline {
             match workload.next_op(&mut rng) {
                 Op::Get(idx) => {
-                    keys.push(workload.key_bytes(idx));
+                    keys.push(workload.key_bytes(base + idx));
                     is_set.push(false);
                 }
                 Op::Set(idx) => {
-                    keys.push(workload.key_bytes(idx));
+                    keys.push(workload.key_bytes(base + idx));
                     is_set.push(true);
                 }
             }
@@ -218,8 +249,7 @@ mod tests {
         let stub = testutil::spawn(None).await;
         let wl = Workload::new(1000, 0.99, 0.9, 128);
         let res = run(
-            "127.0.0.1",
-            stub.port,
+            &[("127.0.0.1".to_string(), stub.port)],
             4,
             Duration::from_millis(200),
             0x00AB_CDEF,
@@ -250,8 +280,7 @@ mod tests {
         let stub = testutil::spawn(None).await;
         let wl = Workload::new(1000, 0.99, 0.9, 128);
         let res = run(
-            "127.0.0.1",
-            stub.port,
+            &[("127.0.0.1".to_string(), stub.port)],
             4,
             Duration::from_millis(200),
             0x00AB_CDEF,
@@ -269,5 +298,43 @@ mod tests {
             stub.replies.load(std::sync::atomic::Ordering::Relaxed) >= res.total_ops,
             "stub replied to every counted op even under pipelining"
         );
+    }
+
+    #[tokio::test]
+    async fn cluster_aware_mode_spreads_connections_across_endpoints() {
+        // Zero-hop mode: with TWO endpoints and an even connection count, both endpoints must
+        // receive load (connections are bound round-robin), and the reported keyspace is the
+        // aggregate across the two partitions (per-partition * 2).
+        use std::sync::atomic::Ordering;
+        let stub_a = testutil::spawn(None).await;
+        let stub_b = testutil::spawn(None).await;
+        let per_partition = 500;
+        let wl = Workload::new(per_partition, 0.99, 0.9, 128);
+        let res = run(
+            &[
+                ("127.0.0.1".to_string(), stub_a.port),
+                ("127.0.0.1".to_string(), stub_b.port),
+            ],
+            4, // 4 connections -> 2 per endpoint
+            Duration::from_millis(200),
+            0x00AB_CDEF,
+            wl,
+            1,
+        )
+        .await
+        .expect("cluster-aware closed-loop run");
+
+        assert!(res.total_ops > 0, "should complete some ops");
+        // Both endpoints served load (each got 2 of the 4 connections, so > 0 replies).
+        assert!(
+            stub_a.replies.load(Ordering::Relaxed) > 0,
+            "endpoint A received no ops"
+        );
+        assert!(
+            stub_b.replies.load(Ordering::Relaxed) > 0,
+            "endpoint B received no ops"
+        );
+        // The reported keyspace is the aggregate: per-partition * n_endpoints.
+        assert_eq!(res.params.keyspace, per_partition * 2);
     }
 }
