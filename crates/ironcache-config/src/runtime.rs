@@ -67,6 +67,14 @@ pub struct RuntimeConfig {
     /// value. Behind ONE `Mutex` that lives in this non-hot-path crate and is taken
     /// only on `CONFIG SET`/generation-change (the per-command hot path never locks).
     strings: Mutex<RuntimeStrings>,
+    /// #648: whether auth is required (`requirepass` is set), cached as a relaxed
+    /// `AtomicBool`. Every command consults `requires_auth()` in `route_and_dispatch`;
+    /// without this cache that read took the `strings` `Mutex` AND cloned the digest
+    /// `String` per command (a top-of-profile hot-path lock). The flag is kept in sync
+    /// under the lock wherever `requirepass` changes; the actual password COMPARE (the
+    /// rare AUTH command) still reads the digest under the lock. Seeded from the boot
+    /// config, exactly like `maxmemory`.
+    requires_auth: AtomicBool,
     /// The runtime SAVE POLICY (#58 / durability footgun fix): the periodic-save interval in
     /// SECONDS and the minimum dirty writes a tick requires, BOTH runtime-settable via
     /// `CONFIG SET save "<seconds> <changes> [...]"` (Redis `save` points). `interval_secs == 0`
@@ -223,6 +231,9 @@ impl RuntimeConfig {
                 maxmemory_policy: cfg.maxmemory_policy.clone(),
                 requirepass: cfg.requirepass.clone(),
             }),
+            // #648: seed the auth-required flag from the boot config so a node started with
+            // `requirepass` set enforces auth from the first command, with no per-command lock.
+            requires_auth: AtomicBool::new(cfg.requirepass.is_some()),
             // Seed the runtime save policy from the boot config so a node started with a
             // configured cadence (`save_interval_secs`/`save_min_changes`) keeps it; a later
             // `CONFIG SET save` then overrides these LIVE (the periodic saver reads them each tick).
@@ -322,11 +333,17 @@ impl RuntimeConfig {
             .clone()
     }
 
-    /// Whether auth is currently required (a non-empty `requirepass`). Convenience over
-    /// [`Self::requirepass`]; still takes the lock, so it is off the hot path.
+    /// Whether auth is currently required (a non-empty `requirepass`). #648: a single
+    /// RELAXED atomic load -- the per-command hot path (`route_and_dispatch` checks this on
+    /// every command) no longer takes the `strings` `Mutex` or clones the digest. The flag is
+    /// kept in sync under the lock wherever `requirepass` changes; the actual password COMPARE
+    /// (the rare AUTH command) still reads [`Self::requirepass`] under the lock, so this
+    /// boolean only gates WHETHER a compare is needed. A `CONFIG SET requirepass` racing an
+    /// in-flight command takes effect for subsequent commands (Redis semantics), so the
+    /// relaxed ordering is sufficient.
     #[must_use]
     pub fn requires_auth(&self) -> bool {
-        self.requirepass().is_some()
+        self.requires_auth.load(Ordering::Relaxed)
     }
 
     /// `CONFIG SET maxmemory <bytes>`: store the new ceiling (a relaxed atomic store).
@@ -375,11 +392,16 @@ impl RuntimeConfig {
         } else {
             Some(crate::sha256_hex(value.as_bytes()))
         };
+        let present = hashed.is_some();
         let mut s = self
             .strings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.requirepass = hashed;
+        // #648: keep the hot-path auth flag in sync with the digest, stored while holding the
+        // lock so it is ordered with the string write. Relaxed: a racing in-flight command
+        // observing the old value is fine (the change takes effect for subsequent commands).
+        self.requires_auth.store(present, Ordering::Relaxed);
     }
 
     /// The CURRENT runtime save policy: `(interval_secs, min_changes)` (#58 durability footgun
@@ -873,5 +895,25 @@ mod tests {
         rc.set_requirepass("");
         assert_eq!(rc.requirepass(), None);
         assert!(!rc.requires_auth());
+    }
+
+    #[test]
+    fn requires_auth_flag_is_seeded_from_boot_config() {
+        // #648: the hot-path `requires_auth()` reads a cached atomic seeded at construction,
+        // so a node BOOTED with `requirepass` set must enforce auth from the first command
+        // WITHOUT any `CONFIG SET`. `Config::requirepass` holds the digest at rest.
+        let cfg = crate::Config {
+            requirepass: Some(crate::sha256_hex(b"boot-secret")),
+            ..Config::default()
+        };
+        let rc = RuntimeConfig::from_config(&cfg);
+        assert!(
+            rc.requires_auth(),
+            "auth-required must be seeded true from boot config"
+        );
+        assert!(rc.requirepass().is_some());
+        // And the default (no requirepass) seeds false.
+        let rc_default = RuntimeConfig::from_config(&Config::default());
+        assert!(!rc_default.requires_auth());
     }
 }
