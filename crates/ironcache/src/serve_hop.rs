@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Cross-shard hop overlap (#8): the [`DeferredHop`] parked-reply state and the
+//! [`drain_deferred_hops`] FIFO drain. Extracted verbatim from `serve.rs` as a cohesive group; both
+//! serve loops (tokio + io_uring) call [`drain_deferred_hops`] at every barrier and end of batch.
+//! The per-command hooks it fans out to (`record_command_stats`, `record_hotkeys`,
+//! `apply_client_tracking`, `consume_caching_flag`, `record_slow_command`) stay in `serve` and are
+//! reached here as `pub(crate)` (crate-internal, no wider exposure).
+
+use crate::coordinator;
+// The per-command hooks + the crate-local `ShardState` live in `serve` (widened to `pub(crate)` for
+// this sibling); the wire/context types come from their origin crates, exactly as `serve` imports
+// them.
+use crate::serve::{
+    ShardState, apply_client_tracking, consume_caching_flag, record_command_stats, record_hotkeys,
+    record_slow_command,
+};
+use ironcache_env::{Clock, SystemEnv};
+use ironcache_server::dispatch::ServerContext;
+use ironcache_server::{ConnState, ProtoVersion, Request};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// One DEFERRED cross-shard hop (#8 overlap): a remote single-key command whose `ShardWork` was
+/// enqueued but whose reply is not yet awaited, so the next command's hop can be issued while this
+/// owner is still working. The serve loop parks a RUN of these and drains them together (in order)
+/// at the next barrier / end of batch, encoding each reply into `out` and running its per-command
+/// hooks then -- because those hooks read the reply bytes (`record_command_stats`/`record_hotkeys`),
+/// they cannot run until the reply is materialized. Every field is the per-command state the hooks
+/// need, captured at defer time.
+///
+/// KNOWN BEST-EFFORT EDGE (client tracking): the drain-time hooks read the deferred command's own
+/// snapshotted `was_tracking`/`was_bcast`, but the CLIENT-TRACKING / CLIENT-CACHING hooks
+/// (`apply_client_tracking`, `consume_caching_flag`) also read LIVE `conn` tracking state. If a
+/// tracking-CONTROL command (`CLIENT CACHING`/`TRACKING`) is pipelined BETWEEN deferred remote hops
+/// in the same batch, a hop's tracking hook can observe that control command's mutation (it runs as
+/// a barrier before the drain). This only affects CLIENT-side tracking of REMOTE keys, which is
+/// ALREADY documented single-shard-only / best-effort (see `apply_client_tracking`); it never
+/// affects the data reply bytes or their wire order. Snapshotting the full tracking sub-state into
+/// this struct is a clean follow-up; deferred here to keep the overlap focused on the FIFO property.
+pub(crate) struct DeferredHop {
+    /// The reply receiver (`None` = the owner was gone at send; `finish_hop` encodes shard-unavailable).
+    pub(crate) rx: Option<coordinator::HopReceiver>,
+    /// The request, for the hooks (cheap clone: `Request` is `Vec<Bytes>`, refcounted).
+    pub(crate) request: Request,
+    /// The monotonic start stamp for this command's elapsed-time (slowlog + commandstats).
+    pub(crate) cmd_start: ironcache_env::Monotonic,
+    /// Tracking-state snapshot taken BEFORE dispatch (so the tracking hook sees an ON->OFF flip).
+    pub(crate) was_tracking: bool,
+    pub(crate) was_bcast: bool,
+    /// The slowlog threshold snapshot (negative = disabled) for this command.
+    pub(crate) slow_threshold: i64,
+    /// The connection's negotiated proto, to encode the reply on the home core.
+    pub(crate) proto: ProtoVersion,
+}
+
+/// Drain a run of [`DeferredHop`]s (in FIFO order) into `out`: for each, await + encode its reply,
+/// then run its per-command hooks (commandstats, hotkeys, client-tracking, caching, slowlog) exactly
+/// as the inline path does -- so a deferred remote command is observably identical to a
+/// non-deferred one, only its reply is assembled later (still in order). Called at every barrier and
+/// at end of batch, so `out` stays strictly append-in-command-order (FIFO on the wire).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drain_deferred_hops(
+    pending: &mut Vec<DeferredHop>,
+    out: &mut Vec<u8>,
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    env: &Rc<RefCell<SystemEnv>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+) {
+    for d in pending.drain(..) {
+        let out_before = out.len();
+        coordinator::finish_hop(d.rx, out, d.proto).await;
+        let cmd_elapsed_us = u64::try_from(
+            env.borrow()
+                .now()
+                .saturating_duration_since(d.cmd_start)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        record_command_stats(state_rc, &d.request, out_before, out, cmd_elapsed_us);
+        if ctx.hotkeys.is_active() {
+            let reply_bytes =
+                u64::try_from(out.len().saturating_sub(out_before)).unwrap_or(u64::MAX);
+            record_hotkeys(ctx, env, &d.request, cmd_elapsed_us, reply_bytes);
+        }
+        apply_client_tracking(
+            conn,
+            push_tx,
+            shed_flag,
+            &d.request,
+            d.was_tracking,
+            d.was_bcast,
+        );
+        consume_caching_flag(conn, &d.request);
+        if d.slow_threshold >= 0 {
+            record_slow_command(ctx, env, conn, &d.request, d.cmd_start, d.slow_threshold);
+        }
+    }
+}
