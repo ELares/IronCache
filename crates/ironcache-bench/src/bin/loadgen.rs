@@ -98,6 +98,16 @@ struct Args {
     #[arg(long, default_value_t = 6379)]
     port: u16,
 
+    /// CLUSTER-AWARE / ZERO-HOP mode (`--mode closed` only): a comma-separated list of
+    /// `host:port` endpoints to spread the load across. Connections are bound round-robin
+    /// to the endpoints and each draws its keys from a DISJOINT partition of the keyspace,
+    /// so every request lands on the endpoint that owns it (no cross-shard hop). Against N
+    /// separately-addressable single-shard servers this measures the zero-hop ceiling a
+    /// perfectly-routed client reaches. `--keyspace` is the AGGREGATE; each of the N
+    /// endpoints owns `keyspace / N` distinct keys. Overrides `--host`/`--port` when set.
+    #[arg(long)]
+    endpoints: Option<String>,
+
     /// Workload RNG seed (a fixed seed makes the workload byte-reproducible).
     #[arg(long, default_value_t = DEFAULT_SEED)]
     seed: u64,
@@ -152,6 +162,41 @@ struct Args {
     hist: Option<String>,
 }
 
+/// Resolve the closed-loop target endpoints: parse the cluster-aware `--endpoints` list
+/// (`host:port,host:port,...`) when given, else the single `--host`/`--port`. Each entry is
+/// split on its LAST `:` so an IPv6 literal host is tolerated. Empty / malformed entries are
+/// a hard error (a benchmark must fail loudly, not silently drop a target).
+fn parse_endpoints(
+    spec: Option<&str>,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<Vec<(String, u16)>> {
+    let Some(spec) = spec else {
+        return Ok(vec![(host.to_string(), port)]);
+    };
+    let mut out = Vec::new();
+    for raw in spec.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (h, p) = entry
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("endpoint '{entry}' is not host:port"))?;
+        let parsed_port: u16 = p
+            .parse()
+            .map_err(|_| anyhow::anyhow!("endpoint '{entry}' has an invalid port"))?;
+        if h.is_empty() {
+            anyhow::bail!("endpoint '{entry}' has an empty host");
+        }
+        out.push((h.to_string(), parsed_port));
+    }
+    if out.is_empty() {
+        anyhow::bail!("--endpoints was set but contained no valid host:port entries");
+    }
+    Ok(out)
+}
+
 /// Synchronous entry point: build a multi-thread tokio runtime sized to the connection
 /// count (so an open-loop connection that busy-spins for dispatch precision never
 /// starves the others) and drive the async run on it. We build the runtime manually
@@ -177,13 +222,19 @@ fn main() -> anyhow::Result<()> {
 /// the generator, not the server.
 async fn run(args: Args) -> anyhow::Result<()> {
     let duration = Duration::from_secs_f64(args.duration_secs.max(0.0));
-    let workload = Workload::new(args.keyspace, args.theta, args.read_ratio, args.value_size);
 
     let json = match args.mode {
         Mode::Closed => {
+            // Resolve the target endpoint(s): the cluster-aware `--endpoints` list, or the
+            // single `--host`/`--port`. In multi-endpoint mode the aggregate `--keyspace` is
+            // split into one disjoint partition per endpoint (`keyspace / N`), so the total
+            // distinct keyspace matches a single-endpoint run at the same `--keyspace`.
+            let endpoints = parse_endpoints(args.endpoints.as_deref(), &args.host, args.port)?;
+            let per_partition = (args.keyspace / endpoints.len() as u64).max(1);
+            let workload =
+                Workload::new(per_partition, args.theta, args.read_ratio, args.value_size);
             let res = closed_loop::run(
-                &args.host,
-                args.port,
+                &endpoints,
                 args.connections,
                 duration,
                 args.seed,
@@ -194,6 +245,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
             res.to_json()
         }
         Mode::Open => {
+            // The open-loop (latency) pass is single-target: `--endpoints` is a closed-loop
+            // throughput-measurement knob only. Reject it here rather than silently ignore it.
+            if args.endpoints.is_some() {
+                anyhow::bail!("--endpoints is only valid with --mode closed (the peak-QPS pass)");
+            }
+            let workload =
+                Workload::new(args.keyspace, args.theta, args.read_ratio, args.value_size);
             let (res, hist) = open_loop::run(
                 &args.host,
                 args.port,
