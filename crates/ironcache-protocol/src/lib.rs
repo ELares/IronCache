@@ -23,7 +23,7 @@ pub mod error;
 pub mod slot;
 pub mod value;
 
-pub use decode::{DecodeOutcome, Limits, Request, decode};
+pub use decode::{DecodeOutcome, Limits, Request, decode, decode_shared};
 pub use encode::{encode, encode_bulk_ref, encode_to_vec, format_human_double};
 pub use error::{ErrorCode, ErrorReply};
 pub use slot::{CLUSTER_SLOTS, crc16, hash_tag, key_slot};
