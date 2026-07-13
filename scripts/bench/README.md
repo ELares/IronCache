@@ -95,6 +95,7 @@ number is measured at.
 | `VALUE_SIZE` | `128` | SET value bytes. |
 | `DURATION_SECS` | `10` | Measured-pass duration. |
 | `CONNECTIONS` | `50` | Load fan-out (closed) / dispatch pool (open). |
+| `PIPELINE` | `1` | Closed-loop RESP pipeline depth (commands sent per write). `1` = one op per round-trip. Closed-loop pass ONLY. |
 | `RATE` | `50000` | Open-loop target ops/sec. |
 | `WARMUP_SECS` | `3` | Write-only warmup duration. |
 | `PORT` | `6399` | RESP port (loopback only). |
@@ -105,9 +106,15 @@ number is measured at.
 
 ### A note on concurrency vs pipeline depth
 
-Within-connection pipeline depth > 1 is a DEFERRED loadgen feature, so BENCHMARK.md's
-pipeline-depth sweep is only partially covered. Until it lands, "concurrency" is
-expressed purely via `--connections` (the manifest records `pipeline_depth: 1`).
+Concurrency is expressed two ways: fan-out across `--connections`, and, within each
+connection, RESP pipeline depth via `PIPELINE` (the loadgen's `--pipeline`). At the
+default `PIPELINE=1` a connection sends one op per round-trip; at `PIPELINE=N` it sends
+N commands in ONE write and reads N replies, amortizing the per-op syscall/round-trip.
+A non-pipelined loadgen is syscall-bound at one op per round-trip, so pipelining is the
+prerequisite for BENCHMARK.md's pipeline-depth sweep and for measuring where
+batching/io_uring lifts throughput. Pipelining applies to the CLOSED-loop peak-QPS pass
+only; the open-loop latency pass stays at depth 1 to keep its coordinated-omission-free
+timing. The manifest records the `pipeline_depth` actually used.
 
 ### A note on `--maxmemory`
 
