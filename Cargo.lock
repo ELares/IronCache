@@ -462,7 +462,9 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "hashbrown 0.16.1",
  "hdrhistogram",
+ "ironcache-dashtable",
  "ironcache-env",
  "ironcache-eviction",
  "ironcache-expiry",
@@ -524,6 +526,10 @@ dependencies = [
 [[package]]
 name = "ironcache-dashtable"
 version = "0.0.0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "ironcache-env",
+]
 
 [[package]]
 name = "ironcache-env"

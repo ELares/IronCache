@@ -14,3 +14,11 @@ publish = false
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# The ORACLE for the DashIndex parity suite (tests/dashindex_oracle.rs): the exact table
+# type + explicit-hash API the store uses today. A dev-dependency only -- the shipped
+# crate stays dependency-free.
+hashbrown = { workspace = true }
+# Seeded SplitMix64 for the deterministic oracle op stream (ADR-0003: no rand, no time).
+ironcache-env = { workspace = true }

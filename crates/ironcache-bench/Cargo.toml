@@ -70,6 +70,9 @@ tikv-jemalloc-ctl = { workspace = true }
 # (plotters) and rayon to keep the dependency tree and cargo-deny clean; only the
 # cargo_bench_support feature (the `cargo bench` harness shim) is enabled.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# The two index backends the dashindex bench compares (#285 Stage 3 gate).
+ironcache-dashtable = { workspace = true }
+hashbrown = { workspace = true }
 
 # The macro load generator (PR-A2): a RESP client driver with closed-loop peak-QPS
 # and open-loop coordinated-omission-free latency-tail passes.
@@ -84,4 +87,10 @@ harness = false
 
 [[bench]]
 name = "store"
+harness = false
+
+# The DashIndex-vs-hashbrown index head-to-head (#285 Stage 3): quantifies the probe /
+# fill / iter gap the DASHTABLE.md gate requires measuring before any store wiring.
+[[bench]]
+name = "dashindex"
 harness = false

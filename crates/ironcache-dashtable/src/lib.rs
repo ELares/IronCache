@@ -43,6 +43,8 @@
 //! Directory mechanics use the TOP `global_depth` bits of the key hash as the directory index and a
 //! disjoint hash byte as the fingerprint, exactly as DASHTABLE.md specifies.
 
+pub mod index;
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -51,11 +53,21 @@ use std::hash::{Hash, Hasher};
 /// store-wired layout (later stage) tunes the real geometry (DASHTABLE.md: Dragonfly uses 840).
 const SEGMENT_CAP: usize = 16;
 
-/// The split-retry bound: after this many splits without making room, force the record in anyway. A
-/// segment only fails to split usefully when every record shares the SAME 64-bit hash (distinct keys
-/// colliding fully), which a 64-bit hash makes astronomically rare; the bound just guarantees
-/// termination instead of looping forever in that pathological case.
+/// The split-retry bound: a backstop on loop iterations per insert. The REAL pathological-collision
+/// guards are [`MAX_GLOBAL_DEPTH`] and the futility fast-path in [`Dashtable::insert`]: a bound on
+/// SPLIT COUNT alone does NOT bound memory, because each futile split of a segment already at the
+/// global depth DOUBLES the directory (records sharing the top-k hash bits drive 2^k directory
+/// entries long before 64 splits elapse).
 const MAX_SPLITS: u32 = 64;
+
+/// The hard cap on the directory depth, shared by [`Dashtable`] and [`index::DashIndex`]: splitting
+/// a segment already at this global depth is refused and the record FORCE-PLACED past the segment
+/// cap instead (the segment grows linearly -- correct, just slower to probe). At depth 20 the
+/// directory is at most 2^20 entries and holds tens of millions of records at segment-cap load,
+/// unreachable with a well-mixed 64-bit hash at this table's scale, so the cap never trips on
+/// legitimate load; it exists so hash-crafted (or astronomically unlucky) shared top-bit prefixes
+/// cannot drive unbounded directory doubling.
+pub(crate) const MAX_GLOBAL_DEPTH: u8 = 20;
 
 /// One stored record: the key, the value, and the 1-byte fingerprint of the key hash (the fast
 /// reject that lets a lookup skip non-matching slots without comparing keys).
@@ -98,14 +110,16 @@ fn hash_key<K: Hash>(key: &K) -> u64 {
 }
 
 /// The 1-byte fingerprint of a hash: the low byte, disjoint from the TOP bits the directory indexes,
-/// so it carries independent entropy.
+/// so it carries independent entropy. Shared with [`index::DashIndex`] (`pub(crate)`) so both tables
+/// route + fingerprint identically from the same 64-bit hash.
 #[allow(clippy::cast_possible_truncation)] // masked to one byte, so the cast is exact.
-fn fingerprint(h: u64) -> u8 {
+pub(crate) fn fingerprint(h: u64) -> u8 {
     (h & 0xFF) as u8
 }
 
-/// Whether the `n`-th bit from the TOP of `h` (1-indexed) is set. `n` is in `1..=64`.
-fn bit_from_top(h: u64, n: u8) -> bool {
+/// Whether the `n`-th bit from the TOP of `h` (1-indexed) is set. `n` is in `1..=64`. Shared with
+/// [`index::DashIndex`] (`pub(crate)`), same rationale as [`fingerprint`].
+pub(crate) fn bit_from_top(h: u64, n: u8) -> bool {
     (h >> (64 - u32::from(n))) & 1 == 1
 }
 
@@ -223,12 +237,27 @@ where
         {
             return Some(std::mem::replace(&mut slot.value, value));
         }
-        // A new key: make room (splitting as needed), then place it ONCE.
+        // A new key: make room (splitting as needed), then place it ONCE. Guards mirror
+        // [`index::DashIndex::entry`] (see there): FUTILITY force-places when the full
+        // segment's records all hash identically to the incoming key (no depth separates
+        // them; splitting would only double the directory forever), the depth cap bounds
+        // the directory against long-shared top-bit prefixes, and MAX_SPLITS backstops the
+        // iteration count. A force-placed segment grows past SEGMENT_CAP linearly, which
+        // stays correct (probes scan it), just slower.
         let mut splits = 0;
         loop {
             let si = self.directory[self.dir_index(h)];
-            if self.segments[si].slots.len() < SEGMENT_CAP || splits >= MAX_SPLITS {
+            let seg = &self.segments[si];
+            if seg.slots.len() < SEGMENT_CAP || splits >= MAX_SPLITS {
                 break;
+            }
+            if seg.slots.iter().all(|s| s.fingerprint == fp)
+                && seg.slots.iter().all(|s| hash_key(&s.key) == h)
+            {
+                break; // fully collided with the incoming key
+            }
+            if seg.local_depth == self.global_depth && self.global_depth >= MAX_GLOBAL_DEPTH {
+                break; // splitting would double the directory past the hard cap
             }
             self.split(self.dir_index(h));
             splits += 1;
