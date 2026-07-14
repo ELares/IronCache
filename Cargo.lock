@@ -673,6 +673,7 @@ dependencies = [
  "bytes",
  "hashbrown 0.16.1",
  "ironcache-config",
+ "ironcache-dashtable",
  "ironcache-eviction",
  "ironcache-storage",
  "tikv-jemalloc-ctl",

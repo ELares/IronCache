@@ -179,6 +179,39 @@ jobs:
       - name: test --features io_uring
         run: cargo nextest run --profile ci -p ironcache-runtime --features io_uring
 
+  dashtable:
+    name: index backends (default hashbrown arm + dashtable feature)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    timeout-minutes: 30
+    # #285 Stage 3 made the store's index a SWAP-STYLE feature (`dashtable`, default OFF):
+    # `--all-features` now compiles the DASH arm, so the `clippy` and `test` jobs above
+    # exercise the Dash index workspace-wide, and the DEFAULT (hashbrown, shipping) arm
+    # would silently lose its workspace gate. This job pins BOTH arms explicitly:
+    # a default-features workspace clippy + nextest run (the hashbrown arm -- the arm the
+    # differential / driver-matrix / perf-gate jobs also run end-to-end), plus a focused
+    # dashtable-feature store+crate leg so a store-only change cannot dodge the dash arm by
+    # touching nothing the all-features workspace run rebuilds. The stage-4 default flip is
+    # further gated on the DASHTABLE.md head-to-heads (memory win, no speed regression).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # The DEFAULT arm's lint bar (the all-features clippy job now lints the dash arm).
+      - name: clippy (default features, hashbrown arm)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The DEFAULT arm's workspace suite (the all-features test job now tests the dash arm).
+      - name: nextest run (workspace, default features)
+        run: cargo nextest run --profile ci --workspace
+      # The dash arm, focused: the store suite (including the index_growth split analogs)
+      # plus the dashtable crate's oracle-parity suite with the feature explicitly on.
+      - name: nextest store + dashtable crate (dashtable feature)
+        run: cargo nextest run --profile ci -p ironcache-store -p ironcache-dashtable --features ironcache-store/dashtable
+
   fuzz:
     name: fuzz (parser, bounded)
     needs: guard

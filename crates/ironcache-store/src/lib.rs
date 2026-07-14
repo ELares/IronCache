@@ -64,7 +64,26 @@ pub use kvobj::KvObj;
 
 use bytes::Bytes;
 use hashbrown::hash_map::Entry as WatchMapEntry;
-use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
+use hashbrown::{DefaultHashBuilder, HashMap, HashSet};
+
+// THE INDEX BACKEND SEAM (#285 Stage 3). The per-slot INDEX table is the ONLY hashbrown
+// role these cfg'd imports swap: the `HashData::HashTable` VALUE encoding (with its
+// user-visible OBJECT ENCODING name) and the WATCH map above stay hashbrown under either
+// backend, which is why the hashbrown dependency itself is unconditional. Every index call
+// site below is written against the shared API surface (find / find_mut / entry /
+// find_entry / iter / len / is_empty / reserve / Clone / Debug -- see
+// ironcache-dashtable's index module doc, whose parity the oracle suite proves), so the
+// backend choice is THESE IMPORTS plus nothing else.
+//
+// Default (no `dashtable` feature): hashbrown's SIMD-probed Swiss table, the shipping
+// backend. With `--features dashtable`: the Dash extendible-hashing index (segment-at-a-
+// time growth, no power-of-two doubling trough), the #285 memory bet under evaluation --
+// NOT production-ready until the DASHTABLE.md stage-4 head-to-heads prove the memory win
+// with no speed regression.
+#[cfg(not(feature = "dashtable"))]
+use hashbrown::{HashTable, hash_table::Entry as TableEntry};
+#[cfg(feature = "dashtable")]
+use ironcache_dashtable::index::{DashIndex as HashTable, Entry as TableEntry};
 use ironcache_eviction::{EvictionPolicy, Policy, VictimStrategy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EncodingThresholds, EvictionHook, ExpireWrite,
@@ -688,11 +707,17 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         };
         // Materialize this DB's slot tables (lazy per-DB) so the reservation lands on real
         // tables, then SPREAD it across the slots: a bulk fill distributes ~additional/S
-        // keys to each slot, so pre-sizing each slot to that share makes the fill resize-
-        // free. The memory model (BENCHMARK.md #8) relies on this to separate the per-entry
-        // data cost from the table slack. Because S and the reservation share the power-of-
-        // two rounding, the aggregate bucket count matches the pre-#570 single table (the
-        // per-slot slack sums back to one table's), so bytes-per-key does not regress.
+        // keys to each slot, so pre-sizing each slot to that share makes the fill
+        // ALLOCATION-FREE. The memory model (BENCHMARK.md #8) relies on this to separate
+        // the per-entry data cost from the table slack. Under the default hashbrown
+        // backend the guarantee is exact (no resize can occur below the reserved
+        // capacity); under the `dashtable` backend it pre-builds the directory + pre-
+        // allocates every segment's slot storage, so a WELL-MIXED fill allocates nothing,
+        // while a hash-skewed segment can still split locally (dash's bounded incremental
+        // growth; see DashIndex::reserve's contract note). Because S and the reservation
+        // share the power-of-two rounding, the aggregate bucket count matches the
+        // pre-#570 single table (the per-slot slack sums back to one table's), so
+        // bytes-per-key does not regress.
         if dbv.is_empty() {
             // `arc_with_non_send_sync` is EXPECTED and intentional here: `HashTable<Entry>` is
             // `!Send`/`!Sync` (its `Entry` is a raw tagged pointer), but the #576 design uses `Arc`
@@ -1017,7 +1042,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             |e| e.key() == key,
             |e| hasher.hash_one(e.key()),
         ) {
-            hashbrown::hash_table::Entry::Occupied(mut e) => {
+            TableEntry::Occupied(mut e) => {
                 let old = e.get().accounted_bytes();
                 // freq-in-object: a reused key KEEPS its S3-FIFO promote frequency
                 // (the policy semantic "a replaced key carries its frequency"). The
@@ -1031,7 +1056,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 *e.get_mut() = obj;
                 Some(old)
             }
-            hashbrown::hash_table::Entry::Vacant(e) => {
+            TableEntry::Vacant(e) => {
                 e.insert(obj);
                 None
             }
@@ -2975,10 +3000,15 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
 ///
 /// `Arc<HashTable<Entry>>` is `!Send` (an [`Entry`] is a raw `NonNull` tagged pointer with
 /// interior-mutable freq, so it is `!Send`/`!Sync`, which is CORRECT for the otherwise
-/// shard-local, single-core store, ADR-0002/0005). Sending a `FrozenSlot` to the persist
-/// thread is nonetheless sound because, for the WHOLE lifetime of the frozen clone, the
-/// slot's table and every entry pointee it holds are DE-FACTO IMMUTABLE from the datapath's
-/// side:
+/// shard-local, single-core store, ADR-0002/0005). NOTE `HashTable` here is the cfg'd
+/// INDEX-BACKEND alias (#285): the proof below depends only on two properties BOTH
+/// backends provide -- `Clone` is a DEEP clone (so `Arc::make_mut` re-homes every entry
+/// the live side mutates), and the table's read paths never mutate through `&self` --
+/// hashbrown by its documented semantics, `DashIndex` by construction (100% safe code, no
+/// interior mutability; its oracle suite pins the deep-clone divergence). Sending a
+/// `FrozenSlot` to the persist thread is nonetheless sound because, for the WHOLE lifetime
+/// of the frozen clone, the slot's table and every entry pointee it holds are DE-FACTO
+/// IMMUTABLE from the datapath's side:
 ///
 /// 1. Any datapath WRITE to this slot goes through `Arc::make_mut`
 ///    ([`ShardStore::slot_table_mut`]): while the frozen clone is outstanding the slot's
