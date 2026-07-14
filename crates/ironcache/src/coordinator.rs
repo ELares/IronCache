@@ -1341,12 +1341,14 @@ pub fn run_local_spublish(request: &Request) -> Value {
 }
 
 // #576 FROZEN-SLOT soundness: the shard hands its FROZEN slot tables to a dedicated persist OS thread,
-// so what it ships MUST be `Send`. An `Arc<HashTable<Entry>>` is `!Send` (`Entry` is a `!Send` tagged
-// `NonNull<u8>`), so the store wraps each frozen slot in `ironcache_store::FrozenSlot`, whose
-// `unsafe impl Send` is justified by the freeze invariant (a frozen slot's entries are de-facto
-// immutable for the save -- every datapath write COWs first and the shared freq bump is gated off; see
-// the `FrozenSlot` type doc). This static assertion pins that the shipped type IS `Send`, so a
-// regression that broke the wrapper would fail HERE at compile time rather than as an `unsafe` footgun.
+// so what it ships MUST be `Send`. The store's Arc-wrapped slot-table type is `!Send` under EITHER
+// index backend (#285: hashbrown or the dashtable feature's DashIndex -- both hold `Entry`, a `!Send`
+// tagged `NonNull<u8>`, and inherit its autotraits), so the store wraps each frozen slot in
+// `ironcache_store::FrozenSlot`, whose `unsafe impl Send` is justified by the backend-independent
+// freeze invariant (a frozen slot's entries are de-facto immutable for the save -- every datapath
+// write COWs via a DEEP `Arc::make_mut` clone first and the shared freq bump is gated off; see the
+// `FrozenSlot` type doc). This static assertion pins that the shipped type IS `Send`, so a regression
+// that broke the wrapper would fail HERE at compile time rather than as an `unsafe` footgun.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Vec<ironcache_store::FrozenSlot>>();

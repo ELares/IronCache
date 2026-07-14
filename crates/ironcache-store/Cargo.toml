@@ -13,6 +13,13 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# #285 Stage 3: swap the per-slot INDEX to the Dash extendible-hashing table. An
+# evaluation flag (default OFF): the differential + property suites run under BOTH
+# backends in CI, but the default flip is gated on the DASHTABLE.md stage-4
+# head-to-heads (uniform memory win, no speed regression).
+dashtable = ["dep:ironcache-dashtable"]
+
 [dependencies]
 # The frozen waist this crate implements.
 ironcache-storage = { workspace = true }
@@ -34,6 +41,10 @@ bytes = { workspace = true }
 # one core). Its default hasher is fine for PR-2a; the inline-tag/seeded-hash
 # tuning is a #8 follow-up.
 hashbrown = { workspace = true }
+# The Dash extendible-hashing index backend (#285 Stage 3), OPTIONAL: compiled and
+# wired as the per-slot index ONLY under the `dashtable` feature (see the cfg'd
+# import seam in lib.rs). Default builds ship hashbrown.
+ironcache-dashtable = { workspace = true, optional = true }
 
 # jemalloc mallctl introspection for the PROCESS-GLOBAL used_memory figure
 # (ADR-0006: epoch + stats.allocated/stats.resident). The `stats` API is SAFE (no

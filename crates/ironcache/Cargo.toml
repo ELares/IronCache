@@ -117,6 +117,9 @@ tracing-subscriber = { workspace = true }
 [features]
 default = []
 io_uring = ["ironcache-runtime/io_uring"]
+# #285 Stage 3: build the store with the Dash index backend (evaluation flag; see
+# ironcache-store's feature of the same name).
+dashtable = ["ironcache-store/dashtable"]
 
 # TRANSPARENT HUGE PAGES for the store tables + value blobs (#512, ADR-0006). A
 # default-OFF, Linux-only knob: when enabled it appends `thp:always,metadata_thp:auto`
