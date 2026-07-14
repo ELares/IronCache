@@ -142,8 +142,17 @@ fn dash_index_matches_hashbrown_over_deterministic_op_streams() {
     // Several seeds x a key space small enough to churn every path: vacant insert,
     // occupied overwrite, remove + re-insert, find/find_mut hits and misses, splits,
     // directory doublings. ~16k ops per seed keeps the suite fast (<1s).
-    for seed in [0x5DEE_CE66_D1CE_5EED_u64, 1, 42, 0xFFFF_FFFF_FFFF_FFFF] {
-        run_oracle(seed, 16 * 1024, 512);
+    // Miri runs ~two orders slower: one seed at 1k ops still crosses splits + a doubling.
+    let (seeds, ops): (&[u64], usize) = if cfg!(miri) {
+        (&[0x5DEE_CE66_D1CE_5EED_u64], 1024)
+    } else {
+        (
+            &[0x5DEE_CE66_D1CE_5EED_u64, 1, 42, 0xFFFF_FFFF_FFFF_FFFF],
+            16 * 1024,
+        )
+    };
+    for &seed in seeds {
+        run_oracle(seed, ops, 512);
     }
 }
 
@@ -151,7 +160,8 @@ fn dash_index_matches_hashbrown_over_deterministic_op_streams() {
 fn dash_index_matches_hashbrown_under_growth_heavy_load() {
     // A larger key space so the run is insert-dominated: the dash index ends with many
     // segments + a deep directory, and the multiset must still match exactly.
-    run_oracle(0xA5A5_A5A5_5A5A_5A5A, 32 * 1024, 1 << 20);
+    let ops = if cfg!(miri) { 2 * 1024 } else { 32 * 1024 };
+    run_oracle(0xA5A5_A5A5_5A5A_5A5A, ops, 1 << 20);
 }
 
 #[test]
@@ -162,7 +172,7 @@ fn clone_divergence_matches_oracle_clone_divergence() {
     let mut rng = SplitMix64::new(seed);
     let mut dash: DashIndex<Rec> = DashIndex::new();
     let mut oracle: HashTable<Rec> = HashTable::new();
-    for _ in 0..4096 {
+    for _ in 0..(if cfg!(miri) { 512 } else { 4096 }) {
         let key = rng.next_u64() % 256;
         let val = rng.next_u64();
         dash_upsert(&mut dash, key, val);
