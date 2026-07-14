@@ -397,3 +397,88 @@ figure; qps/p99 carry runner variance; memcached is memory-only (cross-protocol)
 authoritative bar is still bare metal vs the pinned versions. Surfaced in README.md
 "Benchmarks: how it compares". Harness: scripts/bench/headtohead.sh (competitors
 redis|valkey|dragonfly|keydb|memcached), .github/workflows/headtohead.yml.
+
+## THROUGHPUT INVESTIGATION (2026-07-13): the pipelined pinned-Linux verdict + the cross-shard hop ceiling
+
+The first NON-VIRTUALIZED, PIPELINED throughput sweep (the "authoritative throughput
+verdict" the Measurement-honesty note above defers): a 16-core Graviton3 (c7g.4xlarge),
+server pinned to 8 cores (8 shards, thread-per-core), client to the disjoint 8 over
+loopback, 128 connections, 90% GET / 128B / 1M keys, zipf 0.99, loadgen `--pipeline` depth
+sweep. Reproduced 2x. This settled how much of the deep-pipeline throughput story is the
+ENGINE vs the CLIENT'S ROUTING.
+
+### Headline: the deep-pipeline "cliff" is a NON-CLUSTER-AWARE-CLIENT artifact, not an engine ceiling
+
+Single-endpoint (one process, 8 shards, one SO_REUSEPORT port -> the client's random keys
+hop to the owning shard) vs zero-hop (8 single-shard servers on 8 ports; a cluster-aware
+loadgen routes each key to its owning endpoint), same 8 server / 8 client cores, 128 conns:
+
+| pipeline depth | single-endpoint (hops) | zero-hop (cluster-aware) | zero-hop vs single |
+| ---: | ---: | ---: | --- |
+| 1  | 256k  | 291k  | +14% |
+| 8  | 1.84M | 1.61M | -13% |
+| 16 | 1.44M | 2.98M | **+107%** |
+| 32 | 1.07M | **5.59M** | **+424% (5.2x)** |
+
+Single-endpoint PEAKS at depth 8 then CLIFFS (-42% by depth 32). Zero-hop has NO cliff: it
+scales MONOTONICALLY to 5.59M qps on 8 cores (~700k qps/core). So the engine is NOT the
+bottleneck at deep pipelining -- the cross-shard HOP machinery is (profile below), and a
+client that routes each key to its owning shard/endpoint (as real Redis-Cluster libraries
+do) sidesteps ALL of it. This reconciles with + extends the earlier "+97% cluster-aware
+zero-hop" (#517): at deep pipelining the routing win is +424%. Tool: the `--endpoints`
+cluster-aware loadgen mode (PR #650); orchestration in scripts/bench (8x single-shard
+servers each with `--metrics-addr off`).
+
+### The hop path is near its floor (profile, depth 32, tokio)
+
+`perf` of the single-endpoint server at depth 32 showed the cost is the cross-shard hop
+coordinator: run_drain_loop 34% + drain_deferred_hops 17% + run_remote 15% cumulative;
+self-time dominated by a wall of atomics (~25%) + the per-hop channel machinery (tokio
+oneshot send/poll 4.1% + mpsc send 1.6% + batch_semaphore 1.3% + eventfd wakes 2.1%). This
+per-hop cost is INTRINSIC to cross-thread coordination, and #514 already captured the main
+structural win (hops issue EAGERLY -> the owner works in OVERLAP with the home decoding the
+next command; only the await is deferred). The obvious lever -- coalesce hops by target
+shard into one batched message -- requires DEFERRING the send to drain time, which
+SACRIFICES that overlap; with random keys -> random targets, consecutive same-target hops
+are rare, so it trades guaranteed overlap for uncertain message-count savings (plausibly
+net-NEGATIVE). ANALYZED, NOT PURSUED: the single-endpoint deep-pipeline ceiling is largely
+intrinsic to hopping; the 5.2x is unlocked by CLIENT-SIDE cluster-aware routing, not a
+server change.
+
+### Shipped this pass (single-endpoint hot-path wins, both KEPT)
+
+- **#510 zero-copy RESP parse** (PR #647): args are refcounted SLICES of the read buffer
+  (`decode_shared`) instead of `Bytes::copy_from_slice` per arg. c7g A/B (single-endpoint
+  tokio): +6.8% @ depth 16, +5.6% @ depth 32, neutral @ depth 1. Removes one alloc+memcpy
+  per argument on the pipelined path; differential vs redis 7.0.15 clean (231 cmds).
+- **#648 requires_auth atomic** (PR #649): `requires_auth()` took a Mutex + cloned an
+  `Option<String>` per command (profiled ~2.5% self); now a relaxed `AtomicBool` seeded from
+  boot + kept in sync under the lock, like `maxmemory`. Helps ALL commands / all runtimes.
+- **#515 zero-copy GET reply: REJECTED on data.** The profile put total memcpy at ~1.4% at
+  128B; the store->out reply copy this targets is negligible at typical value sizes, and the
+  fix is a large io_uring-only reply-path reengineering (batch iovec/writev + store pinning).
+  Deprioritized (payoff only at large values).
+
+### Process notes
+
+- The loadgen was NON-pipelined before #646; a throughput verdict is meaningless without a
+  pipelined loadgen (the earlier "io_uring ~6% slower" was non-pipelined-only; io_uring is
+  +189% at depth 32 pipelined -- see #284). Always pipeline before drawing a throughput
+  conclusion.
+- Collect bare-metal bench results PROMPTLY: a bench host auto-terminates on its backstop; a
+  long gap between run and collect loses the results.
+
+### Scoped next-session bets (perf quick-wins are now exhausted; these are multi-session)
+
+- **#285 Dash table, Stage 3-4** (the biggest structural bet). Stages 1-2 DONE (the
+  `ironcache-dashtable` extendible-hashing + segment-local-eviction reference crate) and the
+  bounded-selection eviction refill DONE (`refill_evict_pool` bounded max-heap). Remaining:
+  give the crate a key-in-object (`HashTable<Entry>`-style) API, the unsafe dense cache-line
+  layout, wire it as the store index behind a `dashtable` feature flag, then the pinned-Linux
+  + Dragonfly head-to-heads. Headline risk: throughput vs hashbrown's SIMD probe (must not
+  regress speed to gain memory). Per DASHTABLE.md this is explicitly multi-session /
+  Linux-iterated.
+- **#513 io_uring multishot recv + provided-buffer rings** (raw io_uring, unsafe). The
+  OneShotFixed registered-buffer recv is ALREADY wired (`recv_batch`, in the +189% number);
+  what remains is the multishot/BUF_RING tier (no per-read syscall), an uncertain 8-15% over
+  OneShotFixed, io_uring-only. Colima-correctness + c7g-throughput iterated.
