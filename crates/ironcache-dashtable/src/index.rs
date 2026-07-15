@@ -106,15 +106,24 @@ enum Loc {
 /// packed fingerprints, the inline record slots, and the pathological overflow spill. See
 /// the module doc ("The DENSE segment layout") for the layout rationale and the `unsafe`
 /// invariant (`items[0..len]` initialized; `len..` logically uninitialized).
+/// LAYOUT (`repr(C, align(64))`, the PR-5a probe-locality fix): `fps` is the FIRST field
+/// and the segment is cache-line aligned, so the fingerprint prescan -- the one memory
+/// touch every probe makes before the matched item -- reads EXACTLY ONE cache line. The
+/// prior layout put `fps` at offset 2 of a 592-byte (non-64-multiple) stride: the scan
+/// straddled two lines at a drifting alignment, and the differential profile localized the
+/// dash arm's entire deficit to exactly this read path (`expire_if_due` +1.9pp). The
+/// alignment pads the segment 592 -> 640 bytes (+48 per segment, ~+1 byte/key at organic
+/// load), a deliberate probe-latency-for-memory trade the organic sweep still clears.
+#[repr(C, align(64))]
 struct Segment<T> {
+    /// `fps[i]` is the fingerprint of `items[i]` for `i < len`; bytes at `len..` are
+    /// stale/meaningless (the branchless [`Self::match_mask`] scans them, then provably
+    /// masks their bits off). FIRST field, line-0-aligned: see the layout note above.
+    fps: [u8; SEGMENT_CAP],
     local_depth: u8,
     /// The number of initialized inline records: `items[0..len]` are initialized,
     /// `fps[0..len]` are their fingerprints. Always `<= SEGMENT_CAP`.
     len: u8,
-    /// `fps[i]` is the fingerprint of `items[i]` for `i < len`; bytes at `len..` are
-    /// stale/meaningless (the branchless [`Self::match_mask`] scans them, then provably
-    /// masks their bits off).
-    fps: [u8; SEGMENT_CAP],
     items: [MaybeUninit<T>; SEGMENT_CAP],
     /// The FORCE-PLACE spill (see [`DashIndex::entry`]'s guards): `None` in every
     /// non-pathological segment (one pointer-width), a boxed `(fingerprint, record)` list
