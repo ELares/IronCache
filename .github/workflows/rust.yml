@@ -180,19 +180,20 @@ jobs:
         run: cargo nextest run --profile ci -p ironcache-runtime --features io_uring
 
   dashtable:
-    name: index backends (default hashbrown arm + dashtable feature)
+    name: index backends (default dash arm + hashbrown-index fallback)
     needs: guard
     if: needs.guard.outputs.has_cargo == 'true'
     timeout-minutes: 30
-    # #285 Stage 3 made the store's index a SWAP-STYLE feature (`dashtable`, default OFF):
-    # `--all-features` now compiles the DASH arm, so the `clippy` and `test` jobs above
-    # exercise the Dash index workspace-wide, and the DEFAULT (hashbrown, shipping) arm
-    # would silently lose its workspace gate. This job pins BOTH arms explicitly:
-    # a default-features workspace clippy + nextest run (the hashbrown arm -- the arm the
-    # differential / driver-matrix / perf-gate jobs also run end-to-end), plus a focused
-    # dashtable-feature store+crate leg so a store-only change cannot dodge the dash arm by
-    # touching nothing the all-features workspace run rebuilds. The stage-4 default flip is
-    # further gated on the DASHTABLE.md head-to-heads (memory win, no speed regression).
+    # #285 stage-4 FLIPPED the default: the store's index is DASH by default, with
+    # hashbrown behind the swap-style `hashbrown-index` feature. `--all-features` therefore
+    # compiles the HASHBROWN arm, so the `clippy` and `test` jobs above exercise the
+    # fallback workspace-wide, and the DEFAULT (dash, shipping) arm would silently lose its
+    # workspace gate. This job pins BOTH arms explicitly: a default-features workspace
+    # clippy + nextest run (the dash arm -- the arm the differential / driver-matrix /
+    # perf-gate jobs also run end-to-end), plus a focused hashbrown-index store leg so a
+    # store-only change cannot dodge the fallback arm by touching nothing the all-features
+    # workspace run rebuilds. The flip record (five paired throughput rounds, the organic
+    # memory sweep, the hugepages A/B) lives on #285.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -201,16 +202,18 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      # The DEFAULT arm's lint bar (the all-features clippy job now lints the dash arm).
-      - name: clippy (default features, hashbrown arm)
+      # The DEFAULT (dash) arm's lint bar (the all-features clippy job lints the fallback).
+      - name: clippy (default features, dash arm)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # The DEFAULT arm's workspace suite (the all-features test job now tests the dash arm).
+      # The DEFAULT (dash) arm's workspace suite (the all-features test job covers the
+      # hashbrown fallback arm).
       - name: nextest run (workspace, default features)
         run: cargo nextest run --profile ci --workspace
-      # The dash arm, focused: the store suite (including the index_growth split analogs)
-      # plus the dashtable crate's oracle-parity suite with the feature explicitly on.
-      - name: nextest store + dashtable crate (dashtable feature)
-        run: cargo nextest run --profile ci -p ironcache-store -p ironcache-dashtable --features ironcache-store/dashtable
+      # The fallback arm, focused: the store suite (including the index_growth growth
+      # analogs) with the hashbrown index explicitly selected, plus the dashtable crate's
+      # own oracle-parity suite.
+      - name: nextest store (hashbrown-index fallback) + dashtable crate
+        run: cargo nextest run --profile ci -p ironcache-store -p ironcache-dashtable --features ironcache-store/hashbrown-index
 
   fuzz:
     name: fuzz (parser, bounded)

@@ -509,3 +509,22 @@ closer is IN-SEGMENT BUCKETING (route within a segment by spare hash bits to a 1
 bucket: scan width drops to hashbrown's own group size and the achievable load factor
 rises); re-run this round's A/B after that slice for the flip re-decision. Harnesses:
 benches/dashindex.rs, the organic sweep + memmodel + run.sh A/B (all reproducible).
+
+## #285 FLIP VERDICT (2026-07-15): the default index is now DASH
+
+After the deferred first verdict, four more measurement rounds settled it: a differential
+profile (the only differential symbol was the read-path probe), a paired zero-hop round,
+hardware counters (dash: +10% instructions from the wider fingerprint scan, ~+5% cycles,
+absorbed by higher IPC -- NOT TLB), and a hugepages A/B (THP cuts ~45% of dTLB misses and
+~5% of cycles on BOTH arms, qps-neutral; a separate default-on candidate). Throughput is
+PARITY across five independent paired rounds (-2.2/+0.6/-3.0/+0.2/-0.2%): the original
+"-2.2% regression" that deferred the flip was instance-to-instance variance.
+
+DECISION (owner-approved): flip. The uniform memory win (never worse than hashbrown;
+3.5-4.8% of TOTAL bytes at its doubling-trough keycounts) plus 2.2x faster full-table
+iteration outweigh a latent ~5% CPU-cycles premium that no realistic bottleneck profile
+surfaces as qps. hashbrown stays fully CI-gated behind the `hashbrown-index` fallback
+feature, so the flip is reversible and the arms stay comparable. Follow-on levers, both
+measured and parked with data: the bucketed-segments branch (probes -15-20% but organic
+memory +1-3 B/key until it gains in-segment displacement) and the mixed-local-depth
+reserve (removes the power-of-two round-up cliff).

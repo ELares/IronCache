@@ -9,7 +9,8 @@
 //! table type alias plus one for the [`Entry`] enum) and otherwise byte-identical call
 //! sites (`find`/`find_mut`/`entry`/`find_entry`/`iter`/`len`/`reserve`/`Clone`/`Debug`),
 //! per the Stage 3 plan (DASHTABLE.md "Implementation plan"). PR-2 (#653) wired exactly
-//! that seam; the full store suite runs on this index under `--features dashtable`.
+//! that seam, and the #285 stage-4 flip made this index THE DEFAULT (hashbrown remains
+//! behind the store's `hashbrown-index` fallback feature).
 //!
 //! ## Shape (extendible hashing, same mechanics as [`crate::Dashtable`])
 //!
@@ -54,7 +55,7 @@
 //! prefix; `Clone` clones it behind a panic guard (a mid-clone panic drops the cloned
 //! prefix rather than leaking). The gate for all of this is `miri` over the crate's test
 //! suite (the oracle parity tests hammer these paths with drop-observing payloads) plus
-//! the store's full suite under `--features dashtable`.
+//! the store's full suite, which runs on this index by default since the stage-4 flip.
 //!
 //! ## The zero-allocation empty table (a store constraint)
 //!
