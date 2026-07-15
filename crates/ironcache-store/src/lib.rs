@@ -66,8 +66,8 @@ use bytes::Bytes;
 use hashbrown::hash_map::Entry as WatchMapEntry;
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet};
 
-// THE INDEX BACKEND SEAM (#285 Stage 3). The per-slot INDEX table is the ONLY hashbrown
-// role these cfg'd imports swap: the `HashData::HashTable` VALUE encoding (with its
+// THE INDEX BACKEND SEAM (#285). The per-slot INDEX table is the ONLY hashbrown role
+// these cfg'd imports swap: the `HashData::HashTable` VALUE encoding (with its
 // user-visible OBJECT ENCODING name) and the WATCH map above stay hashbrown under either
 // backend, which is why the hashbrown dependency itself is unconditional. Every index call
 // site below is written against the shared API surface (find / find_mut / entry /
@@ -75,14 +75,19 @@ use hashbrown::{DefaultHashBuilder, HashMap, HashSet};
 // ironcache-dashtable's index module doc, whose parity the oracle suite proves), so the
 // backend choice is THESE IMPORTS plus nothing else.
 //
-// Default (no `dashtable` feature): hashbrown's SIMD-probed Swiss table, the shipping
-// backend. With `--features dashtable`: the Dash extendible-hashing index (segment-at-a-
-// time growth, no power-of-two doubling trough), the #285 memory bet under evaluation --
-// NOT production-ready until the DASHTABLE.md stage-4 head-to-heads prove the memory win
-// with no speed regression.
-#[cfg(not(feature = "dashtable"))]
+// DEFAULT (the #285 stage-4 flip): the Dash extendible-hashing index -- segment-at-a-time
+// growth with NO power-of-two doubling trough. The flip was decided on the full measured
+// record (see #285): a UNIFORM memory win (never worse than hashbrown; 3.5-4.8% of total
+// bytes better at hashbrown's trough keycounts), 2.2x faster full-table iteration (the
+// eviction-refill / snapshot / flush walks), and throughput PARITY across five
+// independent paired rounds -- with an accepted, documented ~5% CPU-cycles premium
+// (instruction count from the wider fingerprint scan; NOT TLB, per the hugepages A/B)
+// that no realistic bottleneck profile surfaced as qps. With `--features
+// hashbrown-index`: the SwissTable fallback arm, kept fully CI-gated so the flip is
+// reversible.
+#[cfg(feature = "hashbrown-index")]
 use hashbrown::{HashTable, hash_table::Entry as TableEntry};
-#[cfg(feature = "dashtable")]
+#[cfg(not(feature = "hashbrown-index"))]
 use ironcache_dashtable::index::{DashIndex as HashTable, Entry as TableEntry};
 use ironcache_eviction::{EvictionPolicy, Policy, VictimStrategy, map_policy_name};
 use ironcache_storage::{
@@ -709,12 +714,12 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // tables, then SPREAD it across the slots: a bulk fill distributes ~additional/S
         // keys to each slot, so pre-sizing each slot to that share makes the fill
         // ALLOCATION-FREE. The memory model (BENCHMARK.md #8) relies on this to separate
-        // the per-entry data cost from the table slack. Under the default hashbrown
-        // backend the guarantee is exact (no resize can occur below the reserved
-        // capacity); under the `dashtable` backend it pre-builds the directory + pre-
-        // allocates every segment's slot storage, so a WELL-MIXED fill allocates nothing,
-        // while a hash-skewed segment can still split locally (dash's bounded incremental
-        // growth; see DashIndex::reserve's contract note). Because S and the reservation
+        // the per-entry data cost from the table slack. Under the DEFAULT dash backend it
+        // pre-builds the directory + pre-allocates every segment's slot storage, so a
+        // WELL-MIXED fill allocates nothing, while a bucket-skewed segment can still
+        // split locally (dash's bounded incremental growth; see DashIndex::reserve's
+        // contract note); under the `hashbrown-index` fallback the guarantee is exact
+        // (no resize can occur below the reserved capacity). Because S and the reservation
         // share the power-of-two rounding, the aggregate bucket count matches the
         // pre-#570 single table (the per-slot slack sums back to one table's), so
         // bytes-per-key does not regress.

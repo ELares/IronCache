@@ -4,8 +4,8 @@
 //!
 //! WHY A SEPARATE FILE from keyspace.rs's resize tests: those are calibrated to hashbrown
 //! capacities at the DEFAULT slot count (256 tables per DB), where a few thousand keys
-//! spread to ~tens per table -- far below the dashtable backend's per-segment capacity, so
-//! under `--features dashtable` they force ZERO segment splits and dash growth would go
+//! spread to ~tens per table -- far below the dash backend's per-segment capacity, so
+//! under the (default) dash backend they force ZERO segment splits and dash growth would go
 //! silently untested. These tests pin `with_slots_per_db(1)` so EVERY key lands in ONE
 //! index table: a few thousand keys then force many dash segment splits + directory
 //! doublings (and, under the default backend, several hashbrown resizes -- the tests are

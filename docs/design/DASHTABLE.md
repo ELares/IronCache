@@ -182,13 +182,16 @@ extra per-entry metadata.
 
 ## Implementation plan (staged, gated)
 
-> STATUS (2026-07-15): stages 1-3 SHIPPED (PRs #652/#653/#654) -- the dense DashIndex is
-> wired behind the default-OFF `dashtable` feature with both arms CI-gated. The stage-4
-> measurement ran: the MEMORY win is confirmed (flat vs hashbrown's 7.7 B/key doubling
-> oscillation; 3.5-4.8% total at troughs, never worse) but pipelined throughput trails
-> 2.2-2.6%, so per this plan's own bar THE DEFAULT FLIP IS DEFERRED. Next slice:
-> in-segment bucketing (16-slot in-segment buckets cut the probe scan to hashbrown's
-> group width), then repeat the A/B. See OPTIMIZATION_LOG.md "#285 DASH INDEX round".
+> STATUS (2026-07-15, FINAL): ALL FOUR STAGES COMPLETE -- THE DEFAULT IS DASH. Stages 1-3
+> shipped as PRs #652/#653/#654; the stage-4 record (five paired throughput rounds, the
+> organic keycount memory sweep, a differential profile, hardware counters, and a
+> hugepages A/B) established throughput PARITY (the early "-2.2%" was instance variance),
+> the uniform memory win (never worse; 3.5-4.8% of total bytes at hashbrown's trough
+> keycounts), 2.2x faster full-table iteration, and an accepted ~5% CPU-cycles premium
+> (instruction count, not TLB). The owner approved the flip; hashbrown remains fully
+> CI-gated behind the `hashbrown-index` fallback feature. The parked bucketed-segments
+> branch (needs in-segment displacement) and the mixed-local-depth reserve are the
+> follow-on levers. Full data: #285 + OPTIMIZATION_LOG.md.
 
 
 The rewrite is too large and too perf-sensitive for one PR. Staged, each gated by
