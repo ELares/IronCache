@@ -47,7 +47,7 @@ is killed by recorded PID (never `pkill -f`, which would self-match) and the tem
 | Client | Library | Status on the dev box | Notes |
 |--------|---------|-----------------------|-------|
 | **redis-py** | `redis` (PyPI) | **RAN** | Python 3.11, `redis` 6.4.0 in a venv |
-| **go-redis** | `github.com/redis/go-redis/v9` | **RAN** | Go 1.25, go-redis v9.7.0 |
+| **go-redis** | `github.com/redis/go-redis/v9` | **RAN** | Go 1.23 (the CI-pinned `go-version` in `driver-matrix.yml`), go-redis v9.7.0 |
 | **ioredis** | `ioredis` (npm) | **RAN** | Node 22, ioredis 5.11.1 |
 | Lettuce / Jedis | JVM | **SKIPPED** | needs a JVM toolchain; not run (note only) |
 | StackExchange.Redis | .NET | **SKIPPED** | needs .NET; not run (note only) |

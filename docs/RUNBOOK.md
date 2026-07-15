@@ -151,8 +151,9 @@ Load-bearing fields per section:
   `redis_mode:standalone`, `process_id`, `run_id`, `tcp_port`, `uptime_in_seconds`,
   `io_threads_active` (= shard count).
 - `# Clients`: `connected_clients`, `maxclients`, `blocked_clients` (currently always
-  `0`), `cluster_connections:0`. Connection saturation = `connected_clients` near
-  `maxclients`.
+  `0` -- the counter is not yet wired even though BLPOP/BRPOP/BLMOVE/WAIT ship, so INFO
+  under-reports genuinely blocked clients; tracked by #661), `cluster_connections:0`.
+  Connection saturation = `connected_clients` near `maxclients`.
 - `# Memory`: `used_memory`, `used_memory_human`, `used_memory_rss`, `maxmemory`,
   `maxmemory_policy`, `mem_fragmentation_ratio` (RSS/used), `mem_allocator`.
 - `# Persistence`: `loading:0` (always 0 -- the readiness gate holds traffic until load
@@ -245,7 +246,8 @@ user a connection authenticated as.
 
 ### `ironcache check` (preflight, the nginx `-t` analogue)
 `ironcache check [--config ...]` resolves + validates the effective config WITHOUT
-binding a port and prints it: `bind`, `shards`, `runtime`, `databases`, `maxmemory`,
+binding a port and prints it: `bind`, `shards`, `runtime`, `databases`, `persist-cpu`
+(the #589 save-thread pin; `off (no pin)` by default), `maxmemory`,
 `policy`, `requirepass` (set/unset), `tls`, and the live `allocator` line. A malformed
 `maxmemory`, a bad `maxmemory-policy`, or an unresolvable overlay fails here with a clear
 error instead of at boot (`crates/ironcache/src/main.rs` `cmd_check`). Run it before every
@@ -368,7 +370,8 @@ indexed below with the file that emits them. Message text is verbatim.
   <log>.cfg, and any <log>.snap) or migrate the persisted state.` -> An in-place upgrade
   across the node-id scheme change refuses to boot rather than silently split-brain. Remove
   the named `ironcache-raft-<port>.log` plus its `.cfg`/`.snap` sidecars for a fresh
-  cluster, or migrate the state (`docs/design/SHUTDOWN.md`).
+  cluster, or migrate the state (`docs/design/SHUTDOWN.md`). Walkthrough:
+  [Raft node refuses to boot](#raft-node-refuses-to-boot-incompatible-node-id-scheme-fresh-cluster-only).
 - ERROR `raft control plane: failed to bind` (fields `listen_addr`, `error`) -- the cluster
   bus port could not bind (address in use / permissions).
 - ERROR `raft control plane: failed to create data directory` / `failed to open storage`
@@ -531,7 +534,25 @@ return `-CLUSTERDOWN <message>`.
 4. Reads/writes on the data path continue where allowed, but config changes wait for a
    leader; restore the down voters to regain quorum.
 
-### Full-disk SAVE failure
+### Raft node refuses to boot: incompatible node-id scheme (fresh-cluster-only)
+Symptom: after an in-place binary upgrade, a raft-mode node exits at boot with
+`persisted raft state at <log> uses an incompatible node-id scheme; this build derives
+node ids from cluster_announce_id. Start a FRESH cluster (remove <log>, <log>.cfg, and
+any <log>.snap) or migrate the persisted state.`
+1. This build derives raft `NodeId`s from `cluster_announce_id`; an EARLIER build derived
+   them from a node's id-sorted topology position. The two schemes are incompatible, and
+   booting persisted state written under the old scheme would cause permanent quorum loss
+   or a silent split brain -- so raft mode is FRESH-CLUSTER-ONLY across the scheme change
+   and the boot refuses instead (`scheme_mismatch_error` in
+   `crates/ironcache/src/raft_boot.rs`).
+2. The refusal names the exact files: remove `<data_dir>/ironcache-raft-<bus-port>.log`
+   plus its `.cfg` and `.snap` sidecars on EVERY node, then re-form the cluster fresh
+   (the turnkey formation re-proposes the declared topology). The keyspace snapshots
+   (`dump-shard-*.icss`) are separate files and are NOT part of the wipe -- but any
+   runtime slot moves / replica assignments made after the original formation live in
+   the wiped raft state and must be re-applied.
+3. A fresh node (no persisted raft state) never hits this; it only fires when non-empty
+   recovered state is fully disjoint from the topology-derived id set.
 Symptom: `SAVE`/`BGSAVE` errors, the exit save logs `save-on-exit failed`, or
 `rdb_last_save_time` stops advancing while `rdb_changes_since_last_save` climbs.
 1. `df -h <data_dir mount>` -- a full or read-only volume is the usual cause.

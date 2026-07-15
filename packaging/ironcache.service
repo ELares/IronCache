@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
 # Hardened systemd unit for the IronCache server (#122).
-# SCAFFOLD: templated and inert until the first release. See
-# docs/design/PACKAGING.md and packaging/README.md.
+# See docs/design/PACKAGING.md and packaging/README.md.
 #
 # Install to /etc/systemd/system/ironcache.service, then:
 #   systemctl daemon-reload && systemctl enable --now ironcache
@@ -15,7 +14,7 @@
 
 [Unit]
 Description=IronCache server
-Documentation=https://github.com/OWNER/REPO
+Documentation=https://github.com/ELares/IronCache
 After=network-online.target
 Wants=network-online.target
 # Socket activation (#389): when ironcache.socket is enabled, systemd creates the

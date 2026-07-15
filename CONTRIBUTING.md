@@ -34,10 +34,12 @@ cargo test  --workspace          # 1,500+ tests
 cargo test -p ironcache-config
 ```
 
-`cargo test` runs the standard test harness. CI runs `cargo test --workspace
---all-features` (see the gates below). `cargo nextest run` is a compatible, faster
-local runner that some contributors use and that the project is adopting; either is
-fine locally.
+`cargo test` runs the standard test harness and is fine locally. CI runs the suite
+under **cargo-nextest** (`cargo nextest run --profile ci --workspace --all-features`,
+process-per-test with a per-test timeout, #533), plus a separate
+`cargo test --doc --workspace --all-features` step because nextest does not run
+doctests (see the gates below). `cargo nextest run` locally reproduces the CI
+runner exactly; either runner is fine while iterating.
 
 To boot the server and talk to it with any Redis client:
 
@@ -107,7 +109,7 @@ that crates exist it is active. Each job below is merge-blocking:
 | --- | --- | --- |
 | `fmt` | `cargo fmt --all --check` | rustfmt formatting |
 | `clippy (pedantic, -D warnings)` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pedantic clippy with warnings denied (the pedantic set and its justified relaxations live in the workspace `Cargo.toml` `[workspace.lints.clippy]`) |
-| `test (ubuntu-latest)` | `cargo test --workspace --all-features` | the test suite |
+| `test (ubuntu-latest)` | `cargo nextest run --profile ci --workspace --all-features`, then `cargo test --doc --workspace --all-features` (nextest does not run doctests) | the test suite, process-per-test with a per-test timeout (#533) |
 | `msrv (1.85)` | `cargo +1.85.0 build --workspace --all-features` | the code compiles on the declared MSRV floor |
 | `musl static build` | `cargo build --release --target x86_64-unknown-linux-musl` | the shipping single static musl binary builds |
 | `io_uring datapath` | clippy + build + test of `ironcache-runtime` / `ironcache` with `--features io_uring` | the Linux-only, default-off io_uring path stays lint-clean, builds, and passes its round-trip test |

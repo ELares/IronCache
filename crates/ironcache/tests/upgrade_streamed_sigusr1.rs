@@ -35,25 +35,21 @@
 //! `serve::tests::resolve_signal_maps_each_arm` for the SIGUSR1 -> Cutover arm). This test's unique
 //! value is the real-binary + real-signal + real-listener-inheritance integration.
 //!
-//! ## STATUS: this capstone SURFACED a real receiver-side protocol bug (the whole point of slice-5)
+//! ## STATUS: BOTH tests PASS (the commit-path bug this capstone surfaced is FIXED)
 //!
-//! `sigusr1_streamed_cutover_aborts_keeps_serving_zero_loss` PASSES (the host fail-safe: an unusable
+//! `sigusr1_streamed_cutover_aborts_keeps_serving_zero_loss` passes (the host fail-safe: an unusable
 //! handoff socket aborts the cutover and the OLD keeps serving with zero loss and never exits).
 //!
-//! `sigusr1_streamed_cutover_commits_zero_loss_no_rst` currently FAILS: the OLD never commits/exits.
-//! Root cause (confirmed, single-shard AND multi-shard): the live SIGUSR1 SENDER speaks the PR-4
-//! commit protocol (`sender_phase1_bulk` sends the frozen bulk then `await_bulk_staged`, then
-//! `send_delta_await_prepared`, then `send_commit` + `await_served`), but the real-server RECEIVER
-//! boot path (`coordinator::receive_shard_from_handoff` -> `receive_shard_into` ->
-//! `drive::recv_shard_timed` -> `stream::recv_shard`) still drives the LEGACY receive protocol:
-//! `recv_bulk` sends only `HELLO_ACK` (never `BulkStaged`) and `recv_cutover` sends only the legacy
-//! `CutoverAck` (never `Prepared`/`Served`). So the sender blocks forever in `await_bulk_staged` while
-//! the receiver blocks reading a delta that is never sent; the receiver hits its 30s handoff timeout,
-//! the barrier aborts, and the OLD resumes (never exits). The PR-4 receiver
-//! (`commit::receive_shard_to_prepared` + a Commit-await + promote + `send_served`, as
-//! `orchestrator::run_receiver_cutover` does for the in-process acceptance) is what the boot path must
-//! call instead; wiring that (the receiver half of the #638 flip barrier) makes this test pass. See
-//! the slice-5 report for the precise fix direction.
+//! `sigusr1_streamed_cutover_commits_zero_loss_no_rst` passes: the OLD commits and exits with zero
+//! acked-write loss, no connection reset, and a sub-second write stall. HISTORY (why this test
+//! exists): the first real-binary run of this capstone surfaced that the receiver BOOT path
+//! (`coordinator::receive_shard_into`) still drove the legacy `stream::recv_shard` protocol while
+//! the live SIGUSR1 sender spoke the PR-4 commit protocol, so a real cutover deadlocked into the
+//! 30s timeout and safely aborted -- invisible to all 30+ in-process tests, which paired PR-4
+//! halves with each other. The fix wired the boot path to the PR-4 receiver
+//! (`commit::receive_shard_to_prepared` -> Commit-await -> promote -> `send_served`), which is
+//! exactly what this test now locks in. The lesson stands: a multi-component protocol needs a
+//! real-process end-to-end acceptance; unit tests that mock both halves hide the seam.
 
 #![cfg(unix)]
 

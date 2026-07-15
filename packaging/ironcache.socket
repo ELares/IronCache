@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
 # systemd SOCKET-ACTIVATION unit for the IronCache RESP port (#389 Phase 2a).
-# SCAFFOLD: templated and inert until the first release. See
-# docs/design/PACKAGING.md and packaging/README.md.
+# See docs/design/PACKAGING.md and packaging/README.md.
 #
 # Why: systemd OWNS this listening socket and keeps it open ACROSS an
 # `ironcache upgrade` service restart, so during the swap clients QUEUE in the
@@ -20,7 +19,7 @@
 
 [Unit]
 Description=IronCache RESP socket (socket activation)
-Documentation=https://github.com/OWNER/REPO
+Documentation=https://github.com/ELares/IronCache
 
 [Socket]
 # The RESP port on LOOPBACK by default, matching IronCache's SAFE config default

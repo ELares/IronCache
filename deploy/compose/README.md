@@ -9,7 +9,10 @@ Two compose files:
 | `docker-compose.cluster.yml` | A 3-node Raft cluster on one host, peering by compose service DNS. |
 
 Both use the published image `ghcr.io/elares/ironcache:latest`. Pin an immutable
-tag (e.g. `:v0.1.0`) for anything but local play.
+tag (e.g. `:0.1.0` -- the registry tag has NO leading `v`; the image CI strips it
+from the release tag) for anything but local play. Channel skew to know about:
+images are published only on `v*` release tags, while binary tarballs roll on
+every push to `main`, so `:latest` here can lag the rolling-binary channel.
 
 ## Single node
 

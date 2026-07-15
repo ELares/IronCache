@@ -4,9 +4,12 @@
 # on gcr.io/distroless/static (~2 MiB, CA certs + nonroot user), well under the
 # 5 MiB ceiling. Use `scratch` instead for the absolute minimum (no certs).
 #
-# SCAFFOLD: templated and inert until the first release. The release pipeline
-# builds and pushes this; the binary is produced by the cargo-zigbuild matrix in
-# .github/workflows/release.yml. See docs/design/PACKAGING.md.
+# UNUSED local-build variant: the image pipeline (.github/workflows/image.yml)
+# builds and pushes the ROOT ./Dockerfile (and ./Dockerfile.console), NOT this
+# file. Kept as a minimal manual-build reference; prefer the root Dockerfile,
+# which is the hadolint-gated, shipped image. The binary either way is produced
+# by the cargo-zigbuild matrix in .github/workflows/release.yml. See
+# docs/design/PACKAGING.md.
 #
 # Build wiring: the release job downloads the per-target archives
 # (ironcache-<ver>-<target>.tar.gz) produced by the cross-build matrix and
