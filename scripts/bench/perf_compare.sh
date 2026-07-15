@@ -48,14 +48,7 @@ set -euo pipefail
 # Budgets / band floor (env-overridable).
 # ---------------------------------------------------------------------------
 QPS_DROP_BUDGET="${QPS_DROP_BUDGET:-0.15}"     # 15% qps drop tolerated (generous; noisy).
-# TRANSITIONAL 7% (normally 5%): the #285 stage-4 default-index flip trades a one-time
-# +5.4% on the memmodel INT class (the reserved-fill split artifact of the dash reserve,
-# documented in DashIndex::reserve + the flip PR) for the uniform ORGANIC memory win the
-# flip record proves (never worse than hashbrown; 3.5-4.8% of total bytes better at its
-# doubling-trough keycounts -- the memmodel reserved fill is the one scenario that cannot
-# show the trough). RESTORE 0.05 in the follow-up PR once the merge-base carries the dash
-# baseline (the ratchet then re-tightens around the new numbers automatically).
-BYTES_RISE_BUDGET="${BYTES_RISE_BUDGET:-0.07}"
+BYTES_RISE_BUDGET="${BYTES_RISE_BUDGET:-0.05}" # 5% bytes/key rise tolerated (tight; deterministic).
 QPS_BAND_FLOOR="${QPS_BAND_FLOOR:-0.05}"       # 5% minimum qps noise band.
 
 # ---------------------------------------------------------------------------
