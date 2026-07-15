@@ -76,17 +76,41 @@ use core::mem::MaybeUninit;
 
 use crate::{MAX_GLOBAL_DEPTH, bit_from_top, fingerprint};
 
-/// The inline record capacity of a segment; an insert into a full segment forces a SPLIT.
-/// 64 keeps the fingerprint prescan at one `[u8; 64]` sweep (~a cache line of work, and a
-/// shape LLVM vectorizes) while amortizing the per-segment fixed costs across enough
-/// records. Geometry stays tunable against the microbench (DASHTABLE.md "Parameter
-/// tuning") -- but the REAL bound is 64, enforced below: [`Segment::match_mask`] packs one
-/// match bit per inline slot into a `u64` (and `len` is a `u8`, the looser bound).
-const SEGMENT_CAP: usize = 64;
+/// The segment geometry (PR-5b, the bucketed Dragonfly shape): 4 BUCKETS of 14 slots plus
+/// a 4-slot STASH, 60 records per segment. A record's HOME bucket comes from spare hash
+/// bits (disjoint from the directory's top bits and the fingerprint's low byte); placement
+/// is TWO-CHOICE (home, then the next bucket) with the stash as the shared third chance,
+/// which is what lifts the achievable load factor well above the flat-array layout's
+/// split-at-first-overflow behavior -- the memory lever this shape exists for. All
+/// presence + match bits pack into one `u64` (enforced below).
+const BUCKETS: usize = 4;
+const BUCKET_CAP: usize = 14;
+const REGULAR_CAP: usize = BUCKETS * BUCKET_CAP; // 56
+const STASH_CAP: usize = 4;
+const SEGMENT_CAP: usize = REGULAR_CAP + STASH_CAP; // 60
+/// The stash slots' presence-bit window (bits 56..60 of the segment mask).
+const STASH_WINDOW: u64 = ((1u64 << STASH_CAP) - 1) << REGULAR_CAP;
 const _: () = assert!(
     SEGMENT_CAP <= 64,
-    "match_mask packs one match bit per slot into a u64"
+    "presence and fingerprint-match bits pack into a u64"
 );
+const _: () = assert!(
+    BUCKETS.is_power_of_two(),
+    "bucket_of masks with BUCKETS - 1"
+);
+
+/// A record's HOME bucket: two spare hash bits ABOVE the fingerprint byte (bits 8..10),
+/// disjoint from both the fingerprint (bits 0..8) and the directory index (top bits), so
+/// the three routing decisions carry independent entropy.
+#[allow(clippy::cast_possible_truncation)] // masked to BUCKETS - 1 (< 4), exact.
+fn bucket_of(h: u64) -> usize {
+    ((h >> 8) & (BUCKETS as u64 - 1)) as usize
+}
+
+/// The presence/match-bit window of bucket `b` (14 bits at `b * 14`).
+fn bucket_window(b: usize) -> u64 {
+    ((1u64 << BUCKET_CAP) - 1) << (b * BUCKET_CAP)
+}
 
 /// The split-retry bound per insert: a backstop on loop iterations. The REAL guards against
 /// pathological collisions are [`MAX_GLOBAL_DEPTH`] and the futility fast-path in
@@ -96,35 +120,32 @@ const MAX_SPLITS: u32 = 64;
 /// Where a probe found a record: in the segment's inline slots or its overflow spill.
 #[derive(Clone, Copy, Debug)]
 enum Loc {
-    /// Index into the initialized inline prefix (`< len`).
+    /// Inline slot index (`0..REGULAR_CAP` a bucket slot, `REGULAR_CAP..SEGMENT_CAP` a
+    /// stash slot). Valid iff the segment mask has that bit set.
     Inline(usize),
     /// Index into the overflow `Vec` (present only after a force-place).
     Overflow(usize),
 }
 
-/// One segment: the extendible-hashing LOCAL depth, the initialized-prefix length, the
-/// packed fingerprints, the inline record slots, and the pathological overflow spill. See
-/// the module doc ("The DENSE segment layout") for the layout rationale and the `unsafe`
-/// invariant (`items[0..len]` initialized; `len..` logically uninitialized).
-/// LAYOUT (`repr(C, align(64))`, the PR-5a probe-locality fix): `fps` is the FIRST field
-/// and the segment is cache-line aligned, so the fingerprint prescan -- the one memory
-/// touch every probe makes before the matched item -- reads EXACTLY ONE cache line. The
-/// prior layout put `fps` at offset 2 of a 592-byte (non-64-multiple) stride: the scan
-/// straddled two lines at a drifting alignment, and the differential profile localized the
-/// dash arm's entire deficit to exactly this read path (`expire_if_due` +1.9pp). The
-/// alignment pads the segment 592 -> 640 bytes (+48 per segment, ~+1 byte/key at organic
-/// load), a deliberate probe-latency-for-memory trade the organic sweep still clears.
+/// One BUCKETED segment (see the module doc "The DENSE segment layout" and the geometry
+/// consts above).
+///
+/// LAYOUT (`repr(C, align(64))`): line 0 is EXACTLY `mask` (8 bytes of presence bits) plus
+/// `fps` (56 packed fingerprints) -- the one line every probe must read. Slots are NOT
+/// packed: presence is the bitmask (removal just clears a bit; `Loc`s are stable), and the
+/// `unsafe` invariant is `items[i]` initialized IFF mask bit `i` is set. The stash
+/// fingerprints + metadata head line 1, followed by the items.
 #[repr(C, align(64))]
 struct Segment<T> {
-    /// `fps[i]` is the fingerprint of `items[i]` for `i < len`; bytes at `len..` are
-    /// stale/meaningless (the branchless [`Self::match_mask`] scans them, then provably
-    /// masks their bits off). FIRST field, line-0-aligned: see the layout note above.
-    fps: [u8; SEGMENT_CAP],
+    /// Presence bits: `0..REGULAR_CAP` the bucket slots, then the stash. Bit i set IFF
+    /// `items[i]` is initialized (THE segment invariant every `unsafe` block cites).
+    mask: u64,
+    /// `fps[i]` is the fingerprint of bucket slot `i` WHEN mask bit `i` is set; stale
+    /// bytes otherwise (the branchless match scan reads them all, then ANDs with `mask`).
+    fps: [u8; REGULAR_CAP],
+    /// Fingerprints of the stash slots (`items[REGULAR_CAP + j]`), mask-gated like `fps`.
+    stash_fps: [u8; STASH_CAP],
     local_depth: u8,
-    /// The number of initialized inline records: `items[0..len]` are initialized,
-    /// `fps[0..len]` are their fingerprints. Always `<= SEGMENT_CAP`.
-    len: u8,
-    items: [MaybeUninit<T>; SEGMENT_CAP],
     /// The FORCE-PLACE spill (see [`DashIndex::entry`]'s guards): `None` in every
     /// non-pathological segment (one pointer-width), a boxed `(fingerprint, record)` list
     /// otherwise. Probes and iteration consult it whenever present. The `Box` around the
@@ -135,55 +156,76 @@ struct Segment<T> {
     /// actually exists.
     #[allow(clippy::box_collection)]
     overflow: Option<Box<Vec<(u8, T)>>>,
+    items: [MaybeUninit<T>; SEGMENT_CAP],
 }
 
 impl<T> Segment<T> {
     fn new(local_depth: u8) -> Self {
         Segment {
+            mask: 0,
+            fps: [0; REGULAR_CAP],
+            stash_fps: [0; STASH_CAP],
             local_depth,
-            len: 0,
-            fps: [0; SEGMENT_CAP],
-            items: [const { MaybeUninit::uninit() }; SEGMENT_CAP],
             overflow: None,
+            items: [const { MaybeUninit::uninit() }; SEGMENT_CAP],
         }
     }
 
     /// The total live records (inline + overflow).
     fn count(&self) -> usize {
-        usize::from(self.len) + self.overflow.as_ref().map_or(0, |ov| ov.len())
+        self.mask.count_ones() as usize + self.overflow.as_ref().map_or(0, |ov| ov.len())
     }
 
-    /// The branchless fingerprint pre-scan: one match bit per inline slot. Scanning the
-    /// WHOLE fixed `[u8; 64]` with no early exit and no calls is the shape LLVM
-    /// auto-vectorizes (a byte-compare + movemask idiom); the mask is then trimmed to the
-    /// initialized prefix. This two-phase probe (mask, THEN `eq` on set bits) is what
-    /// closes the gap on hashbrown's SIMD group probe -- a fused scan with the `eq` call
-    /// inside the loop defeats vectorization and measured ~6x slower.
-    fn match_mask(&self, fp: u8) -> u64 {
-        let mut mask = 0u64;
+    /// Whether a record homed at bucket `b` can be placed INLINE: a free slot in its home
+    /// bucket, the two-choice neighbor, or the stash. This -- not total occupancy -- is
+    /// the bucketed split trigger: other buckets' free slots are unreachable to this
+    /// record, so "the segment has room" is per-record now.
+    fn has_room_for(&self, b: usize) -> bool {
+        let free = !self.mask;
+        let nb = (b + 1) & (BUCKETS - 1);
+        free & (bucket_window(b) | bucket_window(nb) | STASH_WINDOW) != 0
+    }
+
+    /// The branchless fingerprint pre-scan over the bucket slots: one match bit per slot,
+    /// scanning the whole fixed array with no early exit and no calls (the shape LLVM
+    /// vectorizes); callers AND the result with `mask` and the relevant bucket windows.
+    fn match_bits(&self, fp: u8) -> u64 {
+        let mut bits = 0u64;
         for (i, &f) in self.fps.iter().enumerate() {
-            mask |= u64::from(f == fp) << i;
+            bits |= u64::from(f == fp) << i;
         }
-        let len = usize::from(self.len);
-        if len < SEGMENT_CAP {
-            mask &= (1u64 << len) - 1;
-        }
-        mask
+        bits
     }
 
     /// The probe: the location of the record whose fingerprint matches AND whose object
-    /// satisfies `eq`. The fingerprint gate ([`Self::match_mask`]) means `eq` runs only on
-    /// the ~1/256 of records whose hash low byte collides.
-    fn locate(&self, fp: u8, mut eq: impl FnMut(&T) -> bool) -> Option<Loc> {
-        let mut mask = self.match_mask(fp);
-        while mask != 0 {
+    /// satisfies `eq`, checking the hash's home bucket, its two-choice neighbor, the
+    /// stash, then the spill. `eq` runs only on the ~1/256 of scanned records whose hash
+    /// low byte collides.
+    fn locate(&self, hash: u64, mut eq: impl FnMut(&T) -> bool) -> Option<Loc> {
+        let fp = fingerprint(hash);
+        let b = bucket_of(hash);
+        let nb = (b + 1) & (BUCKETS - 1);
+        let mut cand = self.match_bits(fp) & self.mask & (bucket_window(b) | bucket_window(nb));
+        while cand != 0 {
             #[allow(clippy::cast_possible_truncation)] // trailing_zeros of a u64 is <= 64.
-            let i = mask.trailing_zeros() as usize;
-            mask &= mask - 1; // clear the lowest set bit
-            // SAFETY: `match_mask` trimmed the mask to `0..len`, so `items[i]` is
+            let i = cand.trailing_zeros() as usize;
+            cand &= cand - 1;
+            // SAFETY: bit `i` of `mask` is set (cand was ANDed with it), so `items[i]` is
             // initialized (the segment invariant).
             if eq(unsafe { self.items[i].assume_init_ref() }) {
                 return Some(Loc::Inline(i));
+            }
+        }
+        let mut stash = self.mask & STASH_WINDOW;
+        while stash != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = stash.trailing_zeros() as usize;
+            stash &= stash - 1;
+            if self.stash_fps[i - REGULAR_CAP] == fp {
+                // SAFETY: bit `i` of `mask` is set, so `items[i]` is initialized.
+                if eq(unsafe { self.items[i].assume_init_ref() }) {
+                    return Some(Loc::Inline(i));
+                }
             }
         }
         if let Some(ov) = &self.overflow {
@@ -201,9 +243,12 @@ impl<T> Segment<T> {
     /// table's borrow, so the type system enforces that).
     fn get(&self, loc: Loc) -> &T {
         match loc {
-            // SAFETY: a `Loc::Inline` is only ever constructed with `i < len` (locate /
-            // push), and no mutation intervened, so the slot is initialized.
-            Loc::Inline(i) => unsafe { self.items[i].assume_init_ref() },
+            Loc::Inline(i) => {
+                debug_assert!(self.mask & (1 << i) != 0, "loc bit must be present");
+                // SAFETY: a `Loc::Inline(i)` is only constructed with mask bit `i` set
+                // (locate / push), and no mutation intervened, so the slot is initialized.
+                unsafe { self.items[i].assume_init_ref() }
+            }
             Loc::Overflow(i) => &self.overflow.as_ref().expect("overflow loc implies spill")[i].1,
         }
     }
@@ -211,48 +256,60 @@ impl<T> Segment<T> {
     /// A mutable borrow of the record at `loc` (same contract as [`Self::get`]).
     fn get_mut(&mut self, loc: Loc) -> &mut T {
         match loc {
-            // SAFETY: as in `get`: the loc came from this segment with `i < len`.
-            Loc::Inline(i) => unsafe { self.items[i].assume_init_mut() },
+            Loc::Inline(i) => {
+                debug_assert!(self.mask & (1 << i) != 0, "loc bit must be present");
+                // SAFETY: as in `get`: the loc came from this segment with the bit set.
+                unsafe { self.items[i].assume_init_mut() }
+            }
             Loc::Overflow(i) => {
                 &mut self.overflow.as_mut().expect("overflow loc implies spill")[i].1
             }
         }
     }
 
-    /// Place a record, returning where it landed: the next inline slot, or the overflow
-    /// spill when the inline block is full (the force-place path).
-    fn push(&mut self, fp: u8, item: T) -> Loc {
-        let len = usize::from(self.len);
-        if len < SEGMENT_CAP {
-            self.fps[len] = fp;
-            self.items[len].write(item);
-            self.len += 1;
-            Loc::Inline(len)
-        } else {
-            let ov = self.overflow.get_or_insert_with(Box::default);
-            ov.push((fp, item));
-            Loc::Overflow(ov.len() - 1)
+    /// Place a record homed at `bucket`: its home bucket first, then the two-choice
+    /// neighbor, then the stash, else the overflow spill (the force-place path -- the
+    /// caller's split loop already decided growth cannot or should not help).
+    fn push(&mut self, bucket: usize, fp: u8, item: T) -> Loc {
+        let free = !self.mask;
+        let nb = (bucket + 1) & (BUCKETS - 1);
+        for window in [bucket_window(bucket), bucket_window(nb)] {
+            let cand = free & window;
+            if cand != 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let i = cand.trailing_zeros() as usize;
+                self.fps[i] = fp;
+                self.items[i].write(item);
+                self.mask |= 1 << i;
+                return Loc::Inline(i);
+            }
         }
+        let cand = free & STASH_WINDOW;
+        if cand != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = cand.trailing_zeros() as usize;
+            self.stash_fps[i - REGULAR_CAP] = fp;
+            self.items[i].write(item);
+            self.mask |= 1 << i;
+            return Loc::Inline(i);
+        }
+        let ov = self.overflow.get_or_insert_with(Box::default);
+        ov.push((fp, item));
+        Loc::Overflow(ov.len() - 1)
     }
 
     /// Remove and return the record at `loc` (same loc contract as [`Self::get`]).
-    /// Inline removal back-swaps the last record into the hole so the prefix stays packed.
+    /// Inline removal just CLEARS the presence bit -- no record moves (the bitmask model's
+    /// payoff over the packed-prefix layout).
     fn remove_at(&mut self, loc: Loc) -> T {
         match loc {
             Loc::Inline(i) => {
-                let last = usize::from(self.len) - 1;
-                // SAFETY: `i <= last < len` and `items[0..len]` are initialized. The read
-                // moves the record OUT of slot `i`; the swap below then bitwise-moves the
-                // last record into the hole (swapping the moved-out residue to `last`),
-                // and `len -= 1` marks slot `last` logically uninitialized -- so every
-                // record is owned exactly once and `Drop` never sees the residue.
-                let item = unsafe { self.items[i].assume_init_read() };
-                if i != last {
-                    self.fps[i] = self.fps[last];
-                    self.items.swap(i, last);
-                }
-                self.len -= 1;
-                item
+                debug_assert!(self.mask & (1 << i) != 0, "loc bit must be present");
+                self.mask &= !(1u64 << i);
+                // SAFETY: the bit WAS set (loc contract), so `items[i]` was initialized;
+                // clearing the bit first means `Drop`/iteration never touch the moved-out
+                // slot even if the caller panics after this returns.
+                unsafe { self.items[i].assume_init_read() }
             }
             Loc::Overflow(i) => {
                 let ov = self.overflow.as_mut().expect("overflow loc implies spill");
@@ -266,22 +323,31 @@ impl<T> Segment<T> {
         }
     }
 
+    /// The fingerprint of the record in inline slot `i` (bucket or stash region).
+    fn fp_of(&self, i: usize) -> u8 {
+        if i < REGULAR_CAP {
+            self.fps[i]
+        } else {
+            self.stash_fps[i - REGULAR_CAP]
+        }
+    }
+
     /// Move EVERY record out (inline + overflow), leaving the segment empty. Used by the
     /// split to repartition. The output `Vec` is pre-sized, so the per-record pushes below
-    /// cannot allocate (an allocation failure before any record is read leaves the
-    /// segment untouched).
+    /// cannot allocate; the mask is zeroed BEFORE the reads so `Drop` can never
+    /// double-drop a moved-out slot.
     fn drain_all(&mut self) -> Vec<(u8, T)> {
-        let n = usize::from(self.len);
         let mut out = Vec::with_capacity(self.count());
-        // Zero `len` BEFORE the reads: from here on `Drop` owns nothing in the inline
-        // block, so even if a caller-visible panic interrupted the loop (it cannot --
-        // nothing below panics -- but belt-and-suspenders), no slot is double-dropped.
-        self.len = 0;
-        for i in 0..n {
-            // SAFETY: `items[0..n]` were initialized (the invariant before `len` was
-            // zeroed); each slot is read out exactly once and never touched again.
+        let mut m = self.mask;
+        self.mask = 0;
+        while m != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            // SAFETY: bit `i` was set in the pre-zeroed mask, so `items[i]` was
+            // initialized; each slot is read out exactly once and never touched again.
             let item = unsafe { self.items[i].assume_init_read() };
-            out.push((self.fps[i], item));
+            out.push((self.fp_of(i), item));
         }
         if let Some(ov) = self.overflow.take() {
             out.extend(*ov);
@@ -289,57 +355,79 @@ impl<T> Segment<T> {
         out
     }
 
-    /// Iterate every live record (inline prefix, then the overflow spill).
+    /// Iterate every live record (inline mask bits, then the overflow spill).
     fn iter(&self) -> impl Iterator<Item = &T> {
-        self.items[..usize::from(self.len)]
-            .iter()
-            // SAFETY: `items[0..len]` are initialized (the segment invariant), and the
-            // shared borrow of `self` pins `len` for the iterator's lifetime.
-            .map(|slot| unsafe { slot.assume_init_ref() })
-            .chain(
-                self.overflow
-                    .iter()
-                    .flat_map(|ov| ov.iter().map(|(_, item)| item)),
-            )
+        let mut m = self.mask;
+        core::iter::from_fn(move || {
+            if m == 0 {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            // SAFETY: bit `i` of the mask is set, so `items[i]` is initialized; the
+            // shared borrow of `self` pins the mask for the iterator's lifetime.
+            Some(unsafe { self.items[i].assume_init_ref() })
+        })
+        .chain(
+            self.overflow
+                .iter()
+                .flat_map(|ov| ov.iter().map(|(_, item)| item)),
+        )
     }
 
     /// Whether EVERY live record's fingerprint equals `fp` (the cheap futility prefilter;
     /// see [`DashIndex::entry`]).
     fn all_fps_equal(&self, fp: u8) -> bool {
-        self.fps[..usize::from(self.len)].iter().all(|&f| f == fp)
-            && self
-                .overflow
-                .as_ref()
-                .is_none_or(|ov| ov.iter().all(|(f, _)| *f == fp))
+        let mut m = self.mask;
+        while m != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if self.fp_of(i) != fp {
+                return false;
+            }
+        }
+        self.overflow
+            .as_ref()
+            .is_none_or(|ov| ov.iter().all(|(f, _)| *f == fp))
     }
 }
 
 impl<T> Drop for Segment<T> {
     fn drop(&mut self) {
-        for slot in &mut self.items[..usize::from(self.len)] {
-            // SAFETY: `items[0..len]` are initialized (the segment invariant); each is
+        let mut m = self.mask;
+        while m != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            // SAFETY: bit `i` of the mask is set, so `items[i]` is initialized; each is
             // dropped exactly once here, and the segment is never used again. The
             // overflow `Vec` drops itself after this body.
-            unsafe { slot.assume_init_drop() };
+            unsafe { self.items[i].assume_init_drop() };
         }
     }
 }
 
 /// The panic guard for [`Segment`]'s manual `Clone`: `T::clone` is user code and may panic
-/// mid-prefix; the guard drops the records cloned so far so nothing leaks (the source
-/// segment is untouched). On success the clone loop forgets the guard and ownership passes
-/// to the new segment.
-struct PrefixGuard<'a, T> {
+/// mid-clone; the guard drops the records cloned so far (tracked as a bitmask) so nothing
+/// leaks. On success the clone loop forgets the guard and ownership passes to the new
+/// segment.
+struct MaskGuard<'a, T> {
     items: &'a mut [MaybeUninit<T>; SEGMENT_CAP],
-    done: usize,
+    done: u64,
 }
 
-impl<T> Drop for PrefixGuard<'_, T> {
+impl<T> Drop for MaskGuard<'_, T> {
     fn drop(&mut self) {
-        for slot in &mut self.items[..self.done] {
-            // SAFETY: slots `0..done` were initialized by the clone loop that owns the
-            // guard (see `Segment::clone`).
-            unsafe { slot.assume_init_drop() };
+        let mut m = self.done;
+        while m != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            // SAFETY: bit `i` of `done` is set only after the clone loop initialized
+            // `items[i]` (see `Segment::clone`).
+            unsafe { self.items[i].assume_init_drop() };
         }
     }
 }
@@ -348,41 +436,46 @@ impl<T: Clone> Clone for Segment<T> {
     fn clone(&self) -> Self {
         let mut items: [MaybeUninit<T>; SEGMENT_CAP] =
             [const { MaybeUninit::uninit() }; SEGMENT_CAP];
-        let mut guard = PrefixGuard {
+        let mut guard = MaskGuard {
             items: &mut items,
             done: 0,
         };
-        for i in 0..usize::from(self.len) {
-            // SAFETY: source `items[0..len]` are initialized (the segment invariant).
+        let mut m = self.mask;
+        while m != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            // SAFETY: source bit `i` is set, so the source slot is initialized.
             let src = unsafe { self.items[i].assume_init_ref() };
             guard.items[i].write(src.clone());
-            guard.done = i + 1;
+            guard.done |= 1 << i;
         }
         // Clone the overflow BEFORE forgetting the guard: `T::clone` in the spill is user
         // code too, and with the guard already forgotten a panic there would leak every
         // freshly cloned inline record (the bare `MaybeUninit` array drops nothing) --
         // proven by an adversarial probe under miri. With this ordering the unwind runs
-        // through the still-armed guard, which drops the cloned prefix.
+        // through the still-armed guard, which drops the cloned records.
         let overflow = self.overflow.clone();
         core::mem::forget(guard);
         Segment {
-            local_depth: self.local_depth,
-            len: self.len,
+            mask: self.mask,
             fps: self.fps,
-            items,
+            stash_fps: self.stash_fps,
+            local_depth: self.local_depth,
             overflow,
+            items,
         }
     }
 }
 
 impl<T> core::fmt::Debug for Segment<T> {
-    /// Structural debug only (depths + counts): the record slots are `MaybeUninit`, so a
+    /// Structural debug only (depth + occupancy): the record slots are `MaybeUninit`, so a
     /// derived impl is impossible, and the store's `Debug` (a derive over the shard store)
     /// only needs the shape to render.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Segment")
             .field("local_depth", &self.local_depth)
-            .field("len", &self.len)
+            .field("live", &self.mask.count_ones())
             .field("overflow", &self.overflow.as_ref().map_or(0, |ov| ov.len()))
             .finish_non_exhaustive()
     }
@@ -506,7 +599,7 @@ impl<T> DashIndex<T> {
     #[must_use]
     pub fn find(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
         let seg = &self.segments[self.route(hash)?];
-        let loc = seg.locate(fingerprint(hash), eq)?;
+        let loc = seg.locate(hash, eq)?;
         Some(seg.get(loc))
     }
 
@@ -518,7 +611,7 @@ impl<T> DashIndex<T> {
     pub fn find_mut(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&mut T> {
         let si = self.route(hash)?;
         let seg = &mut self.segments[si];
-        let loc = seg.locate(fingerprint(hash), eq)?;
+        let loc = seg.locate(hash, eq)?;
         Some(seg.get_mut(loc))
     }
 
@@ -542,8 +635,9 @@ impl<T> DashIndex<T> {
     ) -> Entry<'_, T> {
         self.ensure_init();
         let fp = fingerprint(hash);
+        let bucket = bucket_of(hash);
         let si = self.directory[self.dir_index(hash)] as usize;
-        if let Some(loc) = self.segments[si].locate(fp, eq) {
+        if let Some(loc) = self.segments[si].locate(hash, eq) {
             return Entry::Occupied(OccupiedEntry {
                 table: self,
                 seg: si,
@@ -567,7 +661,11 @@ impl<T> DashIndex<T> {
         loop {
             let si = self.directory[self.dir_index(hash)] as usize;
             let seg = &self.segments[si];
-            if seg.count() < SEGMENT_CAP || splits >= MAX_SPLITS {
+            // BUCKETED trigger: split when THIS record's placement options (home bucket,
+            // two-choice neighbor, stash) are all full -- not when the whole segment is.
+            // Other buckets' free slots are unreachable to this record, so total-count
+            // room would let the spill grow unbounded under bucket skew.
+            if seg.has_room_for(bucket) || splits >= MAX_SPLITS {
                 break;
             }
             if seg.all_fps_equal(fp) && seg.iter().all(|it| hasher(it) == hash) {
@@ -584,6 +682,7 @@ impl<T> DashIndex<T> {
             table: self,
             seg: si,
             fp,
+            bucket,
         })
     }
 
@@ -603,7 +702,7 @@ impl<T> DashIndex<T> {
         let Some(si) = self.route(hash) else {
             return Err(Absent);
         };
-        match self.segments[si].locate(fingerprint(hash), eq) {
+        match self.segments[si].locate(hash, eq) {
             Some(loc) => Ok(OccupiedEntry {
                 table: self,
                 seg: si,
@@ -622,7 +721,7 @@ impl<T> DashIndex<T> {
     /// power-of-two round-up spreads actual loads over (7/16, 7/8]). Segment slot storage
     /// is INLINE (the dense layout), so a well-mixed fill after a reserve performs no
     /// PER-RECORD allocation -- but note the contract is STATISTICAL, not absolute: at
-    /// mean loads near the 7/8 boundary, binomial spread overflows a fraction of segments
+    /// mean loads near the target boundary, binomial spread overflows a fraction of BUCKETS
     /// (measured ~12% at exactly-boundary sizes), each a local split, and the FIRST such
     /// split doubles the directory (reserve leaves every local depth == global depth).
     /// The memmodel bench's table-vs-object decomposition should treat those allocations
@@ -643,13 +742,17 @@ impl<T> DashIndex<T> {
         if needed == 0 {
             return;
         }
-        // Target ~7/8 of SEGMENT_CAP per segment: a UNIFORM fill then still fits without
-        // splitting, while occupancy stays high -- this is the memory-decisive constant.
-        // (A fatter margin measured ~2x hashbrown's reserved table bytes/key: 5/8 target
-        // times the power-of-two round-up drove occupancy to ~38% at 9.25 B/slot. At 7/8
-        // the reserved shape lands near hashbrown's own 7/8 reserve load, and a REAL
-        // hash-skewed fill that overflows a segment just splits it locally -- dash's cheap
-        // incremental growth -- rather than paying reserved slack everywhere.) The segment
+        // Target ~7/8 of SEGMENT_CAP per segment: the memory-decisive constant. The
+        // interplay with the power-of-two round-up DOMINATES this choice: a smaller
+        // divisor that nudges the segment count just past a 2^k boundary DOUBLES the
+        // reserved footprint (measured: a 4/5 retune crossed a boundary at the
+        // memmodel size and produced ~2x hashbrown's table bytes; 5/8 did the same in
+        // the flat layout's history). At 7/8, per-bucket mean load sits near the cap,
+        // so a RESERVED fill pays some bucket-boundary splits (a bench-only artifact:
+        // production tables grow organically, and the memmodel caveat is documented
+        // above); a mixed-local-depth reserve (alias pairs for non-power-of-two
+        // segment counts, splitting locally without any doubling) is the noted
+        // follow-up that removes the round-up cliff entirely. The segment
         // count rounds up to a power of two (the directory is one), then CLAMPS to the
         // hard directory bound -- reserve must not build what the split path refuses to
         // grow to (and the clamp is what makes the u32 directory-entry cast below exact by
@@ -747,7 +850,7 @@ impl<T> DashIndex<T> {
             } else {
                 seg_idx
             };
-            self.segments[target].push(fp, item);
+            self.segments[target].push(bucket_of(h), fp, item);
             self.len += 1;
         }
         // Re-point the directory: an entry that pointed at the old segment and whose
@@ -832,12 +935,14 @@ pub struct VacantEntry<'a, T> {
     table: &'a mut DashIndex<T>,
     seg: usize,
     fp: u8,
+    /// The record's home bucket (from the query hash), for the two-choice placement.
+    bucket: usize,
 }
 
 impl<'a, T> VacantEntry<'a, T> {
     /// Place `value`, returning the occupied entry for it (mirrors hashbrown).
     pub fn insert(self, value: T) -> OccupiedEntry<'a, T> {
-        let loc = self.table.segments[self.seg].push(self.fp, value);
+        let loc = self.table.segments[self.seg].push(self.bucket, self.fp, value);
         self.table.len += 1;
         OccupiedEntry {
             table: self.table,
@@ -1222,12 +1327,18 @@ mod tests {
         let depth_after_reserve = t.global_depth();
         let segs_after_reserve = t.segment_count();
         assert!(segs_after_reserve.is_power_of_two());
-        // A PERFECTLY uniform fill: keys whose hashes are evenly spread over the top bits
-        // (crafted, not hashed), so segment occupancy is exactly balanced and NO split or
-        // doubling can occur -- proving the pre-size actually pre-sized.
+        // A PERFECTLY uniform fill: hashes crafted so BOTH routing decisions are balanced
+        // -- the top bits spread evenly over the directory (i * step) AND the bucket bits
+        // (8..10) round-robin over the four in-segment buckets (i & 3, OR'd in without
+        // perturbing the top bits). Segment AND bucket occupancy are then exactly
+        // balanced, so NO split or doubling can occur -- proving the pre-size actually
+        // pre-sized. (Top-bit uniformity alone is NOT enough under the bucketed layout:
+        // the i * step stride's bucket bits cluster, overflowing one bucket pair well
+        // below segment capacity -- which is a legitimate SPLIT, per the reserve doc's
+        // statistical caveat, not a pre-size failure.)
         let step = u64::MAX / n as u64;
         for i in 0..n {
-            let h = i as u64 * step;
+            let h = (i as u64 * step) & !0x3FF | ((i as u64 & 3) << 8) | (i as u64 & 0xFF);
             match t.entry(h, |_| false, |_| unreachable!("balanced fill never splits")) {
                 Entry::Occupied(_) => unreachable!("eq is false"),
                 Entry::Vacant(e) => {
