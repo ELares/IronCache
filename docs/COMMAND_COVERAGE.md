@@ -8,10 +8,11 @@ documented as unsupported; the wire protocol and a command's observable behavior
 **Source of truth.** This page is a scannable, by-category summary. The authoritative,
 always-current list is the command registry in the code,
 [`crates/ironcache-server/src/command_spec.rs`](../crates/ironcache-server/src/command_spec.rs)
-(the `spec_of` match), which is also what a live server projects through introspection:
+(the `spec_of` match; the client-facing name list is `CLIENT_COMMAND_NAMES` in the same
+file), which is also what a live server projects through introspection:
 
 ```sh
-redis-cli -p 6379 COMMAND COUNT   # the number of client-facing commands (176)
+redis-cli -p 6379 COMMAND COUNT   # the number of client-facing commands (196)
 redis-cli -p 6379 COMMAND LIST    # the full name list
 redis-cli -p 6379 COMMAND INFO GET
 ```

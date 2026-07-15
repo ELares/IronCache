@@ -58,9 +58,9 @@ time; the per-shard series additionally carry a `shard` label emitted by IronCac
 
 The families are listed in the exact order `/metrics` renders them: the node
 rollup (counters, then gauges, then the raft gauges in raft mode), the per-shard
-counter/gauge detail, the node latency histogram, then the per-shard latency
-histogram. "Labels" lists only the labels IronCache emits (Prometheus adds
-`job`/`instance` on top).
+counter/gauge detail, the node latency histogram, the per-shard latency
+histogram, then the cross-shard inbox-depth gauges (#556) last. "Labels" lists
+only the labels IronCache emits (Prometheus adds `job`/`instance` on top).
 
 ### Node rollup -- counters
 
@@ -75,6 +75,9 @@ monotonic; graph them with `rate()`.
 | `ironcache_expired_keys_total`         | counter | (none) | Keys reclaimed because their TTL passed. |
 | `ironcache_keyspace_hits_total`        | counter | (none) | Read commands that found a live key. |
 | `ironcache_keyspace_misses_total`      | counter | (none) | Read commands that found no live key. |
+| `ironcache_hops_sent_total`            | counter | (none) | Cross-shard requests dispatched to a peer shard (the hop paid) (#556, the #517 zero-hop measurement harness). |
+| `ironcache_hops_served_total`          | counter | (none) | Cross-shard requests received and served for a peer shard. |
+| `ironcache_local_served_total`         | counter | (none) | Keyed requests served locally (owner is the home shard, no hop). |
 
 ### Node rollup -- gauges
 
@@ -144,12 +147,28 @@ hot-shard / key-skew detection.
 | `ironcache_shard_expired_keys_total`         | counter   | `shard` | Keys reclaimed because their TTL passed, per shard. |
 | `ironcache_shard_keyspace_hits_total`        | counter   | `shard` | Read commands that found a live key, per shard. |
 | `ironcache_shard_keyspace_misses_total`      | counter   | `shard` | Read commands that found no live key, per shard. |
+| `ironcache_shard_hops_sent_total`            | counter   | `shard` | Cross-shard requests dispatched to a peer shard (the hop paid), per shard. |
+| `ironcache_shard_hops_served_total`          | counter   | `shard` | Cross-shard requests received and served for a peer shard, per shard. |
+| `ironcache_shard_local_served_total`         | counter   | `shard` | Keyed requests served locally (owner is the home shard, no hop), per shard. |
 | `ironcache_shard_connected_clients`          | gauge     | `shard` | Currently-open client connections, per shard. |
 | `ironcache_shard_keyspace_keys`              | gauge     | `shard` | Live keys held, per shard. |
 | `ironcache_shard_command_duration_seconds`   | histogram | `shard`, `le` | Command execution latency in seconds, per shard (child series `_bucket{shard,le}`, `_sum{shard}`, `_count{shard}`). |
 
-That is the complete set: 31 metric families (the 4 `ironcache_raft_*` gauges appear
-only in raft-governance mode; everything else is always emitted).
+### Cross-shard inbox depth (#556) -- rendered last
+
+| Series | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `ironcache_inbox_depth`       | gauge | (none)  | Cross-shard inbox occupancy (queued cross-shard work items) summed across all shards. |
+| `ironcache_shard_inbox_depth` | gauge | `shard` | The same occupancy, per shard -- back-pressure BUILDING before the bounded inbox stalls a home core. |
+
+The depth is SAMPLED from the channel length at scrape time (`render_inbox_depth` in
+`crates/ironcache-observe/src/lib.rs`), so the gauge costs the cross-shard hop path
+nothing; the hop COUNTERS above are the monotonic view of the same coordinator traffic.
+
+That is the complete set: 39 metric families -- 9 node counters, 11 node gauges, the 4
+`ironcache_raft_*` gauges (raft-governance mode ONLY; a standalone node emits none), the
+2 inbox-depth gauges, 9 per-shard counters, 2 per-shard gauges, and the 2 latency
+histograms. Everything except the raft gauges is always emitted.
 
 ## Key INFO fields
 
@@ -203,6 +222,11 @@ sum(rate(ironcache_keyspace_hits_total[5m]))
 
 # Eviction rate (memory-ceiling pressure).
 sum(rate(ironcache_evicted_keys_total[5m]))
+
+# Cross-shard hop rate: the fraction of keyed requests that paid a cross-shard hop.
+# In shard-owners mode with an owner-dialing client this trends to ~0 (#517 zero-hop).
+sum(rate(ironcache_hops_sent_total[5m]))
+  / clamp_min(sum(rate(ironcache_hops_sent_total[5m])) + sum(rate(ironcache_local_served_total[5m])), 1)
 
 # Memory used as a fraction of the ceiling (only where maxmemory is set).
 ironcache_used_memory_bytes / (ironcache_maxmemory_bytes > 0)

@@ -22,7 +22,9 @@
 #   6379  RESP client listener            (Config.port / IRONCACHE_PORT)
 #   16379 Raft cluster-bus / RAFTMSG      (port + 10000, BUS_PORT_OFFSET; raft mode)
 #   26379 replication data plane          (port + 20000, REPL_PORT_OFFSET; raft mode)
-#   9121  HTTP /metrics + /livez + /readyz (only when --metrics-addr is set)
+#   9121  HTTP /metrics + /livez + /readyz (the endpoint is ON by default, but on
+#         loopback 127.0.0.1:9091, DEFAULT_METRICS_ADDR in crates/ironcache/src/cli.rs;
+#         pass --metrics-addr 0.0.0.0:9121 to bind it here, as the deploy artifacts do)
 #
 # The data_dir (Config.data_dir / IRONCACHE_DATA_DIR) is the single enable switch
 # for durable persistence (the on-disk snapshot dump-shard-<n>.icss + dump.manifest)

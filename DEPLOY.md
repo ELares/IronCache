@@ -66,20 +66,31 @@ pass `--metrics-addr off`.
 | `port` | `IRONCACHE_PORT` | client RESP port (default 6379) |
 | `shards` | `IRONCACHE_SHARDS` | per-core runtimes (default = available parallelism) |
 | `maxmemory` | `IRONCACHE_MAXMEMORY` | memory ceiling ("512mb", "1gb", 0 = unlimited) |
-| `maxmemory-policy` | `IRONCACHE_MAXMEMORY_POLICY` | eviction policy (default `allkeys-lru`) |
+| `maxmemory_policy` | `IRONCACHE_MAXMEMORY_POLICY` | eviction policy (default `allkeys-lru`) |
 | `requirepass` | `IRONCACHE_REQUIREPASS` | client AUTH password (hashed at rest) |
 | `maxclients` | `IRONCACHE_MAXCLIENTS` | max connections (default 10000; 0 = unlimited) |
+| `timeout` | `IRONCACHE_TIMEOUT` | idle client disconnect in seconds (default 0 = never) |
+| `tcp_keepalive_secs` | `IRONCACHE_TCP_KEEPALIVE` | SO_KEEPALIVE idle interval (default 300; 0 = off) |
+| `output_buffer_limit` | `IRONCACHE_OUTPUT_BUFFER_LIMIT` | per-connection reply-buffer cap in bytes (default 1 GiB; 0 = unbounded) |
+| `query_buffer_limit` | `IRONCACHE_QUERY_BUFFER_LIMIT` | per-connection request-buffer cap in bytes (default 1 GiB; 0 = unbounded) |
+| `notify_keyspace_events` | `IRONCACHE_NOTIFY_KEYSPACE_EVENTS` | keyspace-notification flags, e.g. `"KEA"` (default `""` = off) |
+| `databases` | (TOML only) | logical database count (default 16) |
+| `slots_per_db` | (TOML only) | per-DB store partitions (default 256; NOT the 16384 cluster slots) |
+| `runtime` | `IRONCACHE_RUNTIME` | async backend: `tokio` (default) or `io_uring` (Linux, build-feature-gated; see below) |
 | `data_dir` | `IRONCACHE_DATA_DIR` | durable snapshot + Raft log dir (enables persistence) |
 | `save_interval_secs` | `IRONCACHE_SAVE_INTERVAL_SECS` | periodic save cadence (0 = off) |
 | `save_min_changes` | `IRONCACHE_SAVE_MIN_CHANGES` | min writes before a periodic save fires |
 | `persist_cpu` | `IRONCACHE_PERSIST_CPU` | dedicate a core to the persist thread: `off` (default) / `auto` / a cpu list (`8`, `6-7`); Linux-only, see below |
+| `handoff_socket` | `IRONCACHE_HANDOFF_SOCKET` | opt-in streamed live-cutover socket for upgrades (see `docs/UPGRADE.md`) |
 | `refuse_empty_start_on_version_mismatch` | `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH` | fail closed (refuse to boot) on a newer-format snapshot instead of a loud empty start |
 | `cluster_enabled` | `IRONCACHE_CLUSTER_ENABLED` | turn on cluster mode (boot-only) |
-| `cluster_mode` | `IRONCACHE_CLUSTER_MODE` | `static` (default) or `raft` |
+| `cluster_mode` | `IRONCACHE_CLUSTER_MODE` | `static` (default), `raft`, or `shard-owners` (see note below) |
 | `cluster_announce_id` | `IRONCACHE_CLUSTER_ANNOUNCE_ID` | this node's stable 40-hex id |
 | `cluster_topology.nodes` | (TOML only) | the peer list + slot ownership |
+| `replica_max_lag` | `IRONCACHE_REPLICA_MAX_LAG` | promotion-eligibility + replica-read lag bound, in writes (default 256) |
+| `failover_timeout_secs` | `IRONCACHE_FAILOVER_TIMEOUT_SECS` | continuous link-down seconds before a replica self-promotes (default 5) |
 | `min_replicas_to_write` | `IRONCACHE_MIN_REPLICAS_TO_WRITE` | write-side durability guardrail |
-| `min_replicas_max_lag` | `IRONCACHE_MIN_REPLICAS_MAX_LAG` | lag bound for the in-sync quorum |
+| `min_replicas_max_lag` | `IRONCACHE_MIN_REPLICAS_MAX_LAG` | lag bound for the in-sync quorum (default 10) |
 | `raft_snapshot_threshold` | `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` | Raft-log compaction threshold |
 | `raft_snapshot_chunk_bytes` | `IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES` | InstallSnapshot chunk size in bytes (default 256 KiB) |
 | `cluster_secret` | `IRONCACHE_CLUSTER_SECRET` | shared peer-auth secret (bus + repl) |
@@ -90,6 +101,18 @@ pass `--metrics-addr off`.
 | `tls` | `IRONCACHE_TLS` | `off` (default) / `on` -- TLS on the public client port |
 | `tls_cert_path` | `IRONCACHE_TLS_CERT_PATH` | client TLS cert (PEM chain) |
 | `tls_key_path` | `IRONCACHE_TLS_KEY_PATH` | client TLS private key |
+
+`cluster_mode = "shard-owners"` (#517) is the third mode: a SINGLE node advertises
+its own shards as the slot owners, binding one client listener PER shard
+(`port .. port+shards-1`) so a cluster-aware client routes each key straight to the
+owning shard's port and skips the internal cross-shard hop -- the zero-hop mode
+behind the cluster-aware benchmark numbers. Its constraints are enforced at boot
+(`Config::validate` / `validate_shard_owners` in `ironcache-config`): it REQUIRES
+`cluster_enabled = true`, takes NO `cluster_topology` (owners derive from the shard
+count), is REJECTED with the io_uring runtime (per-shard listeners are a follow-up
+there), and is incompatible with systemd socket activation (it needs N self-bound
+ports, but activation passes one inherited socket -- the bootstrap refuses the
+combo, `bind_shard_owner_listeners` in `ironcache-runtime`).
 
 A documented single-node template with one comment per field is at
 [`deploy/ironcache.example.toml`](deploy/ironcache.example.toml); copy it and edit the values.
@@ -123,8 +146,13 @@ Publish: pushing a `v*` tag triggers `.github/workflows/image.yml`, which builds
 the musl binaries (same reproducible recipe as `release.yml`), then `docker buildx`
 builds a multi-arch (`linux/amd64` + `linux/arm64`) image and pushes
 `ghcr.io/elares/ironcache:<version>` + `:latest` with build provenance + an SBOM.
-It is a SEPARATE workflow from the binary release, so it cannot break or duplicate
-the binary-release jobs.
+The image tag STRIPS the leading `v` (image.yml `ver="${TAG#v}"`): a `v0.1.0` git
+tag publishes `:0.1.0`, so pin `image.tag=0.1.0`, never `v0.1.0` (the latter is
+manifest-unknown). Note the two release channels diverge here: images publish on
+`v*` tags ONLY, while binary tarballs also roll continuously to `releases/latest`
+on every push to main, so the GHCR `:latest` image can lag the rolling binary
+channel. It is a SEPARATE workflow from the binary release, so it cannot break or
+duplicate the binary-release jobs.
 
 ---
 
@@ -149,6 +177,86 @@ docker run -d --name ironcache \
   ghcr.io/elares/ironcache:latest \
   server --bind 0.0.0.0 --metrics-addr 0.0.0.0:9121
 ```
+
+### Bare-metal install (any Linux host)
+
+No container required: the release tarballs are static (musl) or glibc-2.17-pinned
+Linux binaries. Two channels publish them (RELEASING.md): formal `v*` tags, and a
+ROLLING CalVer build (`YYYY.MMDD.N`) on every push to main, which is what
+`releases/latest` points at. Asset name:
+`ironcache-<version>-linux-<amd64|arm64>-<musl|glibc>.tar.gz` (the version in the
+asset name has NO leading `v`, matching what `ironcache --version` prints).
+
+Fetch, verify against the consolidated `SHA256SUMS`, and install:
+
+```sh
+# Resolve the newest rolling tag (or set tag=v0.1.0 for a formal release).
+tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/ELares/IronCache/releases/latest | sed 's#.*/tag/##')"
+asset="ironcache-${tag#v}-linux-amd64-musl.tar.gz"   # or -arm64-, or -glibc
+curl -fLO "https://github.com/ELares/IronCache/releases/download/${tag}/${asset}"
+curl -fLO "https://github.com/ELares/IronCache/releases/download/${tag}/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS             # must print: ${asset}: OK
+tar -xzf "$asset"                                    # extracts one file: ironcache
+sudo install -m0755 ironcache /usr/local/bin/ironcache
+ironcache --version
+```
+
+Install the hardened systemd units from the repo's `packaging/` directory (they are
+tracked in git, not release assets -- without a checkout, fetch them raw from
+`https://raw.githubusercontent.com/ELares/IronCache/main/packaging/<unit>`):
+
+```sh
+sudo install -m0644 packaging/ironcache.service /etc/systemd/system/ironcache.service
+sudo install -m0644 packaging/ironcache.socket  /etc/systemd/system/ironcache.socket
+sudo systemctl daemon-reload
+sudo systemctl enable --now ironcache.socket ironcache.service
+```
+
+**Persistence needs a three-line unit edit.** The shipped unit is the in-memory
+default with `ProtectSystem=strict` (the whole filesystem is read-only to the
+service), so setting `data_dir` alone gets you a node that cannot write its
+snapshot. In `[Service]`, uncomment the two prepared lines and add the env var:
+
+```ini
+StateDirectory=ironcache
+ReadWritePaths=/var/lib/ironcache
+Environment=IRONCACHE_DATA_DIR=/var/lib/ironcache
+```
+
+then `systemctl daemon-reload && systemctl restart ironcache`. Also set a save
+cadence (`IRONCACHE_SAVE_INTERVAL_SECS` / `IRONCACHE_SAVE_MIN_CHANGES`, or the TOML
+keys) -- the built-in periodic-save default is OFF (section 8).
+
+**File descriptors.** At boot the server budgets `RLIMIT_NOFILE` against
+`maxclients` (`fd_budget.rs`, `RESERVED_FDS = 64`): it RAISES the soft limit toward
+the hard limit to fit `maxclients + 64`, and otherwise CLAMPS `maxclients` with a
+loud WARN. Under the shipped unit the `@resources` syscall filter BLOCKS that
+self-raise (`setrlimit` is filtered), so the unit provisions `LimitNOFILE=65535`
+instead -- raise that line if you raise `maxclients` past ~65k. Running WITHOUT
+systemd, make sure the HARD limit (`ulimit -Hn`) is `>= maxclients + 64`; the
+server can only self-raise the soft limit up to it.
+
+**The 9091-vs-9121 metrics trap.** The server's own metrics default is
+`127.0.0.1:9091` (`DEFAULT_METRICS_ADDR`), but `ironcache upgrade` health-gates
+against `127.0.0.1:9121` by default (its `--readyz-addr` default). The shipped unit
+already runs `--metrics-addr 127.0.0.1:9121` for exactly this reason; if you run
+the server with default flags instead, every default-flags upgrade fails its
+pre-flight with connection-refused. Either keep the server on
+`--metrics-addr 127.0.0.1:9121` or pass `--readyz-addr 127.0.0.1:9091` to
+`ironcache upgrade`.
+
+First boot + verify:
+
+```sh
+redis-cli -p 6379 ping            # PONG (or: ironcache cli -p 6379)
+curl 127.0.0.1:9121/readyz        # 200 once every shard finished load-on-boot
+journalctl -u ironcache -n 20     # boot banner, fd budget, socket-activation path
+```
+
+Later upgrades are then one command: `ironcache upgrade --to latest` (rolling) or
+`ironcache upgrade --to v0.1.0` (formal tags KEEP the leading `v` here); see
+[`docs/UPGRADE.md`](docs/UPGRADE.md).
 
 ### systemd socket activation (restart without a connection-refused window)
 
@@ -196,6 +304,53 @@ Notes:
 - Scope: activation covers the RESP CLIENT listener. The Raft cluster-bus and
   replication listeners still self-bind (a follow-up), so this is aimed at the
   single-node upgrade path.
+
+### io_uring runtime (Linux, opt-in, from-source only)
+
+The per-shard async backend is tokio by default. An io_uring datapath exists as a
+TWO-STEP opt-in -- both steps are required:
+
+1. **Build** with the cargo feature: `cargo build --release -p ironcache
+   --features io_uring`. The PUBLISHED release/rolling tarballs and the container
+   image are built with DEFAULT features and EXCLUDE it, so io_uring is
+   from-source only today.
+2. **Select** it at run time: `--runtime io_uring`, `IRONCACHE_RUNTIME=io_uring`,
+   or TOML `runtime = "io_uring"`.
+
+Selecting it can never fail a boot: the server FALLS BACK to tokio with a one-line
+log when the feature is absent from the build, the host is not Linux, the kernel
+lacks io_uring, or client TLS is ON (`tls = "on"` forces tokio; rustls does not
+compose with the io_uring path yet). It is also REJECTED at config validation with
+`cluster_mode = "shard-owners"`. `ironcache check` reports the effective backend.
+
+Honest performance guidance: opt in for PIPELINED workloads. On a 16-core arm64
+bench host the io_uring path measured +189% throughput at pipeline depth 32, but
+~6% SLOWER than tokio on a NON-pipelined (one request in flight per connection)
+workload (`docs/bench/OPTIMIZATION_LOG.md`). If your clients do not pipeline, stay
+on tokio; either way, A/B on your own hardware before flipping a fleet.
+
+### Transparent hugepages (Linux)
+
+The store tables and value blobs flow through jemalloc, and random-key workloads
+are dTLB-bound on 4 KiB pages. Backing the allocator with 2 MiB THP is a measured
+win: ~45% fewer dTLB misses and ~5% fewer CPU cycles on a 16-core arm64 bench host
+(qps-neutral there because that workload was not TLB-bottlenecked;
+`docs/bench/OPTIMIZATION_LOG.md`). It is OFF by default and there are two ways in:
+
+- **Build-time**: `cargo build --release -p ironcache --features hugepages`
+  appends `thp:always,metadata_thp:auto` to the compiled jemalloc `malloc_conf`
+  (Linux-only; inert elsewhere).
+- **Runtime, ANY binary including the shipped tarballs/images (no rebuild)**: set
+  `_RJEM_MALLOC_CONF=thp:always` in the process environment (e.g. an
+  `Environment=` line in the unit) and restart. jemalloc reads it once at process
+  init, so it cannot be flipped live and there is no `CONFIG SET` for it.
+
+Caveat -- RSS vs `maxmemory`: THP rounds resident memory up to 2 MiB granularity,
+and the `maxmemory` ceiling is enforced against the allocator RSS figure, so an
+inflated RSS eats eviction headroom -- leave margin between `maxmemory` and the
+host/cgroup limit when enabling it. Some kernels also add occasional khugepaged
+compaction latency. Verify it is live with
+`grep AnonHugePages /proc/<pid>/smaps | awk '$2>0' | head`.
 
 ---
 
@@ -246,7 +401,7 @@ helm install ic deploy/helm/ironcache --namespace cache --create-namespace \
   --set replicas=3 \
   --set clusterSecret.value="$(openssl rand -hex 24)" \
   --set auth.enabled=true --set auth.password="$(openssl rand -hex 24)" \
-  --set image.tag=v0.1.0 \
+  --set image.tag=0.1.0 \
   --set persistence.storageClassName=fast-ssd
 ```
 
@@ -457,11 +612,17 @@ and the Raft log lands in the OS temp dir (lost on a `/tmp`-clearing reboot) -- 
 ALWAYS set `data_dir` (onto a PVC) for a cluster.
 
 RPO is governed by the save policy: `save_interval_secs` + `save_min_changes` (the
-Redis `save <seconds> <changes>` cadence). The defaults here (900s / >=1 change)
-mean up to ~15 minutes of writes can be lost on an ungraceful crash of a single
-node; tighten the interval for a smaller RPO at the cost of more I/O. A graceful
-shutdown performs a final save-on-exit, and the StatefulSet's
-`terminationGracePeriodSeconds` (60s) covers that drain. In a cluster,
+Redis `save <seconds> <changes>` cadence). Two different defaults are in play, so
+be precise about which you are running. The BUILT-IN default is
+`save_interval_secs = 0` -- periodic saves are OFF until you configure a cadence
+(a final save on graceful shutdown STILL runs whenever `data_dir` is set, so a
+data_dir-only setup has shutdown-save durability but loses everything since the
+last explicit SAVE/BGSAVE on an ungraceful crash). The deploy artifacts in this
+repo (`deploy/ironcache.example.toml`, compose, Helm, raw k8s) all configure
+900s / >=1 change, which means up to ~15 minutes of writes can be lost on an
+ungraceful crash of a single node; tighten the interval for a smaller RPO at the
+cost of more I/O. A graceful shutdown performs a final save-on-exit, and the
+StatefulSet's `terminationGracePeriodSeconds` (60s) covers that drain. In a cluster,
 `min_replicas_to_write` bounds how many ACKNOWLEDGED writes a failover can lose to
 the async-replication window: an owner rejects a write unless it has that many
 in-sync replicas, so an acked write is known to be on that many nodes.
@@ -565,6 +726,109 @@ real typo is still caught) and set it only for the rollback (CONFIG.md, #527).
   rebalancing onto newly added nodes is an online-migration operation (`CLUSTER
   SETSLOT` proposals through the Raft log); changing `replicas` in the chart adds
   pods + topology entries but the slot map is governed by Raft at runtime.
+
+### Cluster on bare metal (three hosts)
+
+The same turnkey formation works on three plain Linux hosts (VMs or metal, any
+cloud) with no orchestrator -- the per-node configs below are the
+`deploy/compose/config/node*.toml` pattern with real host addresses. Install the
+binary + units on each host first (section 3 "Bare-metal install", including the
+persistence edit -- a cluster node NEEDS `data_dir` for its durable Raft log).
+
+**1. One TOML per node** at `/etc/ironcache/ironcache.toml` (read by default). All
+three files are IDENTICAL except `cluster_announce_id`. Node ids are any stable
+40-hex strings (`openssl rand -hex 20` once per node); each node's
+`cluster_announce_id` MUST equal its own `[[cluster_topology.nodes]]` entry's `id`
+(`Config::validate` enforces the match and rejects slot gaps/overlaps/dup ids --
+pre-flight with `ironcache check --config /etc/ironcache/ironcache.toml`). Host A:
+
+```toml
+bind = "0.0.0.0"
+port = 6379
+cluster_enabled = true
+cluster_mode = "raft"
+cluster_announce_id = "<HOST-A-40-hex-id>"   # the ONLY per-node line
+data_dir = "/var/lib/ironcache"
+save_interval_secs = 900
+save_min_changes = 1
+min_replicas_to_write = 0                    # see the -NOREPLICAS trap below
+
+[[cluster_topology.nodes]]
+id = "<HOST-A-40-hex-id>"
+host = "10.0.0.1"                            # DNS names also work (resolved lazily)
+port = 6379
+slots = [[0, 5460]]
+
+[[cluster_topology.nodes]]
+id = "<HOST-B-40-hex-id>"
+host = "10.0.0.2"
+port = 6379
+slots = [[5461, 10922]]
+
+[[cluster_topology.nodes]]
+id = "<HOST-C-40-hex-id>"
+host = "10.0.0.3"
+port = 6379
+slots = [[10923, 16383]]
+```
+
+**2. Network**: open THREE ports between the hosts -- `6379` (client), `16379`
+(cluster bus, `port + 10000`), `26379` (replication, `port + 20000`) -- plus
+`9121` from your monitoring network if you scrape metrics. The bus/repl ports are
+derived, never configured.
+
+**3. Secret**: set the SAME `IRONCACHE_CLUSTER_SECRET` on every node (a systemd
+drop-in `Environment=` line, or TOML `cluster_secret`); without it the node boots
+with a LOUD unauthenticated-bus warning. Add `cluster_tls` (section 6) when the
+inter-host network is not trusted.
+
+**4. Boot all three** (`systemctl restart ironcache`), in ANY order -- peer
+addresses resolve lazily at dial time, so an early node waits for the others. On a
+FRESH cluster the elected leader auto-applies the declared topology (the turnkey
+formation above): no `CLUSTER MEET`, no `ADDSLOTS`.
+
+**5. Verify** from any host:
+
+```sh
+redis-cli -c -h 10.0.0.1 cluster info    # cluster_state:ok, cluster_slots_assigned:16384,
+                                         # cluster_known_nodes:3, cluster_raft_leader:<id>
+redis-cli -c -h 10.0.0.1 cluster slots   # the three ranges above
+redis-cli -c -h 10.0.0.1 set smoke ok    # -c follows the -MOVED redirect to the owner
+```
+
+**The -NOREPLICAS trap.** A static topology declares PRIMARY ownership only -- no
+node starts as a replica of any slot. So `min_replicas_to_write >= 1` on a fresh
+cluster fails EVERY write with `-NOREPLICAS Not enough good replicas to write.`
+Keep it 0 until replicas exist, then add them at runtime:
+`CLUSTER REPLICATE <node-id> <slot> [slot ...]` -- note the IronCache-specific
+PER-SLOT argument shape (Redis's `CLUSTER REPLICATE` takes a whole node and there
+is no `REPLICAOF`/`SLAVEOF` here). The replica full-syncs over the repl plane and
+serves reads only on `READONLY` connections.
+
+**Scale-out (adding a fourth host).** The Raft-native join flow is: the new node
+boots as a NON-VOTER (the `cluster_raft_joining` switch, with the FULL topology
+including itself), the operator runs `CLUSTER MEET <host> <client-port>` ON THE
+LEADER (a membership change is NOT forwarded like slot writes -- find the leader
+via `cluster_raft_leader` in `CLUSTER INFO` or the `,leader` mark in
+`CLUSTER NODES`), the joiner is staged as a non-voting LEARNER (the quorum stays
+3), AUTO-PROMOTES to a voter once its log catches up, and `CLUSTER FORGET <id>`
+removes it again (quorum-guarded). This is integration-tested end to end
+(`raft_mode_meet_stages_a_learner_auto_promotes_then_forget_removes_it` in
+`crates/ironcache/tests/raft_cluster.rs`). HONEST LIMITATION: `cluster_raft_joining`
+is a Config field the strict TOML/env layer does not yet expose (it is not in the
+config schema, so a `cluster_raft_joining = true` line fails boot) -- today only
+the test harness can boot a joiner, so treat multi-host scale-out as
+engine-proven but not yet operator-wireable from a config file.
+
+**Moving slots after growth**: `CLUSTER REBALANCE` (or `... DRYRUN`) prints the
+read-only per-node plan (`current_slots` / `target_slots` / `slots_to_move`).
+`CLUSTER REBALANCE APPLY` (raft mode only) ARMS up to 128 moves per call as
+committed MIGRATING + IMPORTING pairs, which auto-copies each slot's keys to the
+destination; it deliberately does NOT flip ownership. Finalize each slot with
+`CLUSTER SETSLOT <slot> NODE <dest-id>` once `CLUSTER COUNTKEYSINSLOT <slot>` on
+the destination shows it caught up, then re-run APPLY for the next batch
+(idempotent and resumable; clients see standard `-ASK` redirects during the move,
+which `redis-cli -c` and real cluster clients follow).
 
 ---
 

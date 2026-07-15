@@ -27,10 +27,10 @@ peer of `docs/RUNBOOK.md` (symptom-to-action) and `DEPLOY.md` (install / config)
 | One node + `data_dir` + `ironcache.socket` | socket-activation handoff | [Single node](#single-node-rolling-upgrade) -- zero refused connections, warm restart |
 | A raft cluster (`cluster_mode = raft`) with replicas | replica failover | [HA cluster](#ha-cluster-rolling-upgrade) -- ownership moves off the node before you touch it |
 
-`cluster_mode` and `data_dir` are config keys
-(`crates/ironcache-config/src/lib.rs:437`, `:511`; TOML `cluster_mode = "raft"` /
-`data_dir = "..."`, or `IRONCACHE_CLUSTER_MODE` / `IRONCACHE_DATA_DIR`). Confirm your
-posture with `ironcache check` (below) and `CLUSTER INFO`.
+`cluster_mode` and `data_dir` are config keys (`Config::cluster_mode` / `Config::data_dir`
+in `crates/ironcache-config/src/lib.rs`; TOML `cluster_mode = "raft"` / `data_dir = "..."`,
+or `IRONCACHE_CLUSTER_MODE` / `IRONCACHE_DATA_DIR`). Confirm your posture with
+`ironcache check` (below) and `CLUSTER INFO`.
 
 ---
 
@@ -40,7 +40,7 @@ posture with `ironcache check` (below) and `CLUSTER INFO`.
    nginx `-t` analogue). It resolves + validates the effective config and prints it
    WITHOUT binding a port; a malformed `maxmemory`, a bad policy, or an unresolvable
    overlay fails HERE instead of at boot
-   (`crates/ironcache/src/main.rs:354` `cmd_check`):
+   (`cmd_check` in `crates/ironcache/src/main.rs`):
 
    ```sh
    ironcache check
@@ -49,8 +49,9 @@ posture with `ironcache check` (below) and `CLUSTER INFO`.
    #   shards      = 8
    #   runtime     = tokio
    #   databases   = 16
+   #   persist-cpu = off (no pin)
    #   maxmemory   = 0 bytes (unlimited)
-   #   policy      = noeviction
+   #   policy      = allkeys-lru
    #   requirepass = set
    #   tls         = off (plaintext)
    #   allocator   = jemalloc (background_thread=true, dirty_decay_ms=5000)
@@ -60,8 +61,8 @@ posture with `ironcache check` (below) and `CLUSTER INFO`.
    recent background save succeeded before you swap, so a warm restart reloads a good
    dump. `INFO persistence` reports `rdb_last_bgsave_status:ok` (`err` after a failed
    save, e.g. a full disk), plus `rdb_last_save_time` and `rdb_changes_since_last_save`
-   (`crates/ironcache-observe/src/lib.rs:1971`, `:1509`; #549). Force a fresh, known-good
-   snapshot immediately before the swap:
+   (`push_persistence_section` in `crates/ironcache-observe/src/lib.rs`; #549). Force a
+   fresh, known-good snapshot immediately before the swap:
 
    ```sh
    redis-cli SAVE        # blocking; or BGSAVE for background
@@ -83,9 +84,10 @@ posture with `ironcache check` (below) and `CLUSTER INFO`.
    ```
 
    or scrape `/metrics`: `ironcache_replication_link_up` must be `1` and
-   `ironcache_replication_lag_offset` small (`crates/ironcache-observe/src/lib.rs:980`,
-   `:985`; #549). The promotion lag bound is `replica_max_lag`
-   (`crates/ironcache-config/src/lib.rs:453`).
+   `ironcache_replication_lag_offset` small (`render_prometheus` in
+   `crates/ironcache-observe/src/lib.rs`; #549). The promotion lag bound is
+   `replica_max_lag` (`Config::replica_max_lag`, default `DEFAULT_REPLICA_MAX_LAG` = 256,
+   `crates/ironcache-config/src/lib.rs`).
 
 4. **The ops endpoint is reachable.** `ironcache upgrade`'s health gate probes `/readyz`
    and the RESP `PING`; the packaged unit exposes the endpoint on `127.0.0.1:9121`
@@ -95,6 +97,13 @@ posture with `ironcache check` (below) and `CLUSTER INFO`.
    ```sh
    curl -fsS http://127.0.0.1:9121/readyz && echo   # expect: ready
    ```
+
+   > PORT MISMATCH TRAP: `ironcache upgrade`'s `--readyz-addr` DEFAULTS to
+   > `127.0.0.1:9121` -- the PACKAGED unit's `--metrics-addr` -- but a server booted
+   > WITHOUT an explicit `--metrics-addr` serves the ops endpoint on `127.0.0.1:9091`
+   > (`DEFAULT_METRICS_ADDR` in `crates/ironcache/src/cli.rs`). On such a node the health
+   > gate can never turn green and a HEALTHY upgrade would be auto-rolled-back at the
+   > `--health-timeout`; pass `--readyz-addr 127.0.0.1:9091` (or whatever your unit binds).
 
 ---
 
@@ -106,8 +115,8 @@ With socket activation enabled, **systemd** owns the RESP listening socket, not 
 server. `packaging/ironcache.socket` opens `ListenStream=127.0.0.1:6379` with
 `Backlog=1024` and `ReusePort=false` and hands the fd to `ironcache.service` via the
 `sd_listen_fds` protocol (`LISTEN_FDS` / `LISTEN_PID`). The server ADOPTS that fd instead
-of self-binding (`crates/ironcache-runtime/src/tokio_rt.rs:178` `listener_for` ->
-`adopt_listener_fd`). Because the single listen queue is never closed across the restart,
+of self-binding (`listener_for` -> `adopt_listener_fd` in
+`crates/ironcache-runtime/src/tokio_rt.rs`). Because the single listen queue is never closed across the restart,
 in-flight and new connections QUEUE in the kernel backlog during the brief swap window
 rather than being refused (`packaging/ironcache.socket` header). This beats
 `SO_REUSEPORT` for upgrades: a closed reuseport socket loses its queued connections; this
@@ -117,16 +126,20 @@ The boot LOUDLY states which listener path it took, so you can confirm the hando
 the logs (#562):
 
 ```
-INFO socket-activation: ADOPTED 1 systemd socket-activation listening fd(s) [ironcache.socket=fd3]; systemd owns the listen queue, so it survives an upgrade restart with no connection-refused window
+INFO socket-activation: ADOPTED 1 systemd socket-activation listening fd(s) [resp=fd3]; systemd owns the listen queue, so it survives an upgrade restart with no connection-refused window
 ```
 
 If activation was not in effect you instead see `FELL BACK to self-binding its own
 listener: not socket-activated (no LISTEN_FDS in the environment)`, and a rejected
 activation environment (a foreign `LISTEN_PID`, a malformed count) logs at WARN naming the
 reason (`crates/ironcache/src/sockact_log.rs`; the classification is
-`crates/ironcache-runtime/src/listen_fds.rs` `classify`). Note the packaged
-`ironcache.socket` sets no `FileDescriptorName=`, so `LISTEN_FDNAMES` defaults to the
-socket unit name (`ironcache.socket`), which is what the fd name shows above.
+`classify` in `crates/ironcache-runtime/src/listen_fds.rs`). The packaged
+`ironcache.socket` sets `FileDescriptorName=resp`, and adoption selects the fd NAMED
+`resp` when `LISTEN_FDNAMES` disambiguates a multi-socket activation (falling back to the
+first passed fd on an unnamed single-socket unit -- `resp_listener_fd` in
+`crates/ironcache-runtime/src/listen_fds.rs`); that name is what the `[resp=fd3]` above
+shows. Naming the fd future-proofs a second `[Socket]` (e.g. a replication listener as
+`FileDescriptorName=repl`) without positional ambiguity.
 
 ### One-time setup (persisted, socket-activated)
 
@@ -150,8 +163,8 @@ NOT save (NOSAVE posture) and the restart comes back cold.
 
 ### The upgrade
 
-`ironcache upgrade` is the single operator command (verified: `crates/ironcache/src/cli.rs:114`
-`UpgradeArgs`, `crates/ironcache/src/main.rs:465` `cmd_upgrade`). It performs the whole
+`ironcache upgrade` is the single operator command (verified: `UpgradeArgs` in
+`crates/ironcache/src/cli.rs`, `cmd_upgrade` in `crates/ironcache/src/main.rs`). It performs the whole
 swap safely: sha256 INTEGRITY of the new artifact (minisign AUTHENTICITY once a public key
 is pinned, #386), a lossless write-freeze (node-wide `CLIENT PAUSE WRITE`, #388) then a
 final SAVE, an atomic never-absent binary swap keeping one `.old` slot, a systemd restart
@@ -169,7 +182,7 @@ ironcache upgrade \
   --health-timeout 30
 ```
 
-Verified flags and defaults (`crates/ironcache/src/cli.rs:125-214`):
+Verified flags and defaults (`UpgradeArgs` in `crates/ironcache/src/cli.rs`):
 
 | Flag | Default | Purpose |
 |------|---------|---------|
@@ -191,44 +204,100 @@ Exactly one source (`--binary`, `--from-url`, or `--to`) must be given. If persi
 NOT configured, `ironcache upgrade` refuses unless `--yes` (you are accepting a cold
 restart).
 
-### In-server streamed live cutover (SIGUSR1, #638) -- opt-in via `handoff_socket`
+> TAG SHAPE: `--to` takes the git TAG, and a FORMAL release tag includes the leading `v`
+> (`--to v1.2.3`, NOT `--to 1.2.3`) even though `ironcache --version` prints the bare
+> `1.2.3`; a rolling build is tagged by its calendar version (e.g. `--to 2026.0701.1`),
+> and `--to latest` follows the `releases/latest` redirect to the newest rolling build
+> (the `--to` doc on `UpgradeArgs` in `crates/ironcache/src/cli.rs`).
+
+### In-server streamed live cutover (SIGUSR1, #391/#638) -- opt-in via `handoff_socket`
 
 The default upgrade above SWAPS the binary and RESTARTS the process (the socket-activation
 handoff keeps the listen queue open across the brief restart). An alternative shape keeps
 the OLD process SERVING while it streams its live keyspace to a freshly spawned sibling
-(a re-exec of the binary in receiver role) and flips write authority at a single committed
-linearization point -- no restart, no acknowledged-write loss, and no orphaned-backlog RST
-because the sibling INHERITS the OLD's client listen fd. This path is OPT-IN: it runs only
-when a node is configured with a `handoff_socket` (TOML `handoff_socket = "..."` or
-`IRONCACHE_HANDOFF_SOCKET`, `crates/ironcache-config/src/lib.rs`), a node-local AF_UNIX
-rendezvous path both the OLD and the sibling agree on.
+(a re-exec of the server binary in receiver role) and flips write authority at a single
+committed linearization point -- no restart, no acknowledged-write loss, and no
+orphaned-backlog RST because the sibling INHERITS the OLD's client listen fd. Both the
+commit path and the abort path are verified end to end by the real two-process acceptance
+tests (`crates/ironcache/tests/upgrade_streamed_sigusr1.rs` asserts a COMPLETED commit
+with zero acked-write loss, no RST, a sub-second write stall, and OLD `exit(0)`;
+`crates/ironcache/tests/upgrade_streamed_cutover.rs` drives the orchestrator primitives;
+both are Linux-gated `#[ignore]` acceptance runs, not default-CI gates). The receiver boot
+path drives the full commit protocol (`receive_shard_into` in
+`crates/ironcache/src/coordinator.rs`: bulk -> `BulkStaged` -> delta -> `Prepared` ->
+await `Commit`/`Abort` -> `Served`; only a COMMITTED shard is ever installed).
 
-The trigger is **SIGUSR1** to the running server pid (`crates/ironcache/src/serve.rs`
-`wait_for_signal` -> `SignalOutcome::Cutover`; `crates/ironcache/src/main.rs` `drive_cutover`).
-On a plain `SIGTERM`/`SIGINT` the server still does the unchanged graceful stop; SIGUSR1 is
-the streamed-cutover trigger:
+**Prerequisites:**
+
+- `handoff_socket` is configured on the running server (TOML `handoff_socket = "..."` or
+  `IRONCACHE_HANDOFF_SOCKET`; `Config::handoff_socket` in
+  `crates/ironcache-config/src/lib.rs`) -- a node-local AF_UNIX rendezvous path both the
+  OLD and the sibling agree on. Without it, SIGUSR1 is logged and IGNORED (the server
+  keeps serving). This is the whole opt-in gate (`HandoffPlan::from_config` in
+  `crates/ironcache/src/upgrade/drive.rs`).
+- `data_dir` is OPTIONAL: when configured, each committed shard's post-cutover state is
+  durably published to `dump-shard-<n>.icss` BEFORE the OLD exits (so a crash of the NEW
+  right after the cutover cannot lose the adopted keyspace); without it the adopt is
+  in-memory-only, matching a non-persistent node's steady state (`receive_shard_into`).
+- Unix only (the handoff rides an AF_UNIX socket + fork/exec), and the single-listener
+  default acceptor; the shard-owners N-listener fd-array inherit is a documented follow-up
+  (`run_cutover_host` in `crates/ironcache/src/main.rs` passes the FIRST client listener fd).
+
+**The trigger** is **SIGUSR1** to the running server pid (`wait_for_signal` ->
+`SignalOutcome::Cutover` in `crates/ironcache/src/serve_signal.rs`; `drive_cutover` in
+`crates/ironcache/src/main.rs`). A plain `SIGTERM`/`SIGINT` still does the unchanged
+graceful stop:
 
 ```sh
 # the running server must have handoff_socket configured; then:
 kill -USR1 "$(redis-cli INFO server | sed -n 's/^process_id://p' | tr -d '\r')"
-# on COMMIT: the sibling serves on the same port and the OLD process exits(0);
-# on ABORT (a bad/unusable handoff socket, or a failed receiver): the OLD keeps serving,
-#   never exits, and writes resume -- the trigger is fail-safe toward keep-serving.
 ```
 
-`ironcache upgrade --streamed` is the intended CLI wrapper (it reads `INFO server`'s
-`process_id` and sends the signal); until it is wired the raw `kill -USR1` above is the
-trigger.
+**What COMMIT looks like** (log lines verbatim from `drive_cutover` in `main.rs`):
 
-> STATUS (slice-5 acceptance, #638): the SIGUSR1 trigger, the sender-side barrier, the
-> sibling spawn + inherited-listener no-RST, and the receiver-side serve-flip barrier are in
-> place, and the ABORT path (OLD keeps serving with zero loss) is verified end to end by
-> `crates/ironcache/tests/upgrade_streamed_sigusr1.rs`. The COMMIT path is NOT yet
-> operational: the real-server acceptance surfaced that the receiver boot path still drives
-> the legacy handoff receive (`stream::recv_shard`) instead of the PR-4 commit protocol the
-> live sender speaks (`BulkStaged`/`Prepared`/`Served`), so a real cutover currently deadlocks
-> and safely aborts. Use the default socket-activation `ironcache upgrade` above for
-> production single-node upgrades until the receiver commit-protocol wiring lands.
+```
+INFO ironcache: streamed cutover COMMITTED; the new sibling now serves on the inherited listener. Draining in-flight connections and exiting.
+```
+
+The sibling serves on the SAME port (it adopted the inherited listen fd) and the OLD
+drains briefly and `exit(0)`s -- the commit exit uses the SHORT cutover drain grace and
+SKIPS the redundant save-on-exit (the NEW already durably promoted the state), so the
+client-visible write stall is SUB-SECOND (asserted by the acceptance test via the
+`ironcache-env` clock seam). A client that sees `-LOADING` or a closed connection during
+the flip reconnects and lands on the NEW.
+
+**What ABORT looks like** -- fail-safe toward keep-serving; the OLD never exits and writes
+resume:
+
+```
+WARN ironcache: streamed cutover aborted; the OLD keeps serving
+WARN ironcache: streamed cutover did not commit; resuming service (the OLD keeps serving). Waiting for the next signal.
+```
+
+A host-side error (rather than a clean abort) logs at ERROR:
+`ironcache: streamed cutover ended without a confirmed commit (degraded standby, W3); NOT
+exiting. Operator recovery: restart the OLD or the NEW.` And with no `handoff_socket`
+configured the signal is a no-op:
+`ironcache: SIGUSR1 cutover requested but no handoff_socket is configured; ignoring (the
+server keeps serving)`.
+
+**CLI selection (no `--streamed` flag exists).** On a node whose config has
+`handoff_socket` set, `ironcache upgrade` AUTO-SELECTS the streamed path: it validates the
+streamed configuration and reports `streamed live-cutover selected: handoff socket ...`,
+and deliberately does NOT run the default destructive swap+restart (which would kill the
+live process the cutover hands off from) -- see `cmd_upgrade` -> `cmd_upgrade_streamed` in
+`crates/ironcache/src/main.rs`. The actual trigger remains the `kill -USR1` above, sent to
+the running server. Corollary: a node with `handoff_socket` configured cannot be driven
+through the default tmpfs swap+restart via `ironcache upgrade` on that config.
+
+**Composition with socket activation.** The sibling adopts the inherited fd through the
+SAME `adopt_listener_fd` path the systemd socket-activation boot uses; the orchestrator
+passes it at a well-known fd via `IRONCACHE_HANDOFF_LISTEN_FD`, which `listener_for`
+checks BEFORE the `LISTEN_FDS` and self-bind paths (`crates/ironcache-runtime/src/tokio_rt.rs`).
+So the never-closed-listener guarantee holds whether the OLD self-bound its listener or
+adopted a systemd socket-activation fd -- in the latter case the inherited duplicate IS the
+systemd-owned socket, and the listen queue is still never closed. A default boot (no
+handoff env) is byte-unchanged.
 
 ---
 
@@ -239,13 +308,13 @@ reads and writes) and others may be committed as its REPLICAS, mirroring the own
 serving READONLY reads (`crates/ironcache/src/replica_attach.rs`). Replica assignment and
 promotion go through the Raft control plane, NOT a `REPLICAOF`/`SLAVEOF` command (those do
 not exist in IronCache). The operator levers are the raft-mode `CLUSTER` mutators, handled
-by `try_raft_cluster_mutator` (`crates/ironcache/src/serve.rs:4830`):
+by `try_raft_cluster_mutator` (`crates/ironcache/src/serve.rs`):
 
 - `CLUSTER REPLICATE <node-id> <slot> [slot ...]` assigns a node as a replica of the
-  listed slots (commits `AssignReplica`; `serve.rs:4873`, `:5601`).
+  listed slots (commits `AssignReplica`; `build_replicate` in `serve.rs`).
 - `CLUSTER FAILOVER` promotes THIS in-sync replica to owner of the slots it replicates
   (commits `PromoteReplica`, which atomically transfers ownership and bumps the config
-  epoch; `serve.rs:4877`, `:5160`).
+  epoch; `build_failover` in `serve.rs`).
 
 The strategy: **move ownership off a node before you upgrade it.**
 
@@ -349,12 +418,19 @@ redis-cli CLUSTER SHARDS
 
 For an upgrade that must not lose an acknowledged write to the async-replication window,
 require replica acknowledgement on the owner BEFORE you start
-(`crates/ironcache-config/src/lib.rs:460`, default 0 = disabled):
+(`Config::min_replicas_to_write` in `crates/ironcache-config/src/lib.rs`, default 0 =
+disabled):
 
 ```
 min_replicas_to_write = 1     # owner rejects writes with -NOREPLICAS when under-replicated
-min_replicas_max_lag  = <writes>
+min_replicas_max_lag  = 10    # in-sync bound, in LOGICAL WRITE OFFSETS (the default,
+                              # DEFAULT_MIN_REPLICAS_MAX_LAG = 10)
 ```
+
+`min_replicas_max_lag` counts LOGICAL WRITES (the same offset unit as
+`ironcache_replication_lag_offset`), not seconds; a replica lagging past it stops counting
+toward `min_replicas_to_write` (`Config::min_replicas_max_lag`, default
+`DEFAULT_MIN_REPLICAS_MAX_LAG` = 10).
 
 ### 2. Upgrade the replicas first
 
@@ -367,8 +443,9 @@ redis-cli INFO replication | grep -E 'role|master_link_status|slave_repl_offset'
 # role:replica ; master_link_status:up ; slave_repl_offset catching up to master_repl_offset
 ```
 
-`master_link_status` flips `up`/`down` at `crates/ironcache-observe/src/lib.rs` (INFO
-replication section); the same signal is `ironcache_replication_link_up` on `/metrics`.
+`master_link_status` flips `up`/`down` in `push_replication_section`
+(`crates/ironcache-observe/src/lib.rs`); the same signal is
+`ironcache_replication_link_up` on `/metrics`.
 
 ### 3. Promote a replica, then upgrade the old owner
 
@@ -381,7 +458,7 @@ redis-cli -h <replica-host> -p <replica-port> CLUSTER FAILOVER
 ```
 
 `CLUSTER FAILOVER` REFUSES (so you cannot promote an unsafe node) when
-(`crates/ironcache/src/serve.rs:5160-5209`):
+(`build_failover` in `crates/ironcache/src/serve.rs`):
 
 - the node is not an in-sync replica (not a replica, its link is down, or its lag exceeds
   the bound) -> `CLUSTER FAILOVER refused: this node is not an in-sync replica ...`;
@@ -403,9 +480,10 @@ rejoins (`CLUSTER NODES`, `/readyz` green).
 If a node is stopped without a controlled `CLUSTER FAILOVER`, its replicas detect the
 master link down and, after `failover_timeout_secs` of CONTINUOUS down-time, an in-sync
 replica SELF-proposes its own promotion through Raft (HA-8;
-`crates/ironcache-config/src/lib.rs:454`, default `DEFAULT_FAILOVER_TIMEOUT_SECS`). A
-replica is only promotable while its link was up and its lag was `<= replica_max_lag`
-(`:445`), so a stale replica is never promoted. The controlled `CLUSTER FAILOVER` is
+`Config::failover_timeout_secs` in `crates/ironcache-config/src/lib.rs`, default
+`DEFAULT_FAILOVER_TIMEOUT_SECS` = 5 s). A replica is only promotable while its link was up
+and its lag was `<= replica_max_lag` (`Config::replica_max_lag`, default
+`DEFAULT_REPLICA_MAX_LAG` = 256), so a stale replica is never promoted. The controlled `CLUSTER FAILOVER` is
 preferred for upgrades because it moves ownership with no down-timeout window and no
 write-rejection blip.
 
@@ -444,20 +522,21 @@ After any upgrade, confirm the NEW binary is the one serving:
 
 1. **Version.** `INFO server` reports `ironcache_version:<real>` (the load-bearing field,
    from the build's `CARGO_PKG_VERSION`) alongside a fixed `redis_version:7.4.0`
-   compatibility tag (`crates/ironcache-observe/src/lib.rs:1826-1827`). Check the REAL one:
+   compatibility tag (`build_info` in `crates/ironcache-observe/src/lib.rs`). Check the REAL one:
 
    ```sh
    redis-cli INFO server | grep -E 'ironcache_version|redis_version|uptime_in_seconds'
    ```
 
    `uptime_in_seconds` (and the `ironcache_uptime_seconds` gauge on `/metrics`,
-   `crates/ironcache-observe/src/lib.rs:941`) resetting toward zero PROVES a real restart
-   happened.
+   `render_prometheus` in `crates/ironcache-observe/src/lib.rs`) resetting toward zero
+   PROVES a real restart happened. (A COMMITTED streamed cutover also resets it: the
+   sibling is a new process.)
 
 2. **Readiness.** `/readyz` returns `200` only once load-on-boot finished for every shard
    AND (in raft mode) a leader is recognized; otherwise `503` with
    `not ready: load-on-boot incomplete` or `not ready: raft: no leader recognized`
-   (`crates/ironcache/src/metrics_http.rs:296-307`). Liveness is `/livez`; both plus
+   (`ReadyState` in `crates/ironcache/src/metrics_http.rs`). Liveness is `/livez`; both plus
    `/metrics` are served on the ops endpoint (boot log `metrics: serving /metrics, /livez,
    /readyz`).
 
@@ -469,8 +548,8 @@ After any upgrade, confirm the NEW binary is the one serving:
    `ironcache_command_duration_seconds` (#546, buckets `0.000025 .. 10, +Inf`) and the
    cross-shard hop counters `ironcache_hops_sent_total` / `ironcache_hops_served_total` /
    `ironcache_local_served_total` plus the `ironcache_inbox_depth` gauge (#556) should
-   return to their pre-upgrade shape (`crates/ironcache-observe/src/lib.rs:1174`, `:908`,
-   `:1150`). A p99 query:
+   return to their pre-upgrade shape (`render_latency_histogram`, `render_prometheus`, and
+   `render_inbox_depth` in `crates/ironcache-observe/src/lib.rs`). A p99 query:
 
    ```
    histogram_quantile(0.99, sum(rate(ironcache_command_duration_seconds_bucket[5m])) by (le))
@@ -493,7 +572,7 @@ After any upgrade, confirm the NEW binary is the one serving:
 fails, or the reported version is not exactly the requested target), it AUTO-RESTORES the
 retained `.old` binary, restarts, and re-probes -- with no operator action, so a bad build
 never strands the node (`docs/design/UPGRADE.md` "Auto-rollback on any miss";
-`crates/ironcache/src/cli.rs:192` `--no-rollback` to opt OUT). The state directory is
+`UpgradeArgs::no_rollback` in `crates/ironcache/src/cli.rs` to opt OUT). The state directory is
 never written during a rollback; the working set comes back through the normal load path.
 
 ### Manual
@@ -512,10 +591,10 @@ For a persisted node, the working set reloads from the last committed snapshot.
 
 A downgrade (or a rollback to a binary older than the one that wrote the on-disk dump) can
 hit a snapshot whose FORMAT version this binary does not understand
-(`FORMAT_VERSION`, `crates/ironcache-persist/src/format.rs:51`, currently `1`). IronCache
+(`FORMAT_VERSION` in `crates/ironcache-persist/src/format.rs`, currently `1`). IronCache
 does NOT silently discard it. At boot, before binding any port,
 `check_snapshot_loadable` inspects the committed dump and, on an unsupported version,
-emits a LOUD error naming the risk (`crates/ironcache-persist/src/lib.rs:265-271`, verbatim):
+emits a LOUD error naming the risk (`crates/ironcache-persist/src/lib.rs`, verbatim):
 
 ```
 ERROR ironcache: the on-disk snapshot has an unsupported format version and will NOT be
@@ -535,12 +614,13 @@ discarding the on-disk data)
   boot instead of starting empty, with
   `refusing to boot: the on-disk snapshot has an unsupported format version and
   refuse_empty_start_on_version_mismatch is set (fail closed rather than start with an
-  empty keyspace)` (`crates/ironcache/src/main.rs:213-222`). The dump is untouched; boot
-  the NEWER binary (or point `data_dir` at a compatible snapshot) and try again. Set this
-  key (TOML `refuse_empty_start_on_version_mismatch = true` or
+  empty keyspace)` (`cmd_server` in `crates/ironcache/src/main.rs`). The dump is untouched;
+  boot the NEWER binary (or point `data_dir` at a compatible snapshot) and try again. Set
+  this key (TOML `refuse_empty_start_on_version_mismatch = true` or
   `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH=1`;
-  `crates/ironcache-config/src/lib.rs:647`) on any node where a downgrade wiping the
-  keyspace is worse than a refused boot -- which is almost always.
+  `Config::refuse_empty_start_on_version_mismatch` in `crates/ironcache-config/src/lib.rs`)
+  on any node where a downgrade wiping the keyspace is worse than a refused boot -- which
+  is almost always.
 
 There is no CLI flag for this key; it is TOML/env only.
 
@@ -548,27 +628,36 @@ There is no CLI flag for this key; it is TOML/env only.
 
 ## Reference: verified against
 
+Citations are SYMBOL names (functions / consts / types), not line numbers: line numbers
+rot as the code moves; symbols are greppable.
+
 | Item | Where confirmed |
 |------|-----------------|
-| `ironcache check` output | `crates/ironcache/src/main.rs:354` `cmd_check` |
-| `ironcache upgrade` flags/defaults | `crates/ironcache/src/cli.rs:114-214`; `crates/ironcache/src/main.rs:465` `cmd_upgrade` |
-| Socket-activation adopt/self-bind | `crates/ironcache-runtime/src/tokio_rt.rs:178` `listener_for`, `:140` `adopt_listener_fd` |
-| Socket-activation boot log (#562) | `crates/ironcache/src/sockact_log.rs`; `crates/ironcache-runtime/src/listen_fds.rs` `classify` / `Activation::boot_summary` |
-| `ironcache.socket` `ListenStream`/`Backlog`/`ReusePort`, no `FileDescriptorName` | `packaging/ironcache.socket` |
+| `ironcache check` output | `cmd_check` in `crates/ironcache/src/main.rs` |
+| `ironcache upgrade` flags/defaults | `UpgradeArgs` in `crates/ironcache/src/cli.rs`; `cmd_upgrade` in `crates/ironcache/src/main.rs` |
+| Streamed-cutover CLI selection (no `--streamed` flag) | `cmd_upgrade` -> `cmd_upgrade_streamed` in `crates/ironcache/src/main.rs` |
+| SIGUSR1 trigger + COMMIT/ABORT log lines | `wait_for_signal` in `crates/ironcache/src/serve_signal.rs`; `drive_cutover` / `run_cutover_host` in `crates/ironcache/src/main.rs` |
+| Receiver commit protocol + durable publish | `receive_shard_into` / `receive_shard_from_handoff` in `crates/ironcache/src/coordinator.rs` |
+| Streamed-cutover acceptance (commit + abort, zero loss, no RST, sub-second stall) | `crates/ironcache/tests/upgrade_streamed_sigusr1.rs`, `crates/ironcache/tests/upgrade_streamed_cutover.rs` |
+| Sibling spawn + inherited-listener no-RST | `spawn_receiver_sibling` in `crates/ironcache/src/upgrade/orchestrator.rs` |
+| Socket-activation adopt/self-bind | `listener_for` / `adopt_listener_fd` in `crates/ironcache-runtime/src/tokio_rt.rs` |
+| Socket-activation boot log (#562) | `crates/ironcache/src/sockact_log.rs`; `classify` / `Activation::boot_summary` in `crates/ironcache-runtime/src/listen_fds.rs` |
+| `ironcache.socket` `ListenStream`/`Backlog`/`ReusePort`/`FileDescriptorName=resp` | `packaging/ironcache.socket`; `resp_listener_fd` in `crates/ironcache-runtime/src/listen_fds.rs` |
 | `ironcache.service` `ExecStart --metrics-addr 127.0.0.1:9121`, `Wants`/`After` socket | `packaging/ironcache.service` |
-| `INFO server` `ironcache_version` / `redis_version:7.4.0` | `crates/ironcache-observe/src/lib.rs:1826-1827` |
-| `INFO persistence` `rdb_last_bgsave_status:ok\|err` (#549) | `crates/ironcache-observe/src/lib.rs:1971`, `:1509` |
-| `INFO replication` `master_link_status`, `role`, offsets | `crates/ironcache-observe/src/lib.rs` replication section |
-| `/metrics` latency histogram (#546) | `crates/ironcache-observe/src/lib.rs:1174` |
-| `/metrics` hop counters + inbox depth (#556) | `crates/ironcache-observe/src/lib.rs:908`, `:1150` |
-| `/metrics` `ironcache_uptime_seconds`, repl gauges (#549) | `crates/ironcache-observe/src/lib.rs:941`, `:980`, `:985` |
-| `/readyz` / `/livez` semantics | `crates/ironcache/src/metrics_http.rs:296-307` |
-| `CLUSTER REPLICATE` -> `AssignReplica` | `crates/ironcache/src/serve.rs:4873`, `:5601` |
-| `CLUSTER FAILOVER` -> `PromoteReplica` + refusals | `crates/ironcache/src/serve.rs:4877`, `:5160-5209` |
-| `failover_timeout_secs`, `replica_max_lag`, `min_replicas_to_write` | `crates/ironcache-config/src/lib.rs:454`, `:445`, `:460` |
-| #530 `check_snapshot_loadable` error text | `crates/ironcache-persist/src/lib.rs:265-271` |
-| #530 fail-closed at boot | `crates/ironcache/src/main.rs:213-222` |
-| #530 `refuse_empty_start_on_version_mismatch` key | `crates/ironcache-config/src/lib.rs:647` |
-| `FORMAT_VERSION` | `crates/ironcache-persist/src/format.rs:51` |
-| `cluster_mode`, `data_dir`, save points | `crates/ironcache-config/src/lib.rs:437`, `:511` |
+| Server default ops bind `127.0.0.1:9091` | `DEFAULT_METRICS_ADDR` / `effective_metrics_addr` in `crates/ironcache/src/cli.rs` |
+| `INFO server` `ironcache_version` / `redis_version:7.4.0` | `build_info` in `crates/ironcache-observe/src/lib.rs` |
+| `INFO persistence` `rdb_last_bgsave_status:ok\|err` (#549) | `push_persistence_section` in `crates/ironcache-observe/src/lib.rs` |
+| `INFO replication` `master_link_status`, `role`, offsets | `push_replication_section` in `crates/ironcache-observe/src/lib.rs` |
+| `/metrics` latency histogram (#546) | `render_latency_histogram` in `crates/ironcache-observe/src/lib.rs` |
+| `/metrics` hop counters + inbox depth (#556) | `render_prometheus` / `render_inbox_depth` in `crates/ironcache-observe/src/lib.rs` |
+| `/metrics` `ironcache_uptime_seconds`, repl gauges (#549) | `render_prometheus` in `crates/ironcache-observe/src/lib.rs` |
+| `/readyz` / `/livez` semantics | `ReadyState` in `crates/ironcache/src/metrics_http.rs` |
+| `CLUSTER REPLICATE` -> `AssignReplica` | `try_raft_cluster_mutator` / `build_replicate` in `crates/ironcache/src/serve.rs` |
+| `CLUSTER FAILOVER` -> `PromoteReplica` + refusals | `try_raft_cluster_mutator` / `build_failover` in `crates/ironcache/src/serve.rs` |
+| `failover_timeout_secs` (5), `replica_max_lag` (256), `min_replicas_to_write` (0), `min_replicas_max_lag` (10) | `Config` fields + `DEFAULT_FAILOVER_TIMEOUT_SECS` / `DEFAULT_REPLICA_MAX_LAG` / `DEFAULT_MIN_REPLICAS_MAX_LAG` in `crates/ironcache-config/src/lib.rs` |
+| #530 `check_snapshot_loadable` error text | `check_snapshot_loadable` in `crates/ironcache-persist/src/lib.rs` |
+| #530 fail-closed at boot | `cmd_server` in `crates/ironcache/src/main.rs` |
+| #530 `refuse_empty_start_on_version_mismatch` key | `Config::refuse_empty_start_on_version_mismatch` in `crates/ironcache-config/src/lib.rs` |
+| `FORMAT_VERSION` | `FORMAT_VERSION` in `crates/ironcache-persist/src/format.rs` |
+| `cluster_mode`, `data_dir`, `handoff_socket`, save points | `Config::cluster_mode` / `Config::data_dir` / `Config::handoff_socket` in `crates/ironcache-config/src/lib.rs` |
 </content>

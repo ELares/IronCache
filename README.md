@@ -10,13 +10,16 @@ IronCache speaks the Redis wire protocol (RESP2 and RESP3) and keeps the observa
 Redis contract for the commands it implements, so existing Redis clients, libraries,
 and `redis-cli` work against it unchanged. It is a shared-nothing, thread-per-core
 engine: the keyspace is sharded so each shard is owned and mutated by exactly one
-core, with no hot-path locks. It ships as a single static binary that is both the
-server and the CLI.
+core, with no hot-path locks. It ships as a single static binary that carries the
+server plus the operator tooling (config preflight, a verified self-upgrade, a
+connectivity smoke client).
 
-The engine is functional and broad: 176 client-facing commands across all the core
+The engine is functional and broad: 196 client-facing commands (what a live server
+reports via `COMMAND COUNT`; the registry is `CLIENT_COMMAND_NAMES` in
+`crates/ironcache-server/src/command_spec.rs`) across all the core
 data types, transactions, pub/sub with keyspace notifications, blocking commands,
 on-disk persistence, and an opt-in Raft-governed multi-node cluster with replication,
-automatic failover, and online slot migration. It is exercised by 1,500+ in-tree
+automatic failover, and online slot migration. It is exercised by 2,600+ in-tree
 tests, a differential harness that proves byte-for-byte RESP parity against
 `redis-server`, and a real client-driver matrix (redis-py, go-redis, ioredis) in both
 single-node and cluster mode.
@@ -74,7 +77,15 @@ approaches, and adversarially verify every load-bearing claim before trusting it
   multi-key, whole-keyspace, and pub/sub commands.
 - **A swappable Runtime seam**: the data path is written against a `Runtime` trait,
   with a portable tokio (epoll/kqueue) implementation and an **optional io_uring
-  datapath** on Linux (default-off, opt-in) behind the same seam.
+  datapath** on Linux (default-off, opt-in; see [Build features](#build-features))
+  behind the same seam.
+- **A Dash extendible-hashing index by DEFAULT**: since the #285 flip, each slot's
+  key index is the Dash table (the `ironcache-dashtable` crate) instead of a
+  SwissTable. Segments grow one at a time, so there is no power-of-two doubling
+  trough and bytes/key stays FLAT as the keyspace grows (measured, see
+  [Benchmarks](#benchmarks)), at throughput parity. The SwissTable arm stays built
+  and CI-gated behind the `hashbrown-index` build feature, so the flip is
+  reversible.
 - **Eviction**: a `maxmemory` ceiling with a configurable policy (default
   `allkeys-lru`).
 
@@ -175,6 +186,15 @@ full contract.
   `CLIENT PAUSE WRITE` (writes hold; reads and admin like SAVE keep serving) so no
   acknowledged write is lost in the save-to-reload window; `--no-freeze` opts out. A
   failed upgrade unpauses and leaves the node untouched.
+- **Three upgrade shapes**: the in-place single-node upgrade above (fed from a local
+  `--binary`, a `--from-url` tarball, or `--to <TAG>|latest` fetched from GitHub
+  Releases); a whole-cluster rolling upgrade (`ironcache upgrade --cluster
+  --inventory <FILE> --to <TAG>`: replicas first, promote an in-sync replica behind
+  the failover freeze, old primary last, `--dry-run` to preview the plan); and an
+  opt-in SIGUSR1 **streamed live cutover** on a node whose config sets
+  `handoff_socket` (the old process streams its keyspace to a re-exec'd sibling that
+  inherits the client listener, and exits only on commit; abort keeps the old
+  process serving). The operator runbook is [`docs/UPGRADE.md`](docs/UPGRADE.md).
 - Validated end to end on a live AWS node: an upgrade under continuous concurrent
   writes preserved every acknowledged write, the full keyspace, and the ACL users.
 
@@ -186,9 +206,19 @@ full contract.
   manifests (`deploy/k8s/`), deploying a StatefulSet with headless + client Services,
   a PDB, a PVC for `data_dir`, and `/livez` + `/readyz` probes.
 - **docker-compose** for a single node and a 3-node Raft cluster (`deploy/compose/`).
+- A bundled **monitoring console** (`crates/ironcache-console`, published as
+  `ghcr.io/elares/ironcache-console`, built from `Dockerfile.console`): a separate,
+  stateless dashboard server that polls the nodes as a scoped ACL user and never
+  sits on the data path. The HA deployment runbook is
+  [`deploy/CONSOLE_DEPLOY.md`](deploy/CONSOLE_DEPLOY.md).
+- A shipped **Grafana dashboard** (`deploy/grafana/ironcache-dashboard.json`) and
+  **Prometheus alert rules** (`deploy/prometheus/ironcache-alerts.yml`) over the
+  `/metrics` series cataloged in [`docs/METRICS.md`](docs/METRICS.md).
 - **CalVer rolling releases** on every push to `main` plus formal `v*` releases:
   reproducible `musl` + `glibc` tarballs for **amd64 and arm64**, a consolidated
-  `SHA256SUMS`, a CycloneDX SBOM, and a keyless Sigstore build-provenance attestation.
+  `SHA256SUMS`, and a keyless Sigstore build-provenance attestation on both
+  channels; a formal `v*` release additionally attaches a CycloneDX SBOM and a
+  minisign signature over `SHA256SUMS` (see [`RELEASING.md`](RELEASING.md)).
 
 See [`DEPLOY.md`](DEPLOY.md) for the full deployment guide, every config key, the
 ports, and what was validated offline versus on a live cluster.
@@ -227,6 +257,89 @@ must share a slot (co-locate them with a `{hash tag}`).
 
 ---
 
+## Install
+
+**Platforms.** Linux is the production target (the io_uring datapath, transparent
+huge pages, and systemd socket activation are Linux-only). macOS is supported for
+development builds. Windows is unsupported (no artifacts, untested).
+
+### Prebuilt binaries (Linux)
+
+Every push to `main` publishes a CalVer **rolling release** (a normal, non-prerelease
+release, so `releases/latest` is always the newest build), and formal `v*` releases
+are cut from the same pipeline. Each release carries static `musl` tarballs for
+x86_64 and aarch64 Linux plus glibc-2.17-pinned `gnu` fallbacks (asset scheme
+`ironcache-<version>-linux-<amd64|arm64>-<musl|glibc>.tar.gz`, the binary at the
+tarball root), a consolidated `SHA256SUMS`, and a keyless Sigstore build-provenance
+attestation. Formal `v*` releases additionally attach a CycloneDX SBOM and a
+minisign signature over `SHA256SUMS`; the verification recipes live in
+[`RELEASING.md`](RELEASING.md).
+
+```sh
+# Fetch the newest build for your platform (here arm64 musl; swap in amd64 and/or
+# glibc) plus the checksum manifest. `gh release download` defaults to releases/latest.
+gh release download --repo ELares/IronCache \
+  --pattern 'ironcache-[0-9]*-linux-arm64-musl.tar.gz' --pattern SHA256SUMS
+
+# Verify integrity + provenance, then install.
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify ironcache-[0-9]*-linux-arm64-musl.tar.gz --repo ELares/IronCache
+tar -xzf ironcache-[0-9]*-linux-arm64-musl.tar.gz
+sudo install -m 0755 ironcache /usr/local/bin/ironcache
+ironcache --version
+```
+
+Without `gh`, download the same two assets from the GitHub releases page (the asset
+name embeds the version) and run the same `sha256sum -c SHA256SUMS --ignore-missing`.
+
+### Docker
+
+```sh
+docker pull ghcr.io/elares/ironcache:latest
+```
+
+Images build only on `v*` tags, so `:latest` tracks the last formal `v*` release and
+can LAG the rolling binary channel above by days of merges. Immutable pins drop the
+`v` prefix: tag `v0.1.0` publishes `ghcr.io/elares/ironcache:0.1.0`.
+
+### From source
+
+You need `rustup` (the repo's `rust-toolchain.toml` auto-pins the exact stable
+toolchain on the first `cargo` invocation; the workspace MSRV is 1.85, edition 2024)
+and a C compiler such as gcc or clang (the `ring` crypto dependency compiles C).
+
+```sh
+git clone https://github.com/ELares/IronCache
+cd IronCache
+cargo build --release -p ironcache
+target/release/ironcache server
+```
+
+### Build features
+
+The published release binaries are built with **default features only**
+(`default = []` on the `ironcache` crate). Three opt-in build features exist, all
+from-source:
+
+- **`io_uring`**: the Linux io_uring datapath. Enabling it is a TWO-step opt-in:
+  build with `cargo build --release -p ironcache --features io_uring` AND select it
+  at boot with `--runtime io_uring` (or `IRONCACHE_RUNTIME=io_uring`, or TOML
+  `runtime = "io_uring"`). It is honored only on a Linux build with the feature and
+  TLS off; in every other case (feature absent, non-Linux, TLS on) the boot LOGS a
+  one-line fallback and serves on tokio, never failing to start. It is NOT in the
+  published release binaries, and its measured wins are on PIPELINED workloads
+  (+189% at pipeline depth 32; see [Benchmarks](#benchmarks)).
+- **`hugepages`**: backs the store tables and value blobs with transparent huge
+  pages by appending `thp:always,metadata_thp:auto` to the baked-in jemalloc
+  `malloc_conf`. The same behavior is available at RUNTIME on any binary (including
+  the shipped ones, no rebuild) via `_RJEM_MALLOC_CONF=thp:always`. Measured: ~45%
+  fewer dTLB misses and ~5% fewer cycles on both index arms, qps-neutral. Default
+  off because `thp:always` can raise RSS against the `maxmemory` ceiling.
+- **`hashbrown-index`**: the SwissTable fallback arm for the store's per-slot index
+  (the pre-#285 default), kept fully CI-gated so the Dash-index flip is reversible.
+
+---
+
 ## Quick start
 
 ### Run it in one command (Docker)
@@ -254,11 +367,12 @@ container (a named data volume plus the `/metrics` + `/readyz` endpoints), see
 
 ### Build and run from source
 
-You need a stable Rust toolchain (MSRV 1.85, edition 2024).
+You need `rustup` and a C compiler (see [Install: from source](#from-source); the
+pinned toolchain installs itself, MSRV 1.85, edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 1,500+ tests
+cargo test --workspace          # 2,600+ tests
 
 # boot the server on every core (sharded, thread-per-core) and talk to it with any
 # Redis client
@@ -266,12 +380,15 @@ cargo run -p ironcache -- server
 redis-cli -p 6379 SET hello world   # -> OK
 redis-cli -p 6379 GET hello         # -> "world"
 
-# other modes: the built-in CLI, the effective config, a config self-check, or a
-# verified data-safe binary self-upgrade (see "Seamless upgrades")
-cargo run -p ironcache -- cli GET hello
-cargo run -p ironcache -- config
-cargo run -p ironcache -- check
+# one binary, six modes: server (default) | cli | check | config | upgrade | bench.
+# `ironcache cli` is a PING-only connectivity smoke check (NOT a REPL); use
+# redis-cli or any Redis client for real commands, as above.
+cargo run -p ironcache -- cli -p 6379   # -> +PONG
+cargo run -p ironcache -- check         # preflight: validate config + self-check
+cargo run -p ironcache -- config        # print the effective configuration
 cargo run -p ironcache -- upgrade --binary ./ironcache --sha256sums ./SHA256SUMS
+# `bench` is a stub (tracked by #8); `upgrade` is the verified data-safe
+# self-update (see "Seamless upgrades" and docs/UPGRADE.md)
 ```
 
 ### Runnable examples
@@ -307,6 +424,10 @@ redis-cli -p 6379 ping
 curl localhost:9121/readyz
 ```
 
+A turnkey 3-node Raft cluster is one command away:
+`docker compose -f deploy/compose/docker-compose.cluster.yml up -d` (the formation,
+ports, and teardown are in [`DEPLOY.md`](DEPLOY.md)).
+
 ### Configuration
 
 Configuration is layered, highest precedence first:
@@ -322,7 +443,7 @@ The most common knobs (every key, with its env var, is in
 | --- | --- | --- |
 | `bind` / `port` | `IRONCACHE_BIND` / `IRONCACHE_PORT` | listen address and client port (default 6379) |
 | `shards` | `IRONCACHE_SHARDS` | per-core runtimes (default = available parallelism) |
-| `maxmemory` / `maxmemory-policy` | `IRONCACHE_MAXMEMORY` / `..._POLICY` | memory ceiling + eviction policy |
+| `maxmemory` / `maxmemory_policy` | `IRONCACHE_MAXMEMORY` / `..._POLICY` | memory ceiling + eviction policy |
 | `maxclients` | `IRONCACHE_MAXCLIENTS` | max connections (default 10000) |
 | `requirepass` | `IRONCACHE_REQUIREPASS` | client AUTH password (hashed at rest) |
 | `aclfile` | `IRONCACHE_ACLFILE` | ACL users loaded at boot |
@@ -332,6 +453,12 @@ The most common knobs (every key, with its env var, is in
 | `cluster_enabled` / `cluster_mode` | `IRONCACHE_CLUSTER_*` | turn on clustering; `static` or `raft` |
 | `cluster_secret` / `cluster_tls` | `IRONCACHE_CLUSTER_SECRET` / `_TLS` | peer auth + bus/repl encryption |
 | `min_replicas_to_write` | `IRONCACHE_MIN_REPLICAS_TO_WRITE` | write-side durability guardrail |
+
+TOML keys use underscores and the file parse is STRICT: `maxmemory-policy` (the
+hyphen spelling) is the runtime `CONFIG GET` / `CONFIG SET` name, and a config file
+that uses it fails boot with an unknown-key error (the accepted keys are
+`KNOWN_TOML_KEYS` in `crates/ironcache-config/src/lib.rs`; the
+`--ignore-unknown-config-keys` downgrade hatch relaxes unknown keys only, loudly).
 
 A documented single-node config template you can copy and edit is at
 [`deploy/ironcache.example.toml`](deploy/ironcache.example.toml) (run it with
@@ -344,10 +471,12 @@ In raft mode the cluster-bus port is `port + 10000` and the replication port is
 
 ## Benchmarks
 
-IronCache is built to be measured, not asserted. Two dated runs are recorded below: a
-**higher-core scaling run against the latest Redis 8.x** (the headline, where a
-thread-per-core design is meant to earn its keep), and an earlier **small-node
-(2-vCPU) worst-case** run. Baselines track the LATEST release of each engine, never a
+IronCache is built to be measured, not asserted. Four dated results are recorded
+below: a **higher-core scaling run against the latest Redis 8.x** (the headline,
+where a thread-per-core design is meant to earn its keep), a **pipelined
+pinned-core depth sweep** and an **index-memory measurement** (the two newest),
+and an earlier **small-node (2-vCPU) worst-case** run.
+Baselines track the LATEST release of each engine, never a
 distro-packaged older one (the version-pinned matrix is [docs/bench/COMPETITORS.md](docs/bench/COMPETITORS.md));
 Redis is compared at **8.x**, not 7.x.
 
@@ -399,6 +528,51 @@ multi-threaded Redis 8 (here Dragonfly is about 2x single-threaded Redis 8, not 
 honest nuance that remains: IronCache's baseline p99.9 TIES Dragonfly (~15ms) rather than
 beating it, and the durable-SAVE tail (291ms) is COMPETITIVE, not category-leading;
 IronCache's decisive edges are GET throughput, memory, and determinism.
+
+### Pipelined pinned-core depth sweep (dated 2026-07-13)
+
+**Setup.** The first non-virtualized, PIPELINED throughput sweep: a 16-core
+Graviton3 (c7g.4xlarge), the server pinned to 8 cores (8 shards, thread-per-core)
+and the load generator to the disjoint 8 over loopback, 128 connections, 90% GET,
+128-byte values, a 1M keyspace (zipf 0.99), sweeping the pipeline depth. Reproduced
+twice. "Single-endpoint" is one 8-shard process behind one port (the client's random
+keys hop to the owning shard); "zero-hop" is a cluster-aware load generator routing
+each key to its owning endpoint, the way real Redis Cluster client libraries route.
+
+| Pipeline depth | Single-endpoint (cross-shard hops) | Zero-hop (cluster-aware) |
+| ---: | ---: | ---: |
+| 1 | 256k | 291k |
+| 8 | 1.84M | 1.61M |
+| 16 | 1.44M | 2.98M |
+| 32 | 1.07M | **5.59M** |
+
+**How to read this (honestly).** Zero-hop scales MONOTONICALLY to **5.59M qps on 8
+cores** (~700k qps/core) at depth 32, 5.2x the single-endpoint figure at the same
+depth. Single-endpoint peaks at depth 8 and then CLIFFS; profiling shows that cliff
+is the intrinsic cross-shard hop machinery (coordinator drain loops, per-hop channel
+wakes), NOT an engine ceiling, and a cluster-aware client sidesteps all of it. That
+makes the deep-pipeline cliff a CLIENT-ROUTING artifact; server-side hop batching was
+analyzed and deliberately NOT pursued (it would trade the eager-hop overlap for
+uncertain savings). The same sweep also overturned an earlier io_uring reading: the
+io_uring datapath is **+189% at depth 32** once the load generator pipelines (the
+prior "~6% slower than tokio" was a non-pipelined-loadgen artifact). Lesson kept: a
+throughput verdict is meaningless without a pipelined load generator. The full
+record is in [docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md).
+
+### Index memory: flat bytes/key (dated 2026-07-15)
+
+The measurement behind the Dash-index default (see Architecture): an organic
+live-server sweep of `used_memory` per key across keycounts, both index arms.
+hashbrown (SwissTable) OSCILLATES over a ~7.7 B/key band, peaking right after its
+power-of-two doubling boundaries (112.5 to 115.8 B/key at the trough keycounts);
+the Dash index stays FLAT (108.3 to 110.2 B/key): parity at hashbrown's best
+points, **3.5 to 4.8% of TOTAL bytes better at the trough keycounts, never worse**.
+Throughput is PARITY across five independent paired rounds (-2.2 / +0.6 / -3.0 /
++0.2 / -0.2%), full-table iteration (the eviction/snapshot/flush walks) is 2.2x
+faster, and the accepted cost is a latent ~5% CPU-cycles premium (wider fingerprint
+scan, absorbed by higher IPC) that no realistic bottleneck profile surfaces as qps.
+The hashbrown arm stays CI-gated behind `hashbrown-index`, so the arms remain
+comparable and the flip reversible.
 
 ### Small-node (2-vCPU) worst case (dated 2026-06-21)
 

@@ -6,7 +6,8 @@
 
 image:
   repository: ghcr.io/elares/ironcache
-  # Pin to an immutable version tag in production (e.g. "v0.1.0"), NOT "latest".
+  # Pin to an immutable version tag in production (e.g. "0.1.0" -- the registry
+  # tag has NO leading "v"; the image CI strips it), NOT "latest".
   tag: "latest"
   pullPolicy: IfNotPresent
 # Image pull secrets for a private registry (GHCR private packages):
@@ -134,13 +135,16 @@ resources:
     # the configured maxmemory so eviction, not the OOM killer, reclaims memory.
     memory: "2Gi"
 
-# Extra IronCache config: any maxmemory / maxmemory-policy / log level overrides
+# Extra IronCache config: any maxmemory / maxmemory_policy / timeout overrides
 # flow in here and are appended to the rendered TOML verbatim. Keys are the REAL
-# TOML keys (maxmemory, maxmemory-policy, timeout, maxclients, output_buffer_limit,
-# databases, shards, log-level via the --log-level arg). Example:
+# TOML keys, underscore spelling (maxmemory, maxmemory_policy, timeout, maxclients,
+# output_buffer_limit, databases, shards; see KNOWN_TOML_KEYS in
+# crates/ironcache-config/src/lib.rs). The TOML parse is STRICT: a hyphen spelling
+# like maxmemory-policy fails the boot. Log level is not a TOML key; use logLevel
+# below (the --log-level arg). Example:
 #   extraConfig: |
 #     maxmemory = 1610612736
-#     maxmemory-policy = "allkeys-lru"
+#     maxmemory_policy = "allkeys-lru"
 extraConfig: ""
 
 # Log level passed as --log-level (error|warn|info|debug|trace).
