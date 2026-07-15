@@ -482,3 +482,30 @@ server change.
   OneShotFixed registered-buffer recv is ALREADY wired (`recv_batch`, in the +189% number);
   what remains is the multishot/BUF_RING tier (no per-read syscall), an uncertain 8-15% over
   OneShotFixed, io_uring-only. Colima-correctness + c7g-throughput iterated.
+
+## #285 DASH INDEX round (2026-07-15): memory thesis CONFIRMED, flip deferred on speed
+
+Stage 3 shipped behind a default-OFF `dashtable` feature (PRs #652/#653/#654: the
+explicit-hash key-in-object DashIndex + the two-import store seam + the dense inline
+segment layout, miri-clean, adversarially reviewed with executed probes). Both index arms
+run the full store + binary suites in CI (`index backends` job).
+
+MEMORY (organic live-server sweep, used_memory/key, 256 slot tables): hashbrown
+OSCILLATES over a 7.7 B/key band with peaks right after its per-slot doubling boundaries
+(112.5-115.8 at 115k/130k/230k/260k keys) while dash stays FLAT (108.3-110.2, a 1.9
+band): parity at hashbrown's best points, 3.5-4.8% of TOTAL bytes better at the troughs,
+never worse. The doubling-trough thesis is empirically CONFIRMED. memmodel (reserved)
+table bytes: parity (13.62/12.38/11.99 vs 13.46/12.32/11.64 int/embstr/raw).
+
+SPEED (16-core Graviton3, 8 shards pinned, 128 conns, 90% GET/128B/1M keys, 2 runs):
+depth 1 +1.3%, depth 8 -2.2%, depth 16 -2.6% vs hashbrown. Micro probe: 11.7ns vs 3.9ns
+hit (the branchless u64 fingerprint-mask scan over 64 slots vs hashbrown's 16-byte SIMD
+group at a hash-derived offset); iteration is 2.2x FASTER than hashbrown (the
+eviction/snapshot/flush shape).
+
+VERDICT (per #285's own bar, "must NOT regress the speed wins to gain memory"): the
+DEFAULT STAYS HASHBROWN; the dash arm stays a CI-gated evaluation flag. The identified
+closer is IN-SEGMENT BUCKETING (route within a segment by spare hash bits to a 16-slot
+bucket: scan width drops to hashbrown's own group size and the achievable load factor
+rises); re-run this round's A/B after that slice for the flip re-decision. Harnesses:
+benches/dashindex.rs, the organic sweep + memmodel + run.sh A/B (all reproducible).

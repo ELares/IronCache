@@ -182,6 +182,15 @@ extra per-entry metadata.
 
 ## Implementation plan (staged, gated)
 
+> STATUS (2026-07-15): stages 1-3 SHIPPED (PRs #652/#653/#654) -- the dense DashIndex is
+> wired behind the default-OFF `dashtable` feature with both arms CI-gated. The stage-4
+> measurement ran: the MEMORY win is confirmed (flat vs hashbrown's 7.7 B/key doubling
+> oscillation; 3.5-4.8% total at troughs, never worse) but pipelined throughput trails
+> 2.2-2.6%, so per this plan's own bar THE DEFAULT FLIP IS DEFERRED. Next slice:
+> in-segment bucketing (16-slot in-segment buckets cut the probe scan to hashbrown's
+> group width), then repeat the A/B. See OPTIMIZATION_LOG.md "#285 DASH INDEX round".
+
+
 The rewrite is too large and too perf-sensitive for one PR. Staged, each gated by
 the FULL suite + `miri` + the per-PR perf-gate + the pinned-Linux and DragonflyDB
 head-to-heads (`docs/bench/`), and each MUST NOT regress the current speed/latency
