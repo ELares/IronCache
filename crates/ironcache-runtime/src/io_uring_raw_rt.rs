@@ -45,7 +45,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
@@ -92,6 +92,10 @@ enum Lifecycle {
     /// The future was DROPPED before its CQE. Owns the op's buffer/resources so they outlive the
     /// in-flight kernel op; `complete` drops this (freeing the memory) when the CQE finally lands.
     Ignored(Box<dyn Any>),
+    /// Like `Ignored`, but the op's RESULT is a freshly-created fd (a cancelled `accept` that raced a
+    /// connection still yields a socket fd in its CQE). On completion `complete` closes that fd if it
+    /// is non-negative before dropping the owned resources -- otherwise the accepted socket would leak.
+    IgnoredCloseResultFd(Box<dyn Any>),
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +169,21 @@ impl Driver {
                 // owned resources HERE (this is the only place a cancelled op's buffer is freed) and
                 // free the slot. `_owned` drops at end of scope; overwrite the slot we just set.
                 self.ops.remove(idx);
+            }
+            Lifecycle::IgnoredCloseResultFd(_owned) => {
+                // A cancelled accept: if it still yielded a socket fd (res >= 0), close it before the
+                // owned sockaddr drops -- otherwise the accepted connection leaks.
+                let Lifecycle::Completed(entry) = self.ops.remove(idx) else {
+                    unreachable!("slot was just set to Completed")
+                };
+                let res = entry.result();
+                if res >= 0 {
+                    // SAFETY: `res` is a fresh, unowned socket fd the kernel just created for the
+                    // (cancelled) accept; closing it here is its sole disposition.
+                    unsafe {
+                        libc::close(res);
+                    }
+                }
             }
             // `Submitted`: the future polls later and takes the `Completed` we just stored.
             // `Completed`: two CQEs for one single-shot op -- impossible in P1; leave it stored.
@@ -253,6 +272,9 @@ struct OpFuture<B: 'static> {
     owned: Option<B>,
     /// Set once the result has been taken so `Drop` knows the slot is already freed.
     done: bool,
+    /// When this future is dropped in flight, whether its op's positive RESULT is a fresh fd the
+    /// cancel path must close (true only for `accept`, whose CQE may still carry an accepted socket).
+    close_result_fd_on_cancel: bool,
 }
 
 impl<B: 'static> OpFuture<B> {
@@ -260,6 +282,17 @@ impl<B: 'static> OpFuture<B> {
     /// that owns it until the CQE, so any pointer `sqe` carries into `owned` stays valid for the
     /// whole kernel op. Every op (recv/send/...) submits through here.
     fn submit(sqe: squeue::Entry, owned: B) -> Self {
+        Self::submit_inner(sqe, owned, false)
+    }
+
+    /// As [`Self::submit`], but on cancel-in-flight the op's positive result is treated as a socket
+    /// fd and closed (for `accept`: a cancelled accept can still yield a connection). See
+    /// [`Lifecycle::IgnoredCloseResultFd`].
+    fn submit_closing_result_fd(sqe: squeue::Entry, owned: B) -> Self {
+        Self::submit_inner(sqe, owned, true)
+    }
+
+    fn submit_inner(sqe: squeue::Entry, owned: B, close_result_fd_on_cancel: bool) -> Self {
         let idx = with_driver(|d| {
             let idx = d.ops.insert(Lifecycle::Submitted);
             let sqe = sqe.user_data(idx as u64);
@@ -281,6 +314,7 @@ impl<B: 'static> OpFuture<B> {
             idx,
             owned: Some(owned),
             done: false,
+            close_result_fd_on_cancel,
         }
     }
 }
@@ -326,7 +360,7 @@ impl<B: 'static + Unpin> Future for OpFuture<B> {
                     };
                     Poll::Ready((res, owned))
                 }
-                Lifecycle::Ignored(_) => {
+                Lifecycle::Ignored(_) | Lifecycle::IgnoredCloseResultFd(_) => {
                     unreachable!(
                         "a live future's slot is never Ignored (only its own Drop sets it)"
                     )
@@ -350,14 +384,33 @@ impl<B: 'static> Drop for OpFuture<B> {
                 return;
             };
             if let Lifecycle::Completed(_) = slot {
-                // The CQE already landed but we never polled it: drain + free the slot; `owned`
-                // drops here (the kernel is done -- the CQE proves it).
-                d.ops.remove(idx);
+                // The CQE already landed but we never polled it. If this op's result is an fd (a
+                // raced accept), close it before `owned` drops -- else the accepted socket leaks.
+                if self.close_result_fd_on_cancel {
+                    let Lifecycle::Completed(entry) = d.ops.remove(idx) else {
+                        unreachable!("slot matched Completed")
+                    };
+                    let res = entry.result();
+                    if res >= 0 {
+                        // SAFETY: `res` is a fresh, unowned socket fd from the completed accept;
+                        // closing it here is its sole disposition.
+                        unsafe {
+                            libc::close(res);
+                        }
+                    }
+                } else {
+                    // `owned` drops here (the kernel is done -- the CQE proves it).
+                    d.ops.remove(idx);
+                }
             } else {
                 // In flight (Submitted / Waiting): the kernel may still touch `owned`'s memory.
                 // MOVE `owned` into the slot so it outlives the op; free it when the CQE lands
                 // (`complete`'s Ignored arm). Best-effort cancel to hurry the CQE along.
-                *slot = Lifecycle::Ignored(Box::new(owned));
+                *slot = if self.close_result_fd_on_cancel {
+                    Lifecycle::IgnoredCloseResultFd(Box::new(owned))
+                } else {
+                    Lifecycle::Ignored(Box::new(owned))
+                };
                 let cancel = opcode::AsyncCancel::new(idx as u64)
                     .build()
                     .user_data(CANCEL_USER_DATA);
@@ -441,6 +494,121 @@ impl Drop for RawUringTcpListener {
 }
 
 // ---------------------------------------------------------------------------
+// Owned op payloads for accept/connect + small socket helpers.
+// ---------------------------------------------------------------------------
+
+/// The kernel-written peer address for a raw `accept`: the accept SQE points into `storage`/`len`,
+/// which the kernel fills as the op completes. Boxed by the op-future so its address stays stable
+/// while the op (and, on cancel, the `Ignored` slot) owns it.
+struct AcceptAddr {
+    storage: libc::sockaddr_storage,
+    len: libc::socklen_t,
+}
+
+impl AcceptAddr {
+    fn new() -> Self {
+        Self {
+            // SAFETY: `sockaddr_storage` is plain-old-data; an all-zero value is a valid placeholder
+            // the kernel overwrites during accept.
+            storage: unsafe { core::mem::zeroed() },
+            len: core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+        }
+    }
+
+    /// Parse the kernel-filled storage into a `SocketAddr` after the accept CQE lands. Only the IP
+    /// families are supported (the listener is a TCP socket); addresses/ports are read out of network
+    /// byte order.
+    fn to_socket_addr(&self) -> io::Result<SocketAddr> {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+        match i32::from(self.storage.ss_family) {
+            libc::AF_INET => {
+                // SAFETY: family AF_INET means the kernel wrote a valid `sockaddr_in` into `storage`.
+                let sin =
+                    unsafe { &*core::ptr::addr_of!(self.storage).cast::<libc::sockaddr_in>() };
+                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                Ok(SocketAddr::V4(SocketAddrV4::new(
+                    ip,
+                    u16::from_be(sin.sin_port),
+                )))
+            }
+            libc::AF_INET6 => {
+                // SAFETY: family AF_INET6 means the kernel wrote a valid `sockaddr_in6`.
+                let sin6 =
+                    unsafe { &*core::ptr::addr_of!(self.storage).cast::<libc::sockaddr_in6>() };
+                let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    ip,
+                    u16::from_be(sin6.sin6_port),
+                    sin6.sin6_flowinfo,
+                    sin6.sin6_scope_id,
+                )))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("accepted peer has unsupported address family {other}"),
+            )),
+        }
+    }
+}
+
+/// Owned state for a raw `connect`: the target address the connect SQE reads (stable heap storage)
+/// and the client socket, held here so a cancelled connect closes the socket only when its CQE lands
+/// -- never while the kernel's connect still references the fd.
+struct ConnectState {
+    storage: libc::sockaddr_storage,
+    len: libc::socklen_t,
+    sock: OwnedFd,
+}
+
+/// Serialize `addr` into a zeroed `sockaddr_storage`, returning the used length. Ports/addresses are
+/// written in network byte order (`to_be` / `octets`), matching what the kernel's connect expects.
+fn write_socket_addr(addr: SocketAddr, storage: &mut libc::sockaddr_storage) -> libc::socklen_t {
+    match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: `sockaddr_storage` is at least as large + aligned as `sockaddr_in`; we write
+            // only the `sockaddr_in` prefix of the zeroed storage.
+            let sin =
+                unsafe { &mut *core::ptr::addr_of_mut!(*storage).cast::<libc::sockaddr_in>() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: as above for the larger `sockaddr_in6`.
+            let sin6 =
+                unsafe { &mut *core::ptr::addr_of_mut!(*storage).cast::<libc::sockaddr_in6>() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_scope_id = v6.scope_id();
+            core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    }
+}
+
+/// Best-effort `TCP_NODELAY` on a raw fd -- the low-latency default the other backends set at accept
+/// and connect. Errors are ignored (a Nagle toggle failure is not fatal to the connection).
+fn set_nodelay_raw(fd: RawFd) {
+    let one: libc::c_int = 1;
+    // SAFETY: `fd` is a live connected socket; `setsockopt` reads `size_of::<c_int>` bytes at `&one`.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            core::ptr::addr_of!(one).cast::<libc::c_void>(),
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The Runtime impl.
 // ---------------------------------------------------------------------------
 
@@ -465,21 +633,60 @@ impl Runtime for RawIoUringRuntime {
 
     async fn accept(
         &self,
-        _listener: &Self::Listener,
+        listener: &Self::Listener,
     ) -> Result<(Self::Stream, SocketAddr), Self::Error> {
-        // The raw `Accept`/`Connect` op-futures are sub-slice 1b: this slice proves the reactor +
-        // owned-buffer recv/send + cancel-safety, driven by a std-adopted socket pair in the test.
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "raw io_uring accept is a following slice (#682 sub-slice 1b)",
-        ))
+        // The kernel writes the peer address into `owned.storage` and its length into `owned.len`
+        // during the op, so `owned` (a heap Box) must outlive the op -- exactly what `OpFuture`
+        // guarantees. `submit_closing_result_fd` ensures a CANCELLED accept that still produced a
+        // socket fd closes it rather than leaking (the fd rides the CQE, not `owned`).
+        let mut owned = Box::new(AcceptAddr::new());
+        let sa_ptr = core::ptr::addr_of_mut!(owned.storage).cast::<libc::sockaddr>();
+        let len_ptr = core::ptr::addr_of_mut!(owned.len);
+        // `SOCK_CLOEXEC`: the accepted DATA socket must not survive an `exec` (the streamed live
+        // cutover #391 re-execs the server); only the inherited listen fd should. The std/tokio
+        // siblings get this via `accept4(SOCK_CLOEXEC)`, and socket2 sets it on the connect socket.
+        let sqe = opcode::Accept::new(types::Fd(listener.fd), sa_ptr, len_ptr)
+            .flags(libc::SOCK_CLOEXEC)
+            .build();
+        let (res, owned) = OpFuture::submit_closing_result_fd(sqe, owned).await;
+        let fd = res?;
+        // Adopt the accepted fd into an OWNING stream BEFORE the fallible peer parse: if
+        // `to_socket_addr` errors (a non-IP family), the early return then closes the fd via the
+        // stream's Drop rather than leaking it. Match the other backends: disable Nagle.
+        let stream = RawUringTcpStream { fd };
+        let peer = owned.to_socket_addr()?;
+        set_nodelay_raw(stream.fd);
+        Ok((stream, peer))
     }
 
-    async fn connect(&self, _addr: SocketAddr) -> Result<Self::Stream, Self::Error> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "raw io_uring connect is a following slice (#682 sub-slice 1b)",
-        ))
+    async fn connect(&self, addr: SocketAddr) -> Result<Self::Stream, Self::Error> {
+        // Create the client socket up front and OWN it inside the op (`ConnectState.sock`): if the
+        // connect future is cancelled in flight, the socket closes only when the (cancelled) CQE
+        // lands, never while the kernel's connect still references it. The target address is likewise
+        // owned so the SQE's pointer into it stays valid for the whole op.
+        let domain = socket2::Domain::for_address(addr);
+        let sock =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        // Adopt the socket as an OwnedFd so it closes exactly once -- and, held inside `ConnectState`,
+        // only after the (possibly cancelled) connect's CQE lands.
+        // SAFETY: `into_raw_fd` transferred sole ownership of the socket fd to us.
+        let sock = unsafe { OwnedFd::from_raw_fd(sock.into_raw_fd()) };
+        let fd = sock.as_raw_fd();
+        let mut owned = Box::new(ConnectState {
+            storage: unsafe { core::mem::zeroed() },
+            len: 0,
+            sock,
+        });
+        owned.len = write_socket_addr(addr, &mut owned.storage);
+        let sa_ptr = core::ptr::addr_of!(owned.storage).cast::<libc::sockaddr>();
+        let sa_len = owned.len;
+        let sqe = opcode::Connect::new(types::Fd(fd), sa_ptr, sa_len).build();
+        let (res, owned) = OpFuture::submit(sqe, owned).await;
+        res?; // a successful connect completes with res == 0
+        // Transfer sole ownership of the connected fd from the op state to the stream.
+        let connected_fd = owned.sock.into_raw_fd();
+        set_nodelay_raw(connected_fd);
+        Ok(RawUringTcpStream { fd: connected_fd })
     }
 
     async fn recv(
@@ -654,7 +861,7 @@ pub fn raw_uring_start<F: Future>(fut: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawIoUringRuntime, RawUringTcpStream, raw_uring_start};
+    use super::{RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, raw_uring_start};
     use crate::Runtime;
     use std::io::{Read, Write};
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -811,5 +1018,77 @@ mod tests {
             tokio::task::yield_now().await;
         });
         // If control reaches here, teardown cancelled + drained the in-flight op with no hang/abort.
+    }
+
+    /// RAW accept + RAW connect end to end (sub-slice 1b): a raw `connect` op-future dials a raw
+    /// `accept` op-future on a real listener, concurrently on the SAME shard ring; then data
+    /// round-trips both directions over the accepted + connected sockets. Proves the kernel-written
+    /// peer address parses and both op payloads (sockaddr + owned socket) are handled correctly.
+    #[test]
+    fn accept_and_connect_round_trip() {
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let raw_listener = RawUringTcpListener::from_std(listener);
+
+            // Drive accept + connect concurrently: accept parks until the connect's SYN lands.
+            let (accepted, connected) = tokio::join!(rt.accept(&raw_listener), rt.connect(addr));
+            let (mut server, peer) = accepted.unwrap();
+            let mut client = connected.unwrap();
+            assert_eq!(
+                peer.ip(),
+                addr.ip(),
+                "accepted peer address parsed (loopback)"
+            );
+
+            // Client -> server.
+            let _ = rt.send(&mut client, b"PING".to_vec()).await.unwrap();
+            let r = rt.recv(&mut server, Vec::with_capacity(16)).await.unwrap();
+            assert_eq!(
+                &r.buf[..r.n],
+                b"PING",
+                "server received over the accepted socket"
+            );
+
+            // Server -> client.
+            let _ = rt.send(&mut server, b"PONG".to_vec()).await.unwrap();
+            let r2 = rt.recv(&mut client, Vec::with_capacity(16)).await.unwrap();
+            assert_eq!(
+                &r2.buf[..r2.n],
+                b"PONG",
+                "client received over the connected socket"
+            );
+        });
+    }
+
+    /// ACCEPT cancel-safety: a raw `accept` dropped before any client connects must free its owned
+    /// sockaddr cleanly (via `IgnoredCloseResultFd`) and leave the runtime intact -- a subsequent
+    /// real accept + connect on the SAME listener/runtime still works.
+    #[test]
+    fn accept_cancelled_before_connection_is_safe() {
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let raw_listener = RawUringTcpListener::from_std(listener);
+
+            // No client yet: the accept parks; a timeout drops it mid-flight (the cancel path).
+            let timed_out = tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                rt.accept(&raw_listener),
+            )
+            .await;
+            assert!(
+                timed_out.is_err(),
+                "accept with no client times out (future dropped mid-flight)"
+            );
+            rt.timer(std::time::Duration::from_millis(30)).await; // let the cancel CQE reap
+
+            // The listener + runtime survive: a real accept + connect still succeeds.
+            let (accepted, connected) = tokio::join!(rt.accept(&raw_listener), rt.connect(addr));
+            let (_server, _peer) = accepted.unwrap();
+            let _client = connected.unwrap();
+        });
     }
 }
