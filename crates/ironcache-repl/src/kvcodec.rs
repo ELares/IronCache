@@ -44,8 +44,8 @@ use ironcache_storage::{
     DataType, Encoding, EncodingThresholds, HashValue, ListValue, NewValueOwned, SetValue,
     UnixMillis, ZSetValue,
 };
-use ironcache_store::KvObj;
 use ironcache_store::kvobj::ValueRepr;
+use ironcache_store::{Entry, KvObj};
 
 /// The data-type wire tags (one byte). A stable on-wire enum, decoupled from the in-memory
 /// [`DataType`] discriminant so a reorder of that enum never silently changes the wire.
@@ -226,6 +226,42 @@ pub fn encode_kvobj(obj: &KvObj) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Encode a stored [`Entry`] directly into `out`, byte-identical to
+/// `out.extend_from_slice(&encode_kvobj(&entry.to_kvobj()))` -- but WITHOUT the intermediate
+/// [`KvObj`] deep-clone for the string family (#676 Phase 0). The snapshot persist thread reads
+/// EVERY frozen entry, and for the overwhelmingly common string case [`Entry::to_kvobj`] copies
+/// the key and value bytes into a fresh `KvObj` only to have them copied AGAIN here. A string
+/// `Entry` already holds its canonical key and value bytes contiguously in the frozen blob, so
+/// this reads them in place: one fewer full-keyspace copy on the bandwidth-bound persist path.
+///
+/// BYTE-IDENTICAL to the `encode_kvobj(to_kvobj)` path (asserted by the persist-crate parity
+/// test over every encoding), because:
+///   - type/enc tags: `to_kvobj` builds the header from `data_type()`/`encoding()`, and the
+///     `HASHTABLEEX` special case is Hash-only, so a string's `enc_byte` is exactly
+///     `enc_to_tag(encoding())`.
+///   - int strings: the blob stores the canonical decimal digits (`format_i64`), which are
+///     byte-for-byte what `encode_kvobj` re-emits via `n.to_string()`, so the value bytes match.
+///
+/// Collections keep the deep-clone path: their per-chunk clone is bounded and their element
+/// iteration is identical either way, so the string fast path is where the win lives.
+pub fn encode_entry_into(out: &mut Vec<u8>, entry: &Entry) {
+    if entry.is_collection() {
+        out.extend_from_slice(&encode_kvobj(&entry.to_kvobj()));
+        return;
+    }
+    out.push(type_to_tag(entry.data_type()));
+    out.push(enc_to_tag(entry.encoding()));
+    match entry.expire_at() {
+        Some(UnixMillis(ms)) => {
+            out.push(1);
+            out.extend_from_slice(&ms.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    put_bytes(out, entry.key());
+    put_bytes(out, entry.str_value_bytes());
 }
 
 // ---------------------------------------------------------------------------

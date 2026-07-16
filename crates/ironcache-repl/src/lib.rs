@@ -63,7 +63,7 @@ pub use frames::{
 };
 
 pub mod kvcodec;
-pub use kvcodec::{decode_kvobj, encode_kvobj};
+pub use kvcodec::{decode_kvobj, encode_entry_into, encode_kvobj};
 
 pub mod link;
 pub use link::{DEFAULT_HEARTBEAT, LinkEffects, LinkEvent, PrimaryLink, ReplState, ReplicaLink};
