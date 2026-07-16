@@ -623,6 +623,7 @@ dependencies = [
  "ironcache-env",
  "libc",
  "rustls-pki-types",
+ "slab",
  "socket2 0.6.4",
  "tokio",
  "tokio-rustls",

@@ -35,6 +35,12 @@ default = ["tokio", "tls"]
 tokio = ["dep:tokio", "dep:socket2"]
 tls = ["tokio", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap"]
 io_uring = ["tokio", "dep:tokio-uring", "dep:io-uring"]
+# The RAW io_uring backend (#682): a Runtime impl built DIRECTLY on the `io-uring` crate (NOT
+# tokio-uring), so it cross-builds for static-musl (where tokio-uring fails on libc statx types) and
+# can reach provided-buffer rings + multishot (#513). ADDITIVE + default-OFF + coexists with
+# `io_uring`: it introduces no alias and is not wired into serve in P1, so both features can be on.
+# Pulls tokio (for the current-thread runtime + AsyncFd readiness + timer/spawn), io-uring, and slab.
+io_uring_raw = ["tokio", "dep:io-uring", "dep:slab"]
 
 [dependencies]
 ironcache-env = { workspace = true }
@@ -84,6 +90,9 @@ libc = { workspace = true }
 # Raw io_uring bindings for the startup capability probe (see the `io_uring` feature note above +
 # `uring_probe`). Linux + opt-in only; already in the tree via tokio-uring.
 io-uring = { workspace = true, optional = true }
+# The in-flight-op Lifecycle table for the RAW io_uring backend (`io_uring_raw`, #682). Linux +
+# opt-in only; pure-Rust MIT, static-musl safe.
+slab = { workspace = true, optional = true }
 
 
 # `test-util` enables tokio's PAUSED-clock test harness (`start_paused`), used to fire the bounded
