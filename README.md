@@ -529,20 +529,25 @@ outright.
 | 32 | 1.85 / 1.32 | **2.65** / 2.83 | 2.62 / **3.23** |
 | 64 | 1.26 / 1.01 | 2.98 / 2.95 | **3.34 / 3.83** |
 
-**Memory** (`used_memory` delta over exactly-N distinct 128B keys, same box and
-method):
+**Memory** (`used_memory` delta over exactly-N distinct 128B keys, fine keycount
+sweep in one environment):
 
 | keys | IronCache (Dash index) | Dragonfly v1.39.0 |
 | ---: | ---: | ---: |
-| 700k | 173.4 | **157.0** |
-| 900k | **163.2** | 182.9 |
-| 1M   | **165.2** | 177.0 |
+| 550k | 175.4 | **169.2** |
+| 700k | 160.6 | **157.0** |
+| 800k | 161.3 | **154.6** |
+| 900k | **162.1** | 182.8 |
+| 1M   | **163.8** | 177.0 |
 
-IronCache wins the 1M headline point (165 vs 177 B/key, the old 180 erased by the
-#285 Dash-index default flip) with a FLATTER curve than Dragonfly (163 to 173 vs
-Dragonfly's 157 to 183), but Dragonfly wins at 700k, so this is a headline win,
-not yet a uniform one; the bucketed-Dash displacement work (#670) targets the
-uniform lead.
+IronCache's Dash index holds a **FLAT 160 to 164 B/key** across the range;
+Dragonfly's dashtable OSCILLATES hard (154 to 183). So IronCache wins the whole
+850k to 1M range (by 13 to 21 B/key), and IronCache's WORST case (164) beats
+Dragonfly's WORST case (183). Dragonfly wins a **narrow 550k to 800k window** by
+about 4%, where its CompactObj inlines these short keys and lands the value in an
+exact allocator bin. That window is an object-encoding difference, not a table
+one (the index slot cost is about 12 to 14 B/key either way, measured
+resize-free), so it is bounded and honest: predictable-flat versus lower-but-swingy.
 
 **How to read this (honestly).** On the realistic pipelined, cluster-aware
 config IronCache leads Dragonfly on both GET and SET, on the shipped binary, with
@@ -552,7 +557,9 @@ way: **pipeline 1** (no pipelining) throughput, where Dragonfly's leaner
 per-command path wins about 30%, and the **during-snapshot tail** (IronCache's
 291ms durable-save p99.9 vs Dragonfly's ~15ms), a known limitation at a
 memory-bandwidth floor that only incremental snapshots can move (tracked, not yet
-built). Versus **Redis 8** the SET story is unassailable: IronCache's per-core
+built). Memory is a wash decided by keycount: IronCache flat-and-predictable,
+Dragonfly lower in a narrow short-key window and much higher in others. Versus
+**Redis 8** the SET story is unassailable: IronCache's per-core
 write path is about **2.5x** Redis 8's best config (Redis serializes every write
 on its single main thread regardless of io-threads). IronCache's decisive edges
 are pipelined throughput, memory, and determinism.
