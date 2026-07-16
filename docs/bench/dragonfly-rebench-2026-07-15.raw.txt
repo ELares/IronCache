@@ -1,0 +1,61 @@
+DF_DIGEST: docker.dragonflydb.io/dragonflydb/dragonfly@sha256:0fa01a2b929e704c7a9300d23e7f52002ebd39e90996fb8bb63826aed92fa06f
+TP ic-tokio-r1 v=128 pipe=1 GET=887232.10 SET=873552.04
+TP ic-tokio-r1 v=128 pipe=16 GET=2257353.53 SET=2170961.69
+TP ic-tokio-r1 v=128 pipe=32 GET=1851566.38 SET=1326217.34
+TP ic-tokio-r1 v=128 pipe=64 GET=1253552.78 SET=1004685.47
+TP ic-tokio-r1 v=256 pipe=1 GET=893496.82 SET=877522.39
+TP ic-tokio-r1 v=256 pipe=16 GET=2138098.04 SET=2249361.53
+TP ic-tokio-r1 v=256 pipe=32 GET=1760794.75 SET=1340156.79
+TP ic-tokio-r1 v=256 pipe=64 GET=1246820.57 SET=1280257.14
+TP ic-uring-r1 v=128 pipe=1 GET=881646.23 SET=861748.69
+TP ic-uring-r1 v=128 pipe=16 GET=2820800.60 SET=2615210.18
+TP ic-uring-r1 v=128 pipe=32 GET=2682748.98 SET=2852852.73
+TP ic-uring-r1 v=128 pipe=64 GET=3010472.35 SET=2964098.85
+TP ic-uring-r1 v=256 pipe=1 GET=876571.52 SET=849795.10
+TP ic-uring-r1 v=256 pipe=16 GET=2142363.15 SET=2622516.29
+TP ic-uring-r1 v=256 pipe=32 GET=2605709.85 SET=2835505.71
+TP ic-uring-r1 v=256 pipe=64 GET=2926427.73 SET=2758245.84
+TP df-1.39.0-r1 v=128 pipe=1 GET=961752.96 SET=953856.77
+TP df-1.39.0-r1 v=128 pipe=16 GET=2485928.79 SET=2524983.94
+TP df-1.39.0-r1 v=128 pipe=32 GET=2605281.16 SET=3207714.60
+TP df-1.39.0-r1 v=128 pipe=64 GET=3323601.33 SET=3796363.63
+TP df-1.39.0-r1 v=256 pipe=1 GET=956212.27 SET=916322.29
+TP df-1.39.0-r1 v=256 pipe=16 GET=1092275.15 SET=2362930.17
+TP df-1.39.0-r1 v=256 pipe=32 GET=1134448.07 SET=2996214.58
+TP df-1.39.0-r1 v=256 pipe=64 GET=1132633.87 SET=2984337.99
+TP ic-tokio-r2 v=128 pipe=1 GET=887099.29 SET=873593.56
+TP ic-tokio-r2 v=128 pipe=16 GET=2194673.60 SET=2140654.39
+TP ic-tokio-r2 v=128 pipe=32 GET=1842935.46 SET=1321550.53
+TP ic-tokio-r2 v=128 pipe=64 GET=1262571.95 SET=1009628.42
+TP ic-tokio-r2 v=256 pipe=1 GET=892484.64 SET=874778.42
+TP ic-tokio-r2 v=256 pipe=16 GET=2129591.84 SET=2238879.39
+TP ic-tokio-r2 v=256 pipe=32 GET=1723610.07 SET=1340455.72
+TP ic-tokio-r2 v=256 pipe=64 GET=1260858.78 SET=1250402.52
+TP ic-uring-r2 v=128 pipe=1 GET=882441.84 SET=852723.62
+TP ic-uring-r2 v=128 pipe=16 GET=2808415.36 SET=2586319.36
+TP ic-uring-r2 v=128 pipe=32 GET=2626875.27 SET=2809474.20
+TP ic-uring-r2 v=128 pipe=64 GET=2951409.64 SET=2939052.49
+TP ic-uring-r2 v=256 pipe=1 GET=864241.72 SET=841367.16
+TP ic-uring-r2 v=256 pipe=16 GET=2132843.74 SET=2588983.73
+TP ic-uring-r2 v=256 pipe=32 GET=2587517.84 SET=2824362.72
+TP ic-uring-r2 v=256 pipe=64 GET=2915382.64 SET=2754727.49
+TP df-1.39.0-r2 v=128 pipe=1 GET=964031.43 SET=954183.44
+TP df-1.39.0-r2 v=128 pipe=16 GET=2509406.06 SET=2557016.64
+TP df-1.39.0-r2 v=128 pipe=32 GET=2628540.94 SET=3256672.47
+TP df-1.39.0-r2 v=128 pipe=64 GET=3355008.82 SET=3857357.04
+TP df-1.39.0-r2 v=256 pipe=1 GET=961322.43 SET=911013.83
+TP df-1.39.0-r2 v=256 pipe=16 GET=1094957.15 SET=2388630.94
+TP df-1.39.0-r2 v=256 pipe=32 GET=1135968.80 SET=3026126.39
+TP df-1.39.0-r2 v=256 pipe=64 GET=1129724.26 SET=2992007.04
+MEM ic-tokio (dash default) N=700000 used_delta=121393096 bytes_per_key=173.42
+MEM ic-tokio (dash default) N=900000 used_delta=146857024 bytes_per_key=163.17
+MEM ic-tokio (dash default) N=1000000 used_delta=165211192 bytes_per_key=165.21
+TAIL ic-tokio Sets        49715.86          ---          ---         0.20223         0.18300         0.30300         0.31900      8490.67 
+TAIL ic-tokio Gets       447419.69    447419.69         0.00         0.20105         0.18300         0.29500         0.31900     74230.41 
+TAIL ic-tokio Totals     497135.55    447419.69         0.00         0.20117         0.18300         0.29500         0.31900     82721.08 
+TAIL df-1.39.0 Sets        49998.71          ---          ---         0.20117         0.18300         0.29500         0.31900      8538.97 
+TAIL df-1.39.0 Gets       449966.95    449966.95         0.00         0.19992         0.18300         0.29500         0.31900     74653.01 
+TAIL df-1.39.0 Totals     499965.65    449966.95         0.00         0.20005         0.18300         0.29500         0.31900     83191.98 
+MEM df-1.39.0 N=700000 dbsize=700000 used_delta=109864960 bytes_per_key=156.95
+MEM df-1.39.0 N=900000 dbsize=900000 used_delta=164615168 bytes_per_key=182.91
+MEM df-1.39.0 N=1000000 dbsize=1000000 used_delta=177027584 bytes_per_key=177.03
