@@ -228,6 +228,10 @@ pub struct ShardDumpBuilder {
     body: Vec<u8>,
     /// The live keys recorded so far (across all of this shard's databases).
     keys: u64,
+    /// A REUSED per-entry encode buffer (#676 Phase 0): [`Self::push_entry`] encodes each entry
+    /// into this and copies it into `body`, so the persist thread makes no fresh per-entry `Vec`
+    /// allocation. `clear()` between entries keeps the one grown allocation.
+    scratch: Vec<u8>,
 }
 
 impl ShardDumpBuilder {
@@ -251,17 +255,19 @@ impl ShardDumpBuilder {
     }
 
     /// APPEND one stored [`Entry`] (read directly from a [`FrozenSlot`]) as a db-tagged
-    /// record, the #576 off-thread FREEZE path's analogue of [`Self::push_chunk`]. It
-    /// reconstructs the owned [`ironcache_store::KvObj`] from the entry with
-    /// [`Entry::to_kvobj`] (the deep-clone the persist thread does OFF the serving core, so
-    /// the shard pays NO O(N) copy) and encodes it with the same reused
-    /// [`ironcache_repl::encode_kvobj`] codec, yielding a record byte-identical to the one
-    /// `push_chunk` would produce for the same key. The caller applies the lazy-expiry skip
-    /// (a logically-dead entry is not pushed).
+    /// record, the #576 off-thread FREEZE path's analogue of [`Self::push_chunk`]. It encodes
+    /// the entry with [`ironcache_repl::encode_entry_into`], which for the common string family
+    /// reads the frozen blob's key + value bytes IN PLACE (no intermediate
+    /// [`ironcache_store::KvObj`] deep-clone), and for collections keeps the bounded per-entry
+    /// clone. The record is byte-identical to the `encode_kvobj(to_kvobj)` one `push_chunk`
+    /// produces for the same key (asserted by the parity test), so the sealed file and its CRC
+    /// are unchanged. Halving the per-entry copy matters because the persist thread's
+    /// full-keyspace read is the memory-bandwidth-bound cost behind the during-snapshot tail
+    /// (#676). The caller applies the lazy-expiry skip (a logically-dead entry is not pushed).
     pub fn push_entry(&mut self, db: u32, entry: &Entry) {
-        let kv = entry.to_kvobj();
-        let encoded = ironcache_repl::encode_kvobj(&kv);
-        format::put_record(&mut self.body, db, &encoded);
+        self.scratch.clear();
+        ironcache_repl::encode_entry_into(&mut self.scratch, entry);
+        format::put_record(&mut self.body, db, &self.scratch);
         self.keys += 1;
     }
 
@@ -660,6 +666,134 @@ mod tests {
         );
         store.insert_object(1, KvObj::from_bytes(b"db1-str", b"hello db1", None));
         6
+    }
+
+    /// #676 Phase 0 correctness gate: [`ironcache_repl::encode_entry_into`] (the direct,
+    /// no-`KvObj`-clone path `push_entry` now uses) MUST be byte-identical to the prior
+    /// `encode_kvobj(&entry.to_kvobj())` for EVERY encoding, across the string family (the fast
+    /// path) AND collections (the fallback). Any drift would silently change the on-disk snapshot
+    /// bytes and their manifest CRC and diverge from the replication codec, so this asserts exact
+    /// equality over a frozen keyspace covering every case.
+    #[test]
+    #[allow(clippy::too_many_lines)] // a flat battery of insert cases; splitting hurts readability
+    fn encode_entry_into_is_byte_identical_to_encode_kvobj() {
+        let th = EncodingThresholds::defaults();
+        let mut store: TestStore = ShardStore::new(2);
+        // Strings of every encoding, plus the edge cases the fast path must get exactly right.
+        store.insert_object(0, KvObj::from_bytes(b"int", b"12345", None));
+        store.insert_object(0, KvObj::from_bytes(b"int-neg", b"-42", None));
+        store.insert_object(0, KvObj::from_bytes(b"int-zero", b"0", None));
+        // i64 boundary ints: format_i64's i128-negation / u64-magnitude parse is the trickiest
+        // part of the canonical-digit invariant the fast path leans on (review LOW finding).
+        store.insert_object(
+            0,
+            KvObj::from_bytes(b"int-min", b"-9223372036854775808", None),
+        );
+        store.insert_object(
+            0,
+            KvObj::from_bytes(b"int-max", b"9223372036854775807", None),
+        );
+        store.insert_object(0, KvObj::from_bytes(b"emb", b"short string", None));
+        store.insert_object(0, KvObj::from_bytes(b"raw", &vec![b'x'; 1024], None));
+        store.insert_object(0, KvObj::from_bytes(b"empty", b"", None));
+        store.insert_object(0, KvObj::from_bytes(b"binkey\0\xff", b"\x00\x01\xfe", None));
+        store.insert_object(
+            0,
+            KvObj::from_bytes(b"ttl", b"v", Some(UnixMillis(10_000_000))),
+        );
+        // A TTL'd INT: the fast path's most common numeric-with-expiry shape, exercising the
+        // ttl marker AND the canonical-digit value together (review LOW finding).
+        store.insert_object(
+            0,
+            KvObj::from_bytes(b"ttlint", b"98765", Some(UnixMillis(9_000_000))),
+        );
+        // Collections (the deep-clone fallback branch): one of each type, INCLUDING an intset set
+        // (numeric members) and a field-TTL hash (the HASHTABLEEX enc tag the invariant relies on
+        // being Hash-only) so the enc-tag surface is byte-checked, not just asserted in prose.
+        store.insert_object(
+            1,
+            KvObj::from_new_owned(
+                b"hash",
+                NewValueOwned::hash(vec![
+                    (b"f1".to_vec(), b"v1".to_vec()),
+                    (b"f2".to_vec(), b"v2".to_vec()),
+                ]),
+                None,
+                &th,
+            ),
+        );
+        store.insert_object(
+            1,
+            KvObj::from_new_owned(
+                b"list",
+                NewValueOwned::list(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
+                None,
+                &th,
+            ),
+        );
+        store.insert_object(
+            1,
+            KvObj::from_new_owned(
+                b"set",
+                NewValueOwned::set(vec![b"m1".to_vec(), b"m2".to_vec()]),
+                None,
+                &th,
+            ),
+        );
+        store.insert_object(
+            1,
+            KvObj::from_new_owned(
+                b"zset",
+                NewValueOwned::zset(vec![(b"m1".to_vec(), 1.5), (b"m2".to_vec(), 2.0)]),
+                None,
+                &th,
+            ),
+        );
+        store.insert_object(
+            1,
+            KvObj::from_new_owned(
+                b"intset",
+                NewValueOwned::set(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]),
+                None,
+                &th,
+            ),
+        );
+        store.insert_object(
+            1,
+            KvObj::from_new_owned(
+                b"hash-ex",
+                NewValueOwned::hash_ex(
+                    vec![
+                        (b"f1".to_vec(), b"v1".to_vec()),
+                        (b"f2".to_vec(), b"v2".to_vec()),
+                    ],
+                    vec![(b"f1".to_vec(), UnixMillis(12_000_000))],
+                ),
+                None,
+                &th,
+            ),
+        );
+
+        let frozen = store.begin_save();
+        let mut checked = 0usize;
+        for slot in &frozen {
+            for entry in slot.entries() {
+                let mut direct = Vec::new();
+                ironcache_repl::encode_entry_into(&mut direct, entry);
+                let via_kvobj = ironcache_repl::encode_kvobj(&entry.to_kvobj());
+                assert_eq!(
+                    direct,
+                    via_kvobj,
+                    "encode_entry_into diverged from encode_kvobj for key {:?}",
+                    entry.key()
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 17,
+            "expected all 17 inserted entries frozen and checked"
+        );
     }
 
     #[test]
