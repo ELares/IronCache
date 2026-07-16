@@ -626,15 +626,38 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
     println!("ironcache check: configuration OK");
     println!("  bind        = {}:{}", cfg.bind, cfg.port);
     println!("  shards      = {}", cfg.shards);
-    // The per-shard runtime backend (PROD-10 / #28). `io_uring` is honored only on a Linux build
-    // with the `io_uring` feature + TLS off; otherwise the boot falls back to tokio (logged then).
-    println!(
-        "  runtime     = {}",
-        match cfg.runtime {
-            ironcache_config::RuntimeBackend::Tokio => "tokio",
-            ironcache_config::RuntimeBackend::IoUring => "io_uring (Linux + feature + plaintext)",
+    // The per-shard runtime backend (PROD-10 / #28), reported as the EFFECTIVE runtime this binary
+    // + kernel will actually use -- not just the config request. io_uring is honored only on a Linux
+    // io_uring-feature build with TLS off AND a kernel that provides io_uring (PROBED here, the same
+    // gate the boot selection uses); every other case serves on tokio. Reporting the request alone
+    // misled operators into believing a non-io_uring binary (or an incapable kernel) was on io_uring.
+    let runtime_desc: String = match cfg.runtime {
+        ironcache_config::RuntimeBackend::Tokio => "tokio".to_owned(),
+        ironcache_config::RuntimeBackend::IoUring if cfg.tls == ironcache_config::TlsMode::On => {
+            "io_uring requested -> tokio (TLS is on; the io_uring datapath is plaintext-only in v1)"
+                .to_owned()
         }
-    );
+        ironcache_config::RuntimeBackend::IoUring => {
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            {
+                match ironcache_runtime::uring_probe::probe_uring_caps() {
+                    Ok(_) => {
+                        "io_uring (Linux, io_uring feature, TLS off, kernel-capable)".to_owned()
+                    }
+                    Err(e) => format!(
+                        "io_uring requested -> tokio (this kernel cannot provide io_uring: {e})"
+                    ),
+                }
+            }
+            #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+            {
+                "io_uring requested -> tokio (this binary is not a Linux build with the io_uring \
+                 feature)"
+                    .to_owned()
+            }
+        }
+    };
+    println!("  runtime     = {runtime_desc}");
     println!("  databases   = {}", cfg.databases);
     // The dedicated persist core (#589): report the effective knob (empty = off / no pin).
     println!(
