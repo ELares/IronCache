@@ -327,8 +327,11 @@ from-source:
   `runtime = "io_uring"`). It is honored only on a Linux build with the feature and
   TLS off; in every other case (feature absent, non-Linux, TLS on) the boot LOGS a
   one-line fallback and serves on tokio, never failing to start. It is NOT in the
-  published release binaries, and its measured wins are on PIPELINED workloads
-  (+189% at pipeline depth 32; see [Benchmarks](#benchmarks)).
+  published release binaries, and its measured wins are on PIPELINED workloads:
+  it ELIMINATES tokio's single-endpoint deep-pipeline cliff (+187% at pipeline
+  depth 32, artifact in
+  [docs/bench/IOURING_DATAPATH_BENCH.md](docs/bench/IOURING_DATAPATH_BENCH.md)),
+  at the cost of about 8% at pipeline 1 (no pipelining).
 - **`hugepages`**: backs the store tables and value blobs with transparent huge
   pages by appending `thp:always,metadata_thp:auto` to the baked-in jemalloc
   `malloc_conf`. The same behavior is available at RUNTIME on any binary (including
