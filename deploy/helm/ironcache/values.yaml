@@ -92,6 +92,9 @@ clusterTls:
   # an existing Secret with keys cluster.crt / cluster.key / cluster.ca.
   cert: ""
   key: ""
+  # The peer-verification CA. Leave EMPTY to use the self-signed cluster cert as its own
+  # CA (the chart then writes cluster.ca = cert); set it to a distinct CA PEM for a stricter
+  # external-PKI trust chain.
   ca: ""
   existingSecret: ""
 

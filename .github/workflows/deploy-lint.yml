@@ -62,7 +62,12 @@ jobs:
           set -euo pipefail
           # -ignore-missing-schemas skips CRDs (ServiceMonitor) that have no core
           # schema; -strict rejects unknown fields in the core resources.
-          for extra in "" "--set console.enabled=true --set console.replicas=2"; do
+          # The clusterTls variant renders the self-signed-cert-as-own-CA path (clusterTls.enabled
+          # with an EMPTY clusterTls.ca): the StatefulSet mounts cluster.ca + points
+          # IRONCACHE_CLUSTER_CA_PATH at it, so the Secret must emit cluster.ca (defaulted to the
+          # cert). #660 shipped that; this variant guards the regression.
+          cluster_tls_set="--set cluster.enabled=true --set clusterTls.enabled=true --set clusterTls.cert=DUMMYCERT --set clusterTls.key=DUMMYKEY"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
@@ -72,13 +77,22 @@ jobs:
               | kubeconform -strict -summary -verbose \
                   -ignore-missing-schemas \
                   -kubernetes-version "${KUBE_VERSION}"
-            if [ -n "$extra" ]; then
-              # Guard against a broken `console.enabled` gate silently rendering
-              # nothing (kubeconform is happy with zero console objects, so assert
-              # the console Deployment/Service actually appeared).
-              printf '%s\n' "$rendered" | grep -q "ic-ironcache-console" \
-                || { echo "ERROR: console.enabled=true rendered no console resources"; exit 1; }
-            fi
+            case "$extra" in
+              *console.enabled=true*)
+                # Guard against a broken `console.enabled` gate silently rendering
+                # nothing (kubeconform is happy with zero console objects, so assert
+                # the console Deployment/Service actually appeared).
+                printf '%s\n' "$rendered" | grep -q "ic-ironcache-console" \
+                  || { echo "ERROR: console.enabled=true rendered no console resources"; exit 1; }
+                ;;
+              *clusterTls.enabled=true*)
+                # #660: with clusterTls on and an empty ca, the Secret must still emit cluster.ca
+                # (defaulted to the cert), or the StatefulSet mounts a missing key and the pod
+                # fails at start. Assert the key is present in the rendered Secret.
+                printf '%s\n' "$rendered" | grep -q "cluster.ca:" \
+                  || { echo "ERROR: clusterTls.enabled rendered no cluster.ca Secret key"; exit 1; }
+                ;;
+            esac
             echo "::endgroup::"
           done
 
