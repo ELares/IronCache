@@ -210,7 +210,9 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     // non-runtime-CONFIG layer. `None` (the no-flag default) leaves the lower layers showing through.
     let cli_runtime = match cli.runtime.as_deref() {
         Some(tok) => Some(ironcache_config::parse_runtime_backend(tok).ok_or_else(|| {
-            anyhow::anyhow!("--runtime: not a runtime backend (expected tokio/io_uring): {tok}")
+            anyhow::anyhow!(
+                "--runtime: not a runtime backend (expected tokio / io_uring / io_uring_raw): {tok}"
+            )
         })?),
         None => None,
     };
