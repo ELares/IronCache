@@ -233,6 +233,43 @@ pub async fn recv_batch(
     Ok(res.n)
 }
 
+/// Send a complete reply batch, staging it through this shard's REGISTERED fixed buffer when the
+/// kernel selected a registered-buffer datapath AND the reply fits one buffer, else the owned send:
+/// the OneShotFixed WRITE tier, the reply-side analogue of [`recv_batch`]. It is the missing half of
+/// the OneShotFixed win -- [`recv_fixed`] already lands reads in the pre-registered slab, but replies
+/// were flushed via the owned [`IoUringRuntime::send`], which pins the reply buffer with the kernel
+/// per write. Staging through a pre-registered buffer removes that per-send pin (one memcpy into the
+/// slab replaces the per-write registration).
+///
+/// BEHAVIOR-PRESERVING: the output is byte-identical either way ([`send_fixed`] writes EXACTLY
+/// `data.len()` bytes; the stale-`init_len` hazard is handled there and regression-tested). It takes
+/// the owned buffer and hands it BACK for reuse exactly like [`IoUringRuntime::send`], so the fixed
+/// path adds no allocation and the owned fallback reuses the SAME buffer with no extra copy. A reply
+/// larger than one fixed buffer (`> ring.buf_size()`), or a momentarily drained slab, transparently
+/// falls back to the owned send.
+///
+/// # Errors
+///
+/// Returns the underlying `io::Error` from the write (a dead/broken peer); the caller closes.
+pub async fn send_batch(
+    rt: &IoUringRuntime,
+    stream: &mut TcpStream,
+    data: Vec<u8>,
+) -> io::Result<Vec<u8>> {
+    if let Some(ring) = shard_fixed_ring() {
+        match send_fixed(stream, &ring, &data).await {
+            // Fixed write done: hand the reply buffer back so the serve loop reuses its allocation.
+            Some(Ok(())) => return Ok(data),
+            Some(Err(e)) => return Err(e),
+            // Oversize (> one fixed buffer) or drained slab: fall through to the owned send with the
+            // SAME buffer (no extra allocation/copy), rather than staging.
+            None => {}
+        }
+    }
+    // Owned datapath (or fixed fall-back): the owned-buffer write, which hands the buffer back.
+    rt.send(stream, data).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FixedRing, recv_batch, recv_fixed, send_fixed};
@@ -479,6 +516,62 @@ mod tests {
             assert!(ring.checkout().is_none(), "drained -> back-pressure");
             drop(a); // returning a buffer lifts back-pressure
             assert!(ring.checkout().is_some(), "a returned buffer is reusable");
+        });
+    }
+
+    /// `send_batch` (the OneShotFixed WRITE tier wired into the serve loop) round-trips
+    /// byte-identical output whether the reply takes the REGISTERED fixed path (fits one buffer) or
+    /// the owned fall-back (oversize `> FIXED_RING_BUF_SIZE`), and hands the buffer back for reuse.
+    /// It runs this shard's resolved datapath (probe + register, or owned) on the running kernel;
+    /// either path must satisfy the exact byte-for-byte flush contract the serve loop depends on.
+    #[test]
+    fn send_batch_round_trips_small_and_oversize_byte_identical() {
+        use super::send_batch;
+        tokio_uring::start(async {
+            let std_listener =
+                tokio_rt::bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = std_listener.local_addr().unwrap();
+            let listener = TcpListener::from_std(std_listener);
+
+            // A small reply (the fixed path when a ring resolves) and an oversize reply
+            // (`> FIXED_RING_BUF_SIZE`, forcing the owned fall-back INSIDE send_batch).
+            let small = b"+PONG\r\n".to_vec();
+            let big = vec![b'y'; super::FIXED_RING_BUF_SIZE + 100];
+            let (small_c, big_c) = (small.clone(), big.clone());
+
+            let server = tokio_uring::spawn(async move {
+                let rt = IoUringRuntime::new();
+                let (mut stream, _peer) = rt.accept(&listener).await.unwrap();
+                // The returned buffer is handed back for reuse (like the owned send).
+                let reused = send_batch(&rt, &mut stream, small_c).await.unwrap();
+                assert_eq!(
+                    reused, b"+PONG\r\n",
+                    "send_batch hands the buffer back unmodified"
+                );
+                send_batch(&rt, &mut stream, big_c).await.unwrap();
+            });
+
+            let client = IoUringRuntime::new();
+            let mut peer = client.connect(addr).await.unwrap();
+            let want = small.len() + big.len();
+            let mut got = Vec::with_capacity(want);
+            while got.len() < want {
+                let res = client
+                    .recv(&mut peer, Vec::with_capacity(want - got.len()))
+                    .await
+                    .unwrap();
+                if res.n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&res.buf[..res.n]);
+            }
+            let mut expect = small.clone();
+            expect.extend_from_slice(&big);
+            assert_eq!(
+                got, expect,
+                "send_batch output must be byte-identical across the fixed + owned paths"
+            );
+            server.await.unwrap();
         });
     }
 }

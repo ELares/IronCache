@@ -2847,7 +2847,10 @@ async fn serve_connection_uring(
 
         if !out.is_empty() {
             let sent = out.len();
-            match rt.send(&mut stream, std::mem::take(&mut out)).await {
+            // OneShotFixed WRITE tier (#284): stage the reply through this shard's REGISTERED
+            // fixed buffer when one is free and the reply fits, else the owned send. Byte-identical
+            // output; hands the buffer back for reuse exactly like the owned `rt.send` did.
+            match ironcache_runtime::send_batch(&rt, &mut stream, std::mem::take(&mut out)).await {
                 Ok(returned) => {
                     out = returned;
                     // #527: net output for the io_uring batch flush (one relaxed atomic add).
