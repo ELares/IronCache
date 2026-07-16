@@ -57,7 +57,8 @@ use tokio::io::unix::AsyncFd;
 const READ_WINDOW: usize = 16 * 1024;
 
 /// The submission-queue depth per shard ring. 256 in-flight SQEs is generous for one shard's
-/// connection fan-out; the CQ is sized to twice this (below) to blunt completion-queue overflow.
+/// connection fan-out; the CQ is sized to 4x this (in `raw_uring_start`) so a mass-drop burst (each
+/// op's own CQE plus its cancel's CQE) has headroom before the kernel's overflow backlog engages.
 const SQ_ENTRIES: u32 = 256;
 
 /// A reserved `user_data` for best-effort `AsyncCancel` CQEs (a cancelled op's cancellation request):
@@ -145,6 +146,13 @@ impl Driver {
     }
 
     /// Transition the slab slot for a landed CQE.
+    ///
+    /// P3 PREREQUISITE (multishot, #513): `user_data == slab index`, and slab indices are REUSED
+    /// after `remove`. In P1 every op is single-shot -- exactly one CQE per index, and the slot is
+    /// not freed until that CQE lands -- so an index cannot alias a live op. Multishot recv produces
+    /// MANY CQEs per `user_data`; before wiring it, `user_data` must carry a generation/epoch tag
+    /// (e.g. `idx | (gen << 32)`) so a stale CQE for a freed op is detected and dropped here rather
+    /// than mutating a since-reused slot.
     fn complete(&mut self, idx: usize, cqe: cqueue::Entry) {
         let Some(slot) = self.ops.get_mut(idx) else {
             return; // a stale/duplicate completion for a freed slot: single-shot ops free on their
@@ -161,6 +169,56 @@ impl Driver {
             // `Submitted`: the future polls later and takes the `Completed` we just stored.
             // `Completed`: two CQEs for one single-shot op -- impossible in P1; leave it stored.
             Lifecycle::Submitted | Lifecycle::Completed(_) => {}
+        }
+    }
+}
+
+impl Drop for Driver {
+    /// Drain in-flight ops to QUIESCENCE before the ring fd and the `Ignored` buffers are freed.
+    ///
+    /// This is the teardown half of the cancel-safety invariant. During operation, a dropped-in-
+    /// flight op's buffer lives in `Lifecycle::Ignored` until its CQE lands. At shutdown, if the
+    /// ring fd were simply closed and `ops` dropped while an op is still in flight, the kernel's
+    /// async release could touch a buffer we just freed (use-after-free), and any un-submitted
+    /// cancel/read SQE would strand its `Ignored` buffer. So here -- with the tokio runtime already
+    /// gone, on the shutdown path where blocking is fine -- we cancel every outstanding op and reap
+    /// every CQE before the fields drop. Bounded so a wedged kernel op cannot hang shutdown forever.
+    ///
+    /// By the time this runs (see `raw_uring_start`'s teardown), all op-FUTURES have already dropped,
+    /// so every remaining slab slot is `Ignored`; each just needs its (cancelled) CQE reaped.
+    fn drop(&mut self) {
+        // Cancel everything still outstanding so no op can block the drain waiting on data that will
+        // never come (e.g. a recv parked on an idle socket). Re-pushing a cancel for an op that
+        // already had one (from `OpFuture::drop`) is harmless: the duplicate completes -ENOENT and
+        // routes to `CANCEL_USER_DATA` (discarded).
+        let pending: Vec<usize> = self.ops.iter().map(|(idx, _)| idx).collect();
+        for idx in pending {
+            let cancel = opcode::AsyncCancel::new(idx as u64)
+                .build()
+                .user_data(CANCEL_USER_DATA);
+            // SAFETY: AsyncCancel references no user buffer (only a user_data key), so it is always
+            // valid to submit. On a full SQ, submit to make room and retry once.
+            if unsafe { self.ring.submission().push(&cancel) }.is_err() {
+                let _ = self.ring.submit();
+                let _ = unsafe { self.ring.submission().push(&cancel) };
+            }
+        }
+        // Reap to quiescence. `submit_and_wait(1)` submits the queued cancels (and any still-queued
+        // original SQEs) and blocks for at least one CQE; `dispatch_completions` frees each `Ignored`
+        // slot on its CQE. The idle-round bound is a paranoia backstop against a slot that never
+        // completes -- it caps shutdown work rather than risking an unbounded hang.
+        let mut idle_rounds = 0u32;
+        while !self.ops.is_empty() && idle_rounds < 4096 {
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(_) => break, // cannot make progress on the ring; stop rather than spin
+            }
+            if self.dispatch_completions() == 0 {
+                idle_rounds += 1;
+            } else {
+                idle_rounds = 0;
+            }
         }
     }
 }
@@ -518,8 +576,14 @@ impl Runtime for RawIoUringRuntime {
 /// the boot-selection layer probes first (see `crate::uring_probe`) so a real deployment never
 /// reaches here on an incapable kernel.
 pub fn raw_uring_start<F: Future>(fut: F) -> F::Output {
+    // Default (IRQ-driven) ring: completions raise the ring fd's epoll readiness, which is what the
+    // `AsyncFd` drain relies on. Do NOT set `IORING_SETUP_IOPOLL` here -- that switches to busy-poll
+    // completions with no fd wakeup, which would silently hang every op (the fd never goes readable).
+    // The CQ is sized 4x the SQ so a mass-drop burst (every op's own CQE PLUS its cancel's CQE) has
+    // headroom before the kernel's overflow backlog engages. Bounding in-flight ops to the CQ (so the
+    // backlog is never needed) is a P2 prerequisite when the serve loop sets the per-shard conn cap.
     let ring = IoUring::builder()
-        .setup_cqsize(SQ_ENTRIES * 2)
+        .setup_cqsize(SQ_ENTRIES * 4)
         .build(SQ_ENTRIES)
         .expect("io_uring_setup failed (kernel lacks io_uring or it is disabled)");
     let ring_fd = ring.as_raw_fd();
@@ -547,8 +611,11 @@ pub fn raw_uring_start<F: Future>(fut: F) -> F::Output {
         .expect("failed to build the raw io_uring current-thread runtime");
 
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
-        DRIVER.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&driver)));
+    // Move a CLONE into the block (installed in the thread-local); keep `driver` itself owned out
+    // here so the teardown below can drop the LAST `Rc` and trigger `Driver::drop`'s shutdown drain.
+    let driver_for_shard = Rc::clone(&driver);
+    let out = local.block_on(&rt, async move {
+        DRIVER.with(|cell| *cell.borrow_mut() = Some(driver_for_shard));
 
         // The completion-drain task: park on the ring fd via tokio's epoll; on readable, reap CQEs.
         let async_fd = AsyncFd::new(RingFd(ring_fd)).expect("register ring fd with tokio epoll");
@@ -565,7 +632,24 @@ pub fn raw_uring_start<F: Future>(fut: F) -> F::Output {
         });
 
         fut.await
-    })
+    });
+
+    // Deterministic teardown, ordered to uphold cancel-safety at shutdown:
+    //   1. Drop the `LocalSet` FIRST -- this drops the drain task AND every serve task, so each
+    //      in-flight op-future runs its `Drop` (moving its buffer into `Lifecycle::Ignored` and
+    //      pushing a best-effort cancel). After this, every remaining slab slot is `Ignored`.
+    //   2. Drop the runtime (its reactor is no longer needed; the ring is drained synchronously).
+    //   3. Clear the thread-local's `Rc` clone so `driver` below is the SOLE owner -- otherwise the
+    //      `Driver` (and its drain-on-`Drop`) would not run until this thread later exits.
+    //   4. Drop `driver` -> `Driver::drop` blocks draining every `Ignored` op to its CQE BEFORE the
+    //      ring fd and the buffers are freed (no use-after-free, no stranded buffer).
+    drop(local);
+    drop(rt);
+    DRIVER.with(|cell| {
+        cell.borrow_mut().take();
+    });
+    drop(driver);
+    out
 }
 
 #[cfg(test)]
@@ -663,5 +747,69 @@ mod tests {
                 "the runtime is intact after a cancelled op"
             );
         });
+    }
+
+    /// FLUSH-UNDER-LOAD + multi-CQE edge re-arm: saturate the shard with many concurrent in-flight
+    /// recvs, then satisfy them all at once. The submit-at-park model must still flush every SQE and
+    /// the `AsyncFd` drain must re-arm across a BURST of completions -- if either starved, the joins
+    /// below would hang (caught by the nextest per-test timeout). The single-op round-trip tests
+    /// never exercise this (they hold at most one op in flight); this is the load path.
+    #[test]
+    fn many_concurrent_recvs_all_complete_under_load() {
+        use std::rc::Rc;
+        raw_uring_start(async {
+            const N: usize = 64;
+            let rt = Rc::new(RawIoUringRuntime::new());
+            let mut clients = Vec::with_capacity(N);
+            let mut tasks = Vec::with_capacity(N);
+            for _ in 0..N {
+                let (mut server, client) = socket_pair();
+                let rt = Rc::clone(&rt);
+                // Each task parks on its own recv -> N ops in flight on the ring simultaneously.
+                tasks.push(tokio::task::spawn_local(async move {
+                    rt.recv(&mut server, Vec::with_capacity(16))
+                        .await
+                        .unwrap()
+                        .n
+                }));
+                clients.push(client);
+            }
+            // Let every task push its recv SQE and park before any data is available.
+            tokio::task::yield_now().await;
+            // Fire all N writes -> a burst of N concurrent completions the drain must reap.
+            for c in &mut clients {
+                c.write_all(b"x").unwrap();
+            }
+            let mut total = 0usize;
+            for jh in tasks {
+                total += jh.await.unwrap();
+            }
+            assert_eq!(
+                total, N,
+                "all concurrent recvs completed (no submit starvation)"
+            );
+            drop(clients);
+        });
+    }
+
+    /// TEARDOWN cancel-safety: leave an op genuinely in flight when `raw_uring_start` returns. The
+    /// deterministic teardown (drop tasks -> `Ignored`, then `Driver::drop` cancels + drains) must
+    /// reap it BEFORE the ring fd and buffers free -- never close the ring under a live kernel op
+    /// (use-after-free) and never hang. Reaching the assert proves the shutdown drain converged.
+    #[test]
+    fn teardown_drains_in_flight_op_without_hang() {
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let (mut server, client) = socket_pair();
+            // Keep the peer OPEN (leak the client fd) so the recv cannot complete via EOF -- the only
+            // thing that can resolve it is the teardown cancel, precisely exercising `Driver::drop`.
+            std::mem::forget(client);
+            tokio::task::spawn_local(async move {
+                let _ = rt.recv(&mut server, Vec::with_capacity(16)).await;
+            });
+            // Let the recv push its SQE and park; return with it still in flight.
+            tokio::task::yield_now().await;
+        });
+        // If control reaches here, teardown cancelled + drained the in-flight op with no hang/abort.
     }
 }
