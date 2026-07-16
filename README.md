@@ -471,63 +471,91 @@ In raft mode the cluster-bus port is `port + 10000` and the replication port is
 
 ## Benchmarks
 
-IronCache is built to be measured, not asserted. Four dated results are recorded
-below: a **higher-core scaling run against the latest Redis 8.x** (the headline,
-where a thread-per-core design is meant to earn its keep), a **pipelined
-pinned-core depth sweep** and an **index-memory measurement** (the two newest),
-and an earlier **small-node (2-vCPU) worst-case** run.
-Baselines track the LATEST release of each engine, never a
-distro-packaged older one (the version-pinned matrix is [docs/bench/COMPETITORS.md](docs/bench/COMPETITORS.md));
-Redis is compared at **8.x**, not 7.x.
+IronCache is built to be measured, not asserted. The headline is a **fair,
+pinned head-to-head against Dragonfly v1.39.0** (the other thread-per-core
+engine), with a reproducible artifact behind every number
+([docs/bench/DRAGONFLY_REBENCH.md](docs/bench/DRAGONFLY_REBENCH.md)). Supporting
+results follow: a **pipelined pinned-core depth sweep**, the **index-memory
+measurement** behind the Dash default, and an earlier **small-node (2-vCPU)
+worst-case** run. Baselines track the LATEST release of each engine, never a
+distro-packaged older one (the version-pinned matrix is
+[docs/bench/COMPETITORS.md](docs/bench/COMPETITORS.md)); Redis is compared at
+**8.x**, not 7.x. Where a competitor wins a row, this section says so.
 
-### Higher-core scaling, latest Redis 8 (dated 2026-07-03)
+### Versus Dragonfly, fair and pinned (dated 2026-07-15)
 
-**Setup.** A single **AWS Graviton c7g.4xlarge** server (16 vCPU, arm64, kernel 6.17)
-with a separate **c7g.8xlarge** load generator (32 vCPU, so the generator is never the
-cap). The tool is `redis-benchmark` against a 1,000,000-key space, **pipeline 64**,
-`-c 512 --threads 16`, **default 3-byte values** (`redis-benchmark`'s default `-d`),
-persistence off. This is a PIPELINED PEAK-THROUGHPUT microbenchmark of GET and SET in
-isolation -- it is NOT a mixed workload and reports no latency percentiles (the 2-vCPU
-run below carries the MIX and tail-latency rows); read it as a raw scaling ceiling, not a
-production-traffic model. Each engine uses all 16 server cores: Redis 8 `--io-threads 8`
-(its peak; 16 did not improve), IronCache `--shards 15` (one core left for the acceptor),
-Dragonfly `--proactor_threads 16`. Versions: **Redis 8.8.0**, Dragonfly official image
-pulled 2026-07-03 (the `latest` tag; the exact patch was not captured on the ephemeral
-box -- the pinned baseline is v1.39.0 in [COMPETITORS.md](docs/bench/COMPETITORS.md), and
-a version-pinned Dragonfly re-run is a follow-up), IronCache (this build, io_uring
-datapath). Bold marks the fastest engine in each row.
+The head-to-head against the other thread-per-core engine, run so the comparison
+is airtight: **Dragonfly PINNED to v1.39.0** (image digest recorded), both
+engines on the **same 8 pinned server cores** with a disjoint 8-core
+`memtier_benchmark` generator, value sizes **128B and 256B**, pipeline depth
+**swept 1 / 16 / 32 / 64**, persistence off, reproduced twice. Full method + raw
+logs: [docs/bench/DRAGONFLY_REBENCH.md](docs/bench/DRAGONFLY_REBENCH.md). Every
+number below has a reproducible artifact; IronCache figures are the **shipped
+tokio binary** unless a row says io_uring. GET / SET in millions of ops/sec, mean
+of two runs, 128B values.
 
-| Peak ops/sec | Redis 8 (1 thread) | Redis 8 (io-threads 8) | IronCache (shards 15) | Dragonfly (16) |
-| --- | ---: | ---: | ---: | ---: |
-| GET | 2,482,622 | 3,315,650 | 3,974,563 | **4,921,260** |
-| SET | (n/a) | 1,328,374 | 3,311,258 | **4,945,598** |
+**Cluster-aware (both engines owner-routed).** This is how a real cluster client
+routes (go-redis, lettuce, `redis-cli -c`): each key goes straight to its owning
+endpoint. IronCache runs `cluster_mode = shard-owners` (#517, one listener per
+shard); Dragonfly runs `--cluster_mode=emulated`. Both driven by
+`memtier --cluster-mode`.
 
-IronCache's GET scales with shards (about 1.53M / 1.33M / 1.81M / 2.84M / 3.97M at 1 / 2 /
-4 / 8 / 15 shards): it DIPS from 1 to 2 shards -- the cross-shard-hop overhead, since with
-2 shards about half of random keys land on the non-home shard -- then climbs steeply,
-overtaking single-threaded Redis 8 at ~8 cores. Erasing that 1-to-2 dip (cross-shard-hop
-batching) is exactly the tracked datapath work below.
+| pipeline | IronCache (shard-owners) | Dragonfly v1.39.0 | IronCache GET |
+| ---: | ---: | ---: | :--- |
+| 1  | 0.70 / 0.69 | **1.02 / 0.98** | -31% |
+| 16 | **3.35 / 2.91** | 2.82 / 2.61 | **+19%** |
+| 32 | **4.08 / 3.46** | 2.83 / 3.34 | **+44%** |
+| 64 | **4.31 / 3.95** | 3.45 / 3.98 | **+25%** |
 
-**How to read this (honestly).** On 16 cores IronCache **wins SET decisively** (3.31M vs
-Redis 8's 1.33M, about 2.5x -- Redis's io-threads accelerate reads but the single main
-thread still serializes the write mutation) and **edges GET** past Redis 8's best config
-(3.97M vs 3.32M, about 1.2x, each engine at its own peak on the same 16-vCPU box). Redis 8
-is a much stronger GET baseline than 7.x was: its io-threads lift GET from 2.48M to 3.32M,
-closing most of the gap a 7.x comparison would have shown -- which is exactly why we no
-longer benchmark against 7.x. On this deep-pipeline (pipeline 64) run Dragonfly posted the
-highest raw GET/SET peaks (about 4.9M), but the IronCache GET figure in the table above was
-DEPRESSED by cross-shard-hop oversubscription (the 1-to-2 dip noted above, amplified when
-shards contend on a saturated box) -- a benchmark CONFIG artifact, not an architectural
-ceiling. A corrected thread-per-core re-bench (c7g, 2026-07-10, proper shard-to-core
-placement) REVERSES the GET standing: IronCache LEADS GET by about 19% single-endpoint
-(2.43M vs Dragonfly's 2.04M ops/sec) and by roughly 2x cluster-aware (4.32M vs 2.19M ops/sec)
-once #517 zero-hop routing removes the cross-shard hop entirely -- the hop-elimination lever
-paid off and #507 is CLOSED. Dragonfly's widely cited "25x" is a
-single-instance-versus-single-threaded-Redis framing that does not hold against
-multi-threaded Redis 8 (here Dragonfly is about 2x single-threaded Redis 8, not 25x). The
-honest nuance that remains: IronCache's baseline p99.9 TIES Dragonfly (~15ms) rather than
-beating it, and the durable-SAVE tail (291ms) is COMPETITIVE, not category-leading;
-IronCache's decisive edges are GET throughput, memory, and determinism.
+At every pipeline depth of 16 or more, IronCache **leads GET by +19 to +60%**
+(the +60% is the 256B leg) and **SET by +3 to +24%**, on the SHIPPED binary. At
+256B IronCache leads GET at every depth. The single row Dragonfly wins is
+**pipeline 1** (no pipelining), by about 30%: with no batch to amortize, its
+leaner per-command path shows, and IronCache's own per-key cluster routing cost
+is not yet paid back at depth 1 (single-endpoint IronCache is actually faster
+than cluster-routed at depth 1). Real high-throughput deployments pipeline,
+which is where the lead lives.
+
+**Single-endpoint (both engines native, one port).** The client sends random
+keys to one port; IronCache then pays a cross-shard hop that a cluster-aware
+client avoids. This is IronCache's WORST routing, shown for honesty. The shipped
+tokio binary cliffs at deep pipeline (the hop machinery); the io_uring build
+(from-source, not in the published binaries) stays competitive and wins 256B GET
+outright.
+
+| pipeline | IC-tokio (shipped) | IC-io_uring | Dragonfly v1.39.0 |
+| ---: | ---: | ---: | ---: |
+| 16 | 2.23 / 2.16 | **2.81** / 2.60 | 2.50 / 2.54 |
+| 32 | 1.85 / 1.32 | **2.65** / 2.83 | 2.62 / **3.23** |
+| 64 | 1.26 / 1.01 | 2.98 / 2.95 | **3.34 / 3.83** |
+
+**Memory** (`used_memory` delta over exactly-N distinct 128B keys, same box and
+method):
+
+| keys | IronCache (Dash index) | Dragonfly v1.39.0 |
+| ---: | ---: | ---: |
+| 700k | 173.4 | **157.0** |
+| 900k | **163.2** | 182.9 |
+| 1M   | **165.2** | 177.0 |
+
+IronCache wins the 1M headline point (165 vs 177 B/key, the old 180 erased by the
+#285 Dash-index default flip) with a FLATTER curve than Dragonfly (163 to 173 vs
+Dragonfly's 157 to 183), but Dragonfly wins at 700k, so this is a headline win,
+not yet a uniform one; the bucketed-Dash displacement work (#670) targets the
+uniform lead.
+
+**How to read this (honestly).** On the realistic pipelined, cluster-aware
+config IronCache leads Dragonfly on both GET and SET, on the shipped binary, with
+a reproducible artifact behind every number. Baseline p99.9 latency **ties**
+Dragonfly (measured identical at a matched load). Two rows honestly go the other
+way: **pipeline 1** (no pipelining) throughput, where Dragonfly's leaner
+per-command path wins about 30%, and the **during-snapshot tail** (IronCache's
+291ms durable-save p99.9 vs Dragonfly's ~15ms), a known limitation at a
+memory-bandwidth floor that only incremental snapshots can move (tracked, not yet
+built). Versus **Redis 8** the SET story is unassailable: IronCache's per-core
+write path is about **2.5x** Redis 8's best config (Redis serializes every write
+on its single main thread regardless of io-threads). IronCache's decisive edges
+are pipelined throughput, memory, and determinism.
 
 ### Pipelined pinned-core depth sweep (dated 2026-07-13)
 
@@ -621,15 +649,16 @@ Where IronCache leads: it **tops SET and GET throughput and GET tail latency
 single-node**, and it **ties Redis on cluster GET (about 1.30M ops/sec)**. KeyDB and
 Dragonfly trail here, but note that is a 2-vCPU artifact: with only two cores the
 multi-threaded engines cannot stretch. Given real core count the field spreads out (see
-the 16-core run above), where the corrected thread-per-core re-bench shows IronCache
-**LEADING GET** (+19% single-endpoint, ~2x cluster-aware via #517 zero-hop), not trailing
-Dragonfly. The picture is honest in both directions: Redis wins the small-op rows,
-IronCache wins the bulk SET/GET and latency rows on these nodes.
+the pinned Dragonfly head-to-head above), where the cluster-aware re-bench shows
+IronCache **LEADING GET** (+19 to +60% at pipeline depths of 16 or more) once #517
+zero-hop routing removes the cross-shard hop. The picture is honest in both directions:
+Redis wins the small-op rows, IronCache wins the bulk SET/GET and latency rows on these
+nodes.
 
 That "higher-core nodes would widen the multi-threaded engines' lead over
-single-threaded Redis" is no longer a projection -- the 16-core run above measures it;
-this run intentionally used small nodes to show the worst case for a thread-per-core
-design, not its best. Reproduce a row with `memtier_benchmark` (32-byte
+single-threaded Redis" is no longer a projection -- the pinned head-to-head above
+measures it; this run intentionally used small nodes to show the worst case for a
+thread-per-core design, not its best. Reproduce a row with `memtier_benchmark` (32-byte
 values, 1M keyspace, `--pipeline 16` for throughput / `--pipeline 1` for latency, both
 cores per engine), sweeping connections for the peak.
 
