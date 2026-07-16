@@ -2189,6 +2189,12 @@ async fn serve_connection(
                                 Err(_) => break 'conn,
                             }
                         }
+                        // #661: count this connection in the node-wide `blocked_clients` gauge for
+                        // the ENTIRE park. The guard clones the shard counters cell (no borrow held
+                        // across the await) and decrements on Drop, so a wake, a timeout, or a peer
+                        // close all clear the count -- INFO `blocked_clients` reflects the live
+                        // parked set leak-free, on BOTH the pop-park and WAIT-park paths inside.
+                        let _blocked = state_rc.borrow().counters.block_guard();
                         let park_close = run_block_park(
                             &mut stream,
                             &timer_rt,

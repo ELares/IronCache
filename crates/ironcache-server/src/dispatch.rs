@@ -3787,8 +3787,10 @@ fn cmd_info<C: Clock, S: Keyspace>(
     let rolled = rollup();
     // The PROD-7 completeness facts for the `# Clients` / `# Stats` / `# CPU` sections: the effective
     // `maxclients` (read from the runtime overlay so a `CONFIG SET maxclients` is reflected) and the
-    // rejected-connection count off the connection gate. `blocked_clients` is 0 (no blocking commands
-    // yet). `instantaneous_ops_per_sec` is a REAL recent rate now (#549): sample the node-wide command
+    // rejected-connection count off the connection gate. `blocked_clients` is the node-wide count of
+    // clients currently parked on a blocking command (#661), summed from the per-shard
+    // `blocked_clients` gauge via the SAME `rolled` aggregate the other node-wide figures use.
+    // `instantaneous_ops_per_sec` is a REAL recent rate now (#549): sample the node-wide command
     // total against the Env WALL clock (`now_unix_millis`, ADR-0003 -- comparable across the shards
     // that may each serve an INFO read into the shared ring) and read the rate over the sampling
     // window. This is the COLD INFO read path, so the clock read + the sampler's node-level lock are
@@ -3799,7 +3801,7 @@ fn cmd_info<C: Clock, S: Keyspace>(
     });
     let runtime_stats = ironcache_observe::RuntimeStats {
         maxclients: ctx.runtime.maxclients(),
-        blocked_clients: 0,
+        blocked_clients: rolled.blocked_clients,
         instantaneous_ops_per_sec,
         rejected_connections: ctx.conn_gate.rejected(),
     };

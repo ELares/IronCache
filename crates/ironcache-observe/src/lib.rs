@@ -365,7 +365,11 @@ pub struct ShardCountersCell {
     connections_received: AtomicU64,
     commands_processed: AtomicU64,
     connected_clients: AtomicU64,
-    /// Cumulative bytes READ off this shard's client sockets (INFO `total_net_input_bytes`, #527):
+    /// Connections PARKED on a blocking command (BLPOP/BRPOP/BLMOVE/WAIT, ...) right now (INFO
+    /// `blocked_clients`, #661). A GAUGE like `connected_clients`: incremented when a client parks,
+    /// decremented on EVERY park exit (wake / timeout / disconnect) via [`BlockedGuard`]'s Drop, so
+    /// no exit path can leak the count. Summed across shards for the node-wide INFO figure.
+    blocked_clients: AtomicU64,
     /// bumped once per serve RECV on both datapaths (tokio + io_uring). `redis_exporter` reads
     /// `redis_net_input_bytes_total` from this INFO field. A since-start stat (`CONFIG RESETSTAT`
     /// clears it, matching Redis's `resetServerStats`).
@@ -427,6 +431,7 @@ impl Default for ShardCountersCell {
             connections_received: AtomicU64::new(0),
             commands_processed: AtomicU64::new(0),
             connected_clients: AtomicU64::new(0),
+            blocked_clients: AtomicU64::new(0),
             total_net_input_bytes: AtomicU64::new(0),
             total_net_output_bytes: AtomicU64::new(0),
             evicted_keys: AtomicU64::new(0),
@@ -456,6 +461,7 @@ impl ShardCountersCell {
             connections_received: self.connections_received.load(Ordering::Relaxed),
             commands_processed: self.commands_processed.load(Ordering::Relaxed),
             connected_clients: self.connected_clients.load(Ordering::Relaxed),
+            blocked_clients: self.blocked_clients.load(Ordering::Relaxed),
             total_net_input_bytes: self.total_net_input_bytes.load(Ordering::Relaxed),
             total_net_output_bytes: self.total_net_output_bytes.load(Ordering::Relaxed),
             evicted_keys: self.evicted_keys.load(Ordering::Relaxed),
@@ -544,6 +550,42 @@ pub struct ShardCounters {
     cell: Arc<ShardCountersCell>,
 }
 
+/// A RAII guard for one PARKED blocking client (#661). [`ShardCounters::block_guard`] increments
+/// the shard's `blocked_clients` gauge on construction; this drops it on EVERY normal park exit --
+/// a wake, a timeout, or a client disconnect -- so INFO's node-wide `blocked_clients` reflects the
+/// LIVE parked count and no exit path can leak it. The tokio serve loop holds one across the entire
+/// block-park (the io_uring datapath does not truly park in v1 -- it replies immediately -- so it
+/// has no parked client to count; a guard must be added there if it ever gains a real park).
+/// Holds an owned `Arc` to the shard's cell, so it needs no borrow of the counters and its `Drop`
+/// runs after the guard outlives the serve borrow. (On an unwinding panic the `Drop` also clears
+/// the count; the shipping release profile is `panic = abort`, where the process ends and the live
+/// count is moot regardless.)
+pub struct BlockedGuard {
+    cell: Arc<ShardCountersCell>,
+}
+
+impl Drop for BlockedGuard {
+    fn drop(&mut self) {
+        // Saturating decrement without a lock (mirrors `on_connection_close`): an increment always
+        // precedes the guard on the SAME shard, so the gauge never underflows in practice, but the
+        // saturating CAS guards against it anyway. Uncontended (the shard owns its cell), so the
+        // loop runs once.
+        let mut cur = self.cell.blocked_clients.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self.cell.blocked_clients.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
 impl ShardCounters {
     /// A fresh zeroed counter set with its own backing cell.
     #[must_use]
@@ -591,6 +633,17 @@ impl ShardCounters {
                 Ok(_) => break,
                 Err(observed) => cur = observed,
             }
+        }
+    }
+
+    /// Increment this shard's `blocked_clients` gauge and return a [`BlockedGuard`] that decrements
+    /// it on Drop (#661). The serve loop holds the guard across a whole block-park, so the gauge
+    /// tracks the live parked count leak-free. `&self`: the gauge is a `Relaxed` atomic.
+    #[must_use]
+    pub fn block_guard(&self) -> BlockedGuard {
+        self.cell.blocked_clients.fetch_add(1, Ordering::Relaxed);
+        BlockedGuard {
+            cell: Arc::clone(&self.cell),
         }
     }
 
@@ -1103,6 +1156,11 @@ pub fn render_prometheus(counters: CounterSnapshot, gauges: MetricsGauges) -> St
         counters.connected_clients,
     );
     gauge(
+        "ironcache_blocked_clients",
+        "Clients currently parked on a blocking command (BLPOP/BRPOP/BLMOVE/WAIT).",
+        counters.blocked_clients,
+    );
+    gauge(
         "ironcache_keyspace_keys",
         "Live keys held across all shards and databases.",
         counters.keyspace_keys,
@@ -1443,6 +1501,9 @@ pub struct CounterSnapshot {
     pub commands_processed: u64,
     /// Currently-open connections on this shard.
     pub connected_clients: u64,
+    /// Connections currently PARKED on a blocking command on this shard (#661); summed across
+    /// shards for the node-wide INFO `blocked_clients`.
+    pub blocked_clients: u64,
     /// Total bytes READ off this shard's client sockets since start (INFO `total_net_input_bytes`,
     /// #527); summed across shards for the node-wide figure `redis_exporter` reads as
     /// `redis_net_input_bytes_total`.
@@ -1482,6 +1543,7 @@ impl CounterSnapshot {
             connections_received: self.connections_received + other.connections_received,
             commands_processed: self.commands_processed + other.commands_processed,
             connected_clients: self.connected_clients + other.connected_clients,
+            blocked_clients: self.blocked_clients + other.blocked_clients,
             total_net_input_bytes: self.total_net_input_bytes + other.total_net_input_bytes,
             total_net_output_bytes: self.total_net_output_bytes + other.total_net_output_bytes,
             evicted_keys: self.evicted_keys + other.evicted_keys,
@@ -1645,9 +1707,10 @@ pub struct EffectiveMemoryConfig<'a> {
 pub struct RuntimeStats {
     /// `maxclients`: the effective simultaneous-connection ceiling (`0` = unlimited).
     pub maxclients: u64,
-    /// `blocked_clients`: connections blocked on a blocking command. IronCache has no blocking
-    /// commands yet, so this is `0`, but it is sourced here so a future blocking subsystem wires
-    /// it without reshaping the section.
+    /// `blocked_clients`: connections currently parked on a blocking command
+    /// (BLPOP/BRPOP/BLMOVE/WAIT, ...), node-wide (#661). Sourced from the summed per-shard
+    /// `blocked_clients` gauge (see [`CounterSnapshot::blocked_clients`]); the dispatch layer sets
+    /// it from `MetricsRegistry::aggregate`.
     pub blocked_clients: u64,
     /// `instantaneous_ops_per_sec`: a coarse commands-per-second estimate (the rolling delta the
     /// caller computes off the per-shard `commands_processed` total); `0` before the first sample.
@@ -3317,6 +3380,41 @@ mod tests {
             rolled.connected_clients, 1,
             "the live gauge survives RESETSTAT"
         );
+    }
+
+    /// #661: `block_guard` is a leak-free per-shard `blocked_clients` gauge -- increments on
+    /// creation, decrements on Drop (every park exit), summed node-wide by the registry. A client
+    /// parks on exactly one shard, so the node-wide figure is the sum of the per-shard gauges.
+    #[test]
+    fn block_guard_tracks_blocked_clients_node_wide_and_leaks_none() {
+        let reg = MetricsRegistry::new(2);
+        let s0 = ShardCounters::with_cell(reg.shard_cell(0));
+        let s1 = ShardCounters::with_cell(reg.shard_cell(1));
+        assert_eq!(reg.aggregate().blocked_clients, 0, "no parks yet");
+
+        let g0 = s0.block_guard();
+        let g1 = s1.block_guard();
+        assert_eq!(
+            reg.aggregate().blocked_clients,
+            2,
+            "two parked clients across two shards"
+        );
+        drop(g0);
+        assert_eq!(reg.aggregate().blocked_clients, 1, "one park exited");
+        drop(g1);
+        assert_eq!(
+            reg.aggregate().blocked_clients,
+            0,
+            "all parks exited -- the gauge leaks nothing"
+        );
+
+        // Nested parks on the SAME shard count as a gauge (not a boolean), and unwind cleanly.
+        let a = s0.block_guard();
+        let b = s0.block_guard();
+        assert_eq!(reg.aggregate().blocked_clients, 2, "two parks on one shard");
+        drop(a);
+        drop(b);
+        assert_eq!(reg.aggregate().blocked_clients, 0);
     }
 
     /// The Prometheus renderer emits valid `# HELP`/`# TYPE` + `name value` lines for the
