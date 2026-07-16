@@ -173,6 +173,19 @@ pub use tokio_rt::set_keepalive;
 pub mod io_uring_rt;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub use io_uring_rt::{IoUringRuntime, peer_local_addrs, run_shards_uring, set_keepalive_uring};
+
+// The RAW io_uring backend (#682): a `Runtime` impl built DIRECTLY on the `io-uring` crate, so it
+// cross-builds for static-musl (tokio-uring fails musl on libc statx types) and can reach
+// provided-buffer rings + multishot (#513). ADDITIVE + default-OFF + Linux-gated; it coexists with
+// `io_uring` (introduces NO alias, not wired into serve in P1), so both features may be on at once.
+// The raw ring runs inside a tokio current-thread runtime, driven by `AsyncFd` on the ring fd; ALL
+// `unsafe` (SQE push, buffer pointers, fd lifecycle) is confined to this module. See its module doc.
+#[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+pub mod io_uring_raw_rt;
+#[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+pub use io_uring_raw_rt::{
+    RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, raw_uring_start,
+};
 // Re-export the io_uring transport stream type so the `ironcache` serve loop can name it
 // (`ironcache_runtime::UringTcpStream`) WITHOUT taking a direct dependency on `tokio-uring`: the
 // low-level binding stays an implementation detail of this runtime crate, mirroring how

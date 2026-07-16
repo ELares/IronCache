@@ -143,6 +143,9 @@ tokio-uring = { version = "0.5", features = ["bytes"] }
 # supports, so one Linux artifact selects the fastest datapath the kernel offers. Linux + opt-in
 # only (same license tree as tokio-uring, already cargo-deny clean).
 io-uring = { version = "0.6", default-features = false }
+# The slab op-table for the RAW io_uring runtime (#682, `io_uring_raw` feature): user_data == slab
+# index, the in-flight-op Lifecycle table. Pure-Rust, MIT, cargo-deny clean, static-musl safe.
+slab = "0.4"
 # The per-shard SwissTable for the store index (ADR-0005, HASHTABLE.md #35). Stock
 # hashbrown, unsynchronized, owned by one core; MIT OR Apache-2.0 (cargo-deny clean).
 hashbrown = "0.16"
