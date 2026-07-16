@@ -2135,9 +2135,10 @@ async fn serve_connection(
                     // encoded later, in order), so FIFO on the wire is preserved. A hop is never a
                     // blocking command and never closes the connection, so we skip the hooks + park +
                     // close handling and go straight to the next command; its hooks run at drain time.
-                    if let coordinator::HopOutcome::Deferred(rx) = deferred_hop {
+                    if let coordinator::HopOutcome::Deferred(target) = deferred_hop {
                         pending.push(DeferredHop {
-                            rx,
+                            target,
+                            db: conn.db,
                             request,
                             cmd_start,
                             was_tracking,
@@ -2164,6 +2165,7 @@ async fn serve_connection(
                             &state_rc,
                             &push_tx,
                             &shed_flag,
+                            &inbox,
                         )
                         .await;
                         out_before = out.len();
@@ -2315,6 +2317,7 @@ async fn serve_connection(
                             &state_rc,
                             &push_tx,
                             &shed_flag,
+                            &inbox,
                         )
                         .await;
                     }
@@ -2342,6 +2345,7 @@ async fn serve_connection(
                 &state_rc,
                 &push_tx,
                 &shed_flag,
+                &inbox,
             )
             .await;
         }
@@ -2765,9 +2769,10 @@ async fn serve_connection_generic<R>(
                     // encoded later, in order), so FIFO on the wire is preserved. A hop is never a
                     // blocking command and never closes the connection, so we skip the hooks + FIX1 +
                     // close handling and go straight to the next command; its hooks run at drain time.
-                    if let coordinator::HopOutcome::Deferred(rx) = deferred_hop {
+                    if let coordinator::HopOutcome::Deferred(target) = deferred_hop {
                         pending.push(DeferredHop {
-                            rx,
+                            target,
+                            db: conn.db,
                             request,
                             cmd_start,
                             was_tracking,
@@ -2796,6 +2801,7 @@ async fn serve_connection_generic<R>(
                             &state_rc,
                             &push_tx,
                             &shed_flag,
+                            &inbox,
                         )
                         .await;
                         out_before = out.len();
@@ -2890,6 +2896,7 @@ async fn serve_connection_generic<R>(
                             &state_rc,
                             &push_tx,
                             &shed_flag,
+                            &inbox,
                         )
                         .await;
                     }
@@ -2917,6 +2924,7 @@ async fn serve_connection_generic<R>(
                 &state_rc,
                 &push_tx,
                 &shed_flag,
+                &inbox,
             )
             .await;
         }
@@ -5022,17 +5030,16 @@ async fn route_and_dispatch(
         // so `hops_sent` trends to ~0 -- the #517 property, now MEASURABLE instead of merely claimed.
         state_rc.borrow().counters.on_hop_sent();
         if defer_hops {
-            // #8 OVERLAP: enqueue the hop and hand the receiver back WITHOUT awaiting, so the caller
-            // can issue the next command's hop before this owner replies. `out` is left UNTOUCHED
-            // (the reply is encoded later, in order, by the caller's drain), so `deferred_hop` being
-            // Some is the caller's signal to defer this command's hooks + reply. A None inside means
-            // the owner was already gone; the caller's `finish_hop` encodes shard-unavailable in order.
-            *deferred_hop = coordinator::HopOutcome::Deferred(
-                coordinator::dispatch_via_send(inbox, target, request, conn.db).await,
-            );
-            // No home post-processing for a deferred remote hop: the wake/keyspace-publish below run
-            // on the OWNER shard (via run_remote), and the home probes are no-ops for a remote key.
-            // Return early so we do NOT run the shared post-dispatch (wake/publish) against `out`.
+            // #8 OVERLAP + #674 COALESCING: RECORD the owning shard; do NOT send yet. The serve loop
+            // parks this as a `DeferredHop` and `drain_deferred_hops` groups the whole run's hops per
+            // shard, sending ONE coalesced `ShardWork::Batch` per shard with >= 2 hops (a `Single` for
+            // a lone hop) and demuxing the replies in wire order. `out` is left UNTOUCHED (the reply is
+            // encoded later, in order, at drain). Deferring the send to drain is what enables the
+            // coalescing; the decode-overlap it trades away is negligible (decode is not the cost).
+            *deferred_hop = coordinator::HopOutcome::Deferred(target);
+            // No home post-processing for a deferred remote hop: the wake/keyspace-publish run on the
+            // OWNER shard (via run_remote), and the home probes are no-ops for a remote key. Return
+            // early so we do NOT run the shared post-dispatch (wake/publish) against `out`.
             return false;
         }
         coordinator::dispatch_via(inbox, target, request, conn.db, out, conn.proto).await;

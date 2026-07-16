@@ -38,8 +38,12 @@ use std::rc::Rc;
 /// affects the data reply bytes or their wire order. Snapshotting the full tracking sub-state into
 /// this struct is a clean follow-up; deferred here to keep the overlap focused on the FIFO property.
 pub(crate) struct DeferredHop {
-    /// The reply receiver (`None` = the owner was gone at send; `finish_hop` encodes shard-unavailable).
-    pub(crate) rx: Option<coordinator::HopReceiver>,
+    /// The OWNING shard for this hop (#674): recorded at defer time; the send is deferred to
+    /// [`drain_deferred_hops`], which groups a run's hops per shard + coalesces same-shard ones.
+    pub(crate) target: usize,
+    /// The DB the connection had selected. Constant across a run (a `SELECT` is a barrier that drains
+    /// the run first), so the drain uses it for the per-shard batch send.
+    pub(crate) db: u32,
     /// The request, for the hooks (cheap clone: `Request` is `Vec<Bytes>`, refcounted).
     pub(crate) request: Request,
     /// The monotonic start stamp for this command's elapsed-time (slowlog + commandstats).
@@ -51,6 +55,22 @@ pub(crate) struct DeferredHop {
     pub(crate) slow_threshold: i64,
     /// The connection's negotiated proto, to encode the reply on the home core.
     pub(crate) proto: ProtoVersion,
+}
+
+/// A per-shard reply RECEIVER collected by [`drain_deferred_hops`] after it issues the run's sends: a
+/// coalesced `Batch` (#674) or a lone `Single` (`None` = the owning shard's queue was gone at send).
+enum Rx {
+    Batch(Option<coordinator::BatchReceiver>),
+    Single(Option<coordinator::HopReceiver>),
+}
+
+/// A per-shard AWAITED reply, ready for the demux: a `Batch`'s replies wrapped `Option` per index so
+/// each hop can `take()` ITS slot; a `Single`'s one reply; or `Gone` (owner gone/errored -> every hop
+/// for that shard encodes shard-unavailable, in order).
+enum ShardResult {
+    Batch(Vec<Option<coordinator::ShardReply>>),
+    Single(Option<coordinator::ShardReply>),
+    Gone,
 }
 
 /// Drain a run of [`DeferredHop`]s (in FIFO order) into `out`: for each, await + encode its reply,
@@ -68,10 +88,77 @@ pub(crate) async fn drain_deferred_hops(
     state_rc: &Rc<RefCell<ShardState>>,
     push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
     shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+    inbox: &coordinator::Inbox,
 ) {
-    for d in pending.drain(..) {
+    if pending.is_empty() {
+        return;
+    }
+    // The run's DB is constant: `SELECT`/`RESET` (the only commands that change `conn.db`) are
+    // `AlwaysHome`, so they force a barrier that drains the run BEFORE they run -- no db change ever
+    // appears mid-run. The batch is sent with `pending[0].db`; assert the invariant so a future change
+    // that made a db-mutating command deferrable trips a test instead of silently mis-db'ing a batch.
+    let db = pending[0].db;
+    debug_assert!(
+        pending.iter().all(|d| d.db == db),
+        "a deferred cross-shard run must share one db (SELECT/RESET are barriers)"
+    );
+
+    // 1) GROUP each parked hop's request into its owning shard's bucket, recording per hop the
+    //    `(target, index-within-that-bucket)` so the reply can be demuxed back to wire order.
+    let mut by_shard: std::collections::HashMap<usize, Vec<Request>> =
+        std::collections::HashMap::new();
+    let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
+    for d in pending.iter() {
+        let bucket = by_shard.entry(d.target).or_default();
+        slots.push((d.target, bucket.len()));
+        bucket.push(d.request.clone());
+    }
+
+    // 2) SEND one message per shard -- a coalesced `Batch` for >= 2 hops (#674), a `Single` for a lone
+    //    one (byte-identical to the pre-#674 path). Issue ALL sends first so the owners work
+    //    concurrently across shards, then collect the receivers.
+    let mut rxs: Vec<(usize, Rx)> = Vec::with_capacity(by_shard.len());
+    for (target, mut requests) in by_shard {
+        let rx = if requests.len() >= 2 {
+            Rx::Batch(coordinator::dispatch_batch_send(inbox, target, requests, db).await)
+        } else {
+            let req = requests.pop().expect("a bucket holds >= 1 request");
+            Rx::Single(coordinator::dispatch_via_send_owned(inbox, target, req, db).await)
+        };
+        rxs.push((target, rx));
+    }
+
+    // 3) AWAIT each shard's reply. A `Batch` reply becomes a takeable `Vec<Option<_>>` so each hop can
+    //    pull ITS index; a gone/errored owner becomes `Gone` (all its hops encode shard-unavailable).
+    let mut results: std::collections::HashMap<usize, ShardResult> =
+        std::collections::HashMap::new();
+    for (target, rx) in rxs {
+        let r = match rx {
+            Rx::Batch(Some(rx)) => match rx.await {
+                Ok(v) => ShardResult::Batch(v.into_iter().map(Some).collect()),
+                Err(_) => ShardResult::Gone,
+            },
+            Rx::Single(Some(rx)) => match rx.await {
+                Ok(rep) => ShardResult::Single(Some(rep)),
+                Err(_) => ShardResult::Gone,
+            },
+            Rx::Batch(None) | Rx::Single(None) => ShardResult::Gone,
+        };
+        results.insert(target, r);
+    }
+
+    // 4) DEMUX in FIFO (wire) order: for each parked hop, pull its reply from its shard's result at the
+    //    recorded index, encode it (or shard-unavailable), then run its per-command hooks -- exactly as
+    //    the un-coalesced path did, so a coalesced hop is observably identical, only assembled later.
+    for (i, d) in pending.drain(..).enumerate() {
+        let (target, idx) = slots[i];
+        let value = match results.get_mut(&target) {
+            Some(ShardResult::Batch(v)) => v.get_mut(idx).and_then(Option::take).map(|r| r.value),
+            Some(ShardResult::Single(o)) => o.take().map(|r| r.value),
+            Some(ShardResult::Gone) | None => None,
+        };
         let out_before = out.len();
-        coordinator::finish_hop(d.rx, out, d.proto).await;
+        coordinator::encode_hop_reply(value, out, d.proto);
         let cmd_elapsed_us = u64::try_from(
             env.borrow()
                 .now()
