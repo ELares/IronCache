@@ -270,6 +270,27 @@ pub async fn send_batch(
     rt.send(stream, data).await
 }
 
+/// The tokio-uring backend's [`crate::BatchedRecvSend`]: delegate to the free `recv_batch`/
+/// `send_batch` above, which stage through the per-shard REGISTERED fixed-buffer slab (the
+/// OneShotFixed fast path) when the kernel selected it, else the owned recv/send.
+impl crate::BatchedRecvSend for IoUringRuntime {
+    fn recv_batch(
+        &self,
+        stream: &mut TcpStream,
+        read_buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = io::Result<usize>> {
+        recv_batch(self, stream, read_buf)
+    }
+
+    fn send_batch(
+        &self,
+        stream: &mut TcpStream,
+        data: Vec<u8>,
+    ) -> impl std::future::Future<Output = io::Result<Vec<u8>>> {
+        send_batch(self, stream, data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FixedRing, recv_batch, recv_fixed, send_fixed};

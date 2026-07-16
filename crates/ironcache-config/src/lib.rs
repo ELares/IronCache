@@ -318,6 +318,10 @@ pub enum RuntimeBackend {
     Tokio,
     /// The opt-in, Linux-only io_uring backend (falls back to tokio off-Linux / no-feature / TLS).
     IoUring,
+    /// The opt-in, Linux-only RAW io_uring backend (#682): the same datapath as [`IoUring`] but
+    /// built directly on the `io-uring` crate (cross-builds on static-musl, reaches multishot). Same
+    /// fallback rules as [`IoUring`] (tokio off-Linux / no `io_uring_raw` feature / TLS on).
+    IoUringRaw,
 }
 
 /// The fully-resolved, effective configuration the server boots from.
@@ -1196,7 +1200,10 @@ impl Config {
                     .to_owned(),
             });
         }
-        if self.runtime == RuntimeBackend::IoUring {
+        if matches!(
+            self.runtime,
+            RuntimeBackend::IoUring | RuntimeBackend::IoUringRaw
+        ) {
             return Err(ConfigError::Invalid {
                 field: "cluster-mode",
                 reason: "shard-owners mode is not yet supported with the io_uring runtime (its \
@@ -2550,6 +2557,9 @@ pub fn parse_runtime_backend(s: &str) -> Option<RuntimeBackend> {
     match s.trim().to_ascii_lowercase().as_str() {
         "tokio" => Some(RuntimeBackend::Tokio),
         "io_uring" | "io-uring" | "iouring" | "uring" => Some(RuntimeBackend::IoUring),
+        "io_uring_raw" | "io-uring-raw" | "iouring_raw" | "uring_raw" | "raw" => {
+            Some(RuntimeBackend::IoUringRaw)
+        }
         _ => None,
     }
 }

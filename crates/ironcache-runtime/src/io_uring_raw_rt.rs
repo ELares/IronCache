@@ -859,6 +859,310 @@ pub fn raw_uring_start<F: Future>(fut: F) -> F::Output {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Stream socket-option / address helpers (the raw analogs of the tokio-uring backend's
+// `set_keepalive_uring` / `peer_local_addrs`). `RawUringTcpStream` exposes only its fd, so borrow it
+// through a temporary std stream and `into_raw_fd` it back to AVOID closing the fd the raw stream
+// still owns. These live here (not in `ironcache`) because the borrow needs `unsafe`, which the
+// `ironcache` crate forbids.
+// ---------------------------------------------------------------------------
+
+/// Apply `SO_KEEPALIVE` (idle `secs`; `0` DISABLES) to a raw stream at accept, without taking
+/// ownership of its fd. Mirrors [`crate::io_uring_rt::set_keepalive_uring`]. Errors ignored.
+pub fn set_keepalive_raw(stream: &RawUringTcpStream, secs: u64) {
+    let raw = stream.fd;
+    // SAFETY: `raw` is the valid open TCP socket fd owned by `stream` for this borrow; the std
+    // stream is `into_raw_fd`'d back so it does NOT close the fd the raw stream still owns.
+    let s = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+    {
+        let sock = socket2::SockRef::from(&s);
+        if secs == 0 {
+            let _ = sock.set_keepalive(false);
+        } else {
+            let _ = sock.set_keepalive(true);
+            let _ = sock.set_tcp_keepalive(
+                &socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(secs)),
+            );
+        }
+    }
+    let _ = s.into_raw_fd();
+}
+
+/// Read the `(peer, local)` addresses of a raw stream as display strings (for `CLIENT INFO`),
+/// without taking ownership of its fd. Mirrors [`crate::io_uring_rt::peer_local_addrs`]. A failure
+/// yields an empty string (the addresses are cosmetic).
+#[must_use]
+pub fn peer_local_addrs_raw(stream: &RawUringTcpStream) -> (String, String) {
+    let raw = stream.fd;
+    // SAFETY: as in `set_keepalive_raw` -- borrow only, `into_raw_fd` relinquishes without closing.
+    let s = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+    let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let _ = s.into_raw_fd();
+    (peer, local)
+}
+
+/// The raw backend's [`crate::BatchedRecvSend`]: the PLAIN owned recv/send (the raw backend's
+/// registered-buffer / multishot fast path is #513 / P3). `recv_batch` appends into `read_buf`
+/// exactly like the owned `recv`; `send_batch` writes all + hands the buffer back.
+impl crate::BatchedRecvSend for RawIoUringRuntime {
+    async fn recv_batch(
+        &self,
+        stream: &mut RawUringTcpStream,
+        read_buf: &mut Vec<u8>,
+    ) -> io::Result<usize> {
+        let res = self.recv(stream, core::mem::take(read_buf)).await?;
+        *read_buf = res.buf;
+        Ok(res.n)
+    }
+
+    async fn send_batch(
+        &self,
+        stream: &mut RawUringTcpStream,
+        data: Vec<u8>,
+    ) -> io::Result<Vec<u8>> {
+        self.send(stream, data).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-shard RAW io_uring bootstrap (the raw sibling of `io_uring_rt::run_shards_uring`).
+// ---------------------------------------------------------------------------
+
+pub use raw_uring_bootstrap::run_shards_raw_uring;
+
+mod raw_uring_bootstrap {
+    use super::{RawIoUringRuntime, RawUringTcpStream, raw_uring_start};
+    use crate::bootstrap::{ShardConfig, ShardId, ShardSet};
+    use crate::tokio_rt::listener_for;
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    // NOTE: the acceptor loop / live-task drain here are duplicated from `io_uring_rt`'s
+    // `uring_bootstrap` (they carry no backend types -- pure std + tokio-time). They are duplicated
+    // rather than shared so the `io_uring_raw` feature builds WITHOUT the `io_uring` feature (whose
+    // module is cfg'd out then). Factoring the shared acceptor into an `any(io_uring, io_uring_raw)`
+    // module is a follow-up.
+
+    type LiveTasks = Rc<Cell<usize>>;
+
+    struct LiveGuard(LiveTasks);
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_sub(1));
+        }
+    }
+
+    /// Run the shard set on the RAW io_uring backend (Linux, `runtime = io_uring_raw`, PLAINTEXT).
+    /// Identical topology to [`crate::io_uring_rt::run_shards_uring`] -- one bound listener + a
+    /// single userspace acceptor thread round-robining accepted std streams to per-shard channels --
+    /// but each shard thread runs [`raw_uring_start`] (the raw ring reactor) instead of
+    /// `tokio_uring::start`, and adopts each connection via [`RawUringTcpStream::from_std`].
+    pub fn run_shards_raw_uring<S, Fut, I, D, DFut>(
+        cfg: &ShardConfig,
+        serve: S,
+        inboxes: Vec<I>,
+        drain: D,
+    ) -> std::io::Result<ShardSet>
+    where
+        S: Fn(RawIoUringRuntime, RawUringTcpStream, ShardId, Arc<AtomicBool>) -> Fut
+            + Clone
+            + Send
+            + 'static,
+        Fut: Future<Output = ()> + 'static,
+        I: Send + 'static,
+        D: Fn(usize, I, Arc<AtomicBool>) -> DFut + Clone + Send + 'static,
+        DFut: Future<Output = ()> + 'static,
+    {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let total = cfg.shards.max(1);
+        assert_eq!(
+            inboxes.len(),
+            total,
+            "run_shards_raw_uring: one inbox per shard required (got {}, need {total})",
+            inboxes.len()
+        );
+
+        let listener = listener_for(cfg.bind)?;
+
+        let mut conn_senders = Vec::with_capacity(total);
+        let mut conn_receivers = Vec::with_capacity(total);
+        for _ in 0..total {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
+            conn_senders.push(tx);
+            conn_receivers.push(rx);
+        }
+
+        let mut handles = Vec::with_capacity(total + 1);
+
+        {
+            let shutdown = Arc::clone(&shutdown);
+            let acceptor = std::thread::Builder::new()
+                .name("ironcache-acceptor-raw-uring".to_string())
+                .spawn(move || acceptor_loop(&listener, &conn_senders, &shutdown))?;
+            handles.push(acceptor);
+        }
+
+        for ((index, inbox), conn_rx) in inboxes.into_iter().enumerate().zip(conn_receivers) {
+            let shutdown = Arc::clone(&shutdown);
+            let drain_shutdown = Arc::clone(&shutdown);
+            let serve = serve.clone();
+            let drain = drain.clone();
+            let shard = ShardId { index, total };
+            let handle = std::thread::Builder::new()
+                .name(format!("ironcache-shard-raw-uring-{index}"))
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // ONE raw io_uring runtime per shard thread (one ring per shard); all of the
+                        // shard's tasks run on its `LocalSet`, interleaved never parallel (ADR-0002).
+                        raw_uring_start(async move {
+                            let drain_task =
+                                tokio::task::spawn_local(drain(index, inbox, drain_shutdown));
+                            serve_loop(conn_rx, &serve, shard, &shutdown).await;
+                            let drain_grace =
+                                tokio::time::sleep(crate::bootstrap::active_drain_grace());
+                            tokio::pin!(drain_grace);
+                            tokio::select! {
+                                _ = drain_task => {}
+                                () = &mut drain_grace => {
+                                    eprintln!(
+                                        "shard {index} (raw io_uring): drain task did not finish \
+                                         within the grace window; proceeding with shutdown"
+                                    );
+                                }
+                            }
+                        });
+                    }));
+                    if let Err(panic) = result {
+                        let shard_died: u64 = 1;
+                        eprintln!(
+                            "shard {index} (raw io_uring): serve loop panicked \
+                             (shard_died={shard_died}); shard thread exiting"
+                        );
+                        std::panic::resume_unwind(panic);
+                    }
+                })?;
+            handles.push(handle);
+        }
+
+        Ok(ShardSet::from_parts(shutdown, handles))
+    }
+
+    /// The single acceptor's loop (a copy of the tokio/io_uring bootstrap's: a blocking std accept
+    /// with a non-blocking shutdown poll, round-robining to shard channels).
+    fn acceptor_loop(
+        listener: &std::net::TcpListener,
+        conn_senders: &[tokio::sync::mpsc::UnboundedSender<std::net::TcpStream>],
+        shutdown: &Arc<AtomicBool>,
+    ) {
+        if let Err(e) = listener.set_nonblocking(true) {
+            eprintln!(
+                "acceptor (raw io_uring): set_nonblocking failed: {e}; shutdown may be delayed"
+            );
+        }
+        let poll = Duration::from_millis(1);
+        let mut next: usize = 0;
+        let n = conn_senders.len().max(1);
+        while !shutdown.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    let target = next % n;
+                    next = next.wrapping_add(1);
+                    if let Err(e) = conn_senders[target].send(stream) {
+                        eprintln!("acceptor (raw io_uring): shard {target} channel closed: {e}");
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(poll);
+                }
+                Err(e) => {
+                    eprintln!("acceptor (raw io_uring): accept error: {e}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// The shard's serve loop: await std streams on the channel, adopt each onto THIS shard's raw
+    /// ring via [`RawUringTcpStream::from_std`], and spawn `serve` per connection on the LocalSet.
+    async fn serve_loop<S, Fut>(
+        mut conn_rx: tokio::sync::mpsc::UnboundedReceiver<std::net::TcpStream>,
+        serve: &S,
+        shard: ShardId,
+        shutdown: &Arc<AtomicBool>,
+    ) where
+        S: Fn(RawIoUringRuntime, RawUringTcpStream, ShardId, Arc<AtomicBool>) -> Fut
+            + Clone
+            + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let live: LiveTasks = Rc::new(Cell::new(0));
+
+        while !shutdown.load(Ordering::Relaxed) {
+            tokio::select! {
+                maybe = conn_rx.recv() => {
+                    match maybe {
+                        Some(std_stream) => {
+                            // Adopt onto THIS shard's ring. Round-trip the fd so exactly one owner
+                            // closes it (the raw stream); the socket's non-blocking flag is
+                            // irrelevant to io_uring submissions (the ring drives readiness).
+                            let raw = std_stream.into_raw_fd();
+                            // SAFETY: `raw` is a valid open TCP socket fd just handed off by the
+                            // acceptor and retained nowhere else; the rewrap transfers sole
+                            // ownership to the raw stream.
+                            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+                            let stream = RawUringTcpStream::from_std(std_stream);
+                            let fut = serve(
+                                RawIoUringRuntime::new(),
+                                stream,
+                                shard,
+                                Arc::clone(shutdown),
+                            );
+                            live.set(live.get() + 1);
+                            let guard = LiveGuard(Rc::clone(&live));
+                            tokio::task::spawn_local(async move {
+                                let _guard = guard;
+                                fut.await;
+                            });
+                        }
+                        None => break,
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+
+        drain_live_tasks(&live, shard).await;
+    }
+
+    /// Await the shard's in-flight connection tasks until zero or the grace window elapses.
+    async fn drain_live_tasks(live: &LiveTasks, shard: ShardId) {
+        if live.get() == 0 {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + crate::bootstrap::active_drain_grace();
+        let tick = Duration::from_millis(20);
+        while live.get() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!(
+                    "shard {} (raw io_uring): drain grace elapsed with {} connection task(s) still \
+                     live; proceeding with shutdown",
+                    shard.index,
+                    live.get()
+                );
+                break;
+            }
+            tokio::time::sleep(tick).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, raw_uring_start};
