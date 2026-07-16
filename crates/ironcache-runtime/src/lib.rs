@@ -240,7 +240,7 @@ pub mod uring_probe;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub mod fixed_datapath;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-pub use fixed_datapath::recv_batch;
+pub use fixed_datapath::{recv_batch, send_batch};
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
