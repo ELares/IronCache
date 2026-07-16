@@ -226,10 +226,12 @@ pub async fn recv_batch(
             None => {}
         }
     }
-    // Owned datapath (or drained fall-back): the io_uring owned-buffer recv, appending into
-    // `read_buf`'s spare capacity, then hand ownership back.
-    let res = rt.recv(stream, std::mem::take(read_buf)).await?;
-    *read_buf = res.buf;
+    // Owned datapath (or drained fall-back): the io_uring owned-buffer recv into a FRESH buffer, then
+    // APPEND. Drop-safe -- the subscriber idle-wait's `select!` can cancel this without losing
+    // `read_buf`'s partial-frame carryover (a `mem::take(read_buf)` would strand it in the cancelled
+    // op). The registered-buffer fast path above already appends; this matches it on the cold path.
+    let res = rt.recv(stream, Vec::new()).await?;
+    read_buf.extend_from_slice(&res.buf[..res.n]);
     Ok(res.n)
 }
 

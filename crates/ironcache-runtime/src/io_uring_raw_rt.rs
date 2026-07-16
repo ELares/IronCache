@@ -271,13 +271,17 @@ impl Driver {
     // -----------------------------------------------------------------------
 
     /// Lazily create the per-shard provided-buffer group (on the first multishot arm) and provide all
-    /// its buffers to the kernel. Idempotent.
+    /// its buffers to the kernel. Idempotent. The pool is installed ONLY if the provide SQE was queued
+    /// -- otherwise the ledger (`in_group` all true) would lie about a group the kernel never got, so
+    /// on a full SQ we leave `pool` None and retry on the next arm.
     fn ensure_pool(&mut self) {
         if self.pool.is_some() {
             return;
         }
         let mut pool = MultishotPool::new();
-        // ONE ProvideBuffers SQE hands the whole slab (bids 0..N) to group MSHOT_BGID.
+        // ONE ProvideBuffers SQE hands the whole slab (bids 0..N) to group MSHOT_BGID. `pool.mem` is a
+        // stable heap slab (a `Box<[u8]>` that never reallocs; moving `pool` into `self.pool` moves
+        // only the Box header, not the heap), so the pointer stays valid for the shard's life.
         let sqe = opcode::ProvideBuffers::new(
             pool.mem.as_mut_ptr(),
             READ_WINDOW as i32,
@@ -287,19 +291,43 @@ impl Driver {
         )
         .build()
         .user_data(PROVIDE_USER_DATA);
-        // SAFETY: `pool.mem` is a stable heap slab held in `self.pool` for the shard's life, so the
-        // pointer stays valid for every buffer the kernel fills; the SQE references no other memory.
-        let _ = unsafe { self.ring.submission().push(&sqe) };
-        self.pool = Some(pool);
+        if self.try_push(&sqe) {
+            self.pool = Some(pool);
+            // Belt-and-suspenders: if a PRIOR arm was stranded because its `ensure_pool` push failed
+            // (SQ+CQ both full -- unreachable at startup, the CQ is empty then), its connection parked
+            // un-armed with no pool. Now that the group exists, sweep + re-arm any such conn so it can
+            // never stay permanently deaf. A no-op on the common first-arm path (no prior conns).
+            self.rearm_all_starved();
+        }
+    }
+
+    /// Push one SQE, retrying on a FULL submission queue. The whole multishot bookkeeping (mark a
+    /// buffer in-group, mark a connection armed) is applied by callers ONLY when this returns `true`,
+    /// so the ledger never claims a buffer/op the kernel did not actually receive (the full-SQ ledger-
+    /// corruption class). On a full SQ, `submit()` flushes the queued SQEs to the kernel to free
+    /// slots; it does NOT reap CQEs, so it never re-enters `dispatch_completions` (no recursion when
+    /// called from `complete_multishot`). Returns false only if the retry also fails (SQ *and* CQ both
+    /// full -- unreachable in practice, CQ is 4x the SQ + continuously drained).
+    fn try_push(&mut self, sqe: &squeue::Entry) -> bool {
+        // SAFETY: every `sqe` passed here is a fully-built io_uring op whose referenced memory (a
+        // provided-buffer pointer into the stable pool slab, or none for RecvMulti/AsyncCancel)
+        // outlives the op; pushing it is always valid.
+        if unsafe { self.ring.submission().push(sqe) }.is_ok() {
+            return true;
+        }
+        let _ = self.ring.submit();
+        unsafe { self.ring.submission().push(sqe) }.is_ok()
     }
 
     /// Arm a multishot recv on `fd`: create the pool if needed, allocate a fresh tagged `user_data`,
-    /// insert the connection slot, and push the `RecvMulti` SQE. Returns the `user_data` (stored on
-    /// the stream so `recv_batch` finds its slot).
+    /// insert the connection slot (armed IFF the SQE actually went in), and return the `user_data`
+    /// (stored on the stream so `recv_batch` finds its slot). If the push was dropped, `armed` is
+    /// false and `multishot_pump` re-arms on its next poll (never parks un-armed).
     fn arm_multishot(&mut self, fd: RawFd) -> u64 {
         self.ensure_pool();
         let ud = MSHOT_TAG | self.next_mshot_seq;
         self.next_mshot_seq += 1;
+        let armed = self.push_recvmulti(fd, ud);
         self.mshot.insert(
             ud,
             MultishotConn {
@@ -308,44 +336,80 @@ impl Driver {
                 waker: None,
                 eof: false,
                 err: None,
-                armed: true,
+                armed,
                 cancelling: false,
             },
         );
-        self.push_recvmulti(fd, ud);
         ud
     }
 
-    /// Push a `RecvMulti` SQE (arm or re-arm) against the shared group.
-    fn push_recvmulti(&mut self, fd: RawFd, ud: u64) {
+    /// Push a `RecvMulti` SQE (arm or re-arm). Returns whether it was queued (callers set `armed`
+    /// accordingly, so a dropped arm never lies about being in flight -- the armed-but-no-op class).
+    fn push_recvmulti(&mut self, fd: RawFd, ud: u64) -> bool {
         let sqe = opcode::RecvMulti::new(types::Fd(fd), MSHOT_BGID)
             .build()
             .user_data(ud);
-        // SAFETY: RecvMulti references only the fd + the group id (no user buffer -- the kernel picks
-        // buffers from the provided group), so it is always valid to submit.
-        let _ = unsafe { self.ring.submission().push(&sqe) };
+        self.try_push(&sqe)
     }
 
-    /// Return buffer `bid` to the kernel group: mark it in (rejecting a double-provide) and push a
-    /// one-buffer `ProvideBuffers` SQE.
+    /// Return buffer `bid` to the kernel group. Pushes the one-buffer `ProvideBuffers` FIRST and marks
+    /// it in-group ONLY on success, so the ledger never claims a buffer the kernel did not receive.
+    /// When this refills a group that was empty, re-arm every connection that parked un-armed waiting
+    /// for a buffer (else it stays permanently DEAF -- no in-flight op means no CQE will ever wake it).
     fn reprovide(&mut self, bid: u16) {
-        let Some(pool) = self.pool.as_mut() else {
-            return;
+        let (already_in, was_empty) = match self.pool.as_ref() {
+            Some(p) => (p.in_group[bid as usize], p.in_group_count == 0),
+            None => return,
         };
-        if !pool.mark_in(bid) {
+        if already_in {
             return; // already in-group: never double-provide (would alias a live read)
         }
-        let ptr = unsafe { pool.mem.as_mut_ptr().add(MultishotPool::offset(bid)) };
+        // SAFETY: `ptr` is within the stable pool slab (a `Box<[u8]>` that never reallocs); the buffer
+        // is not in the group, so the kernel is never handed the same buffer twice.
+        let ptr = unsafe {
+            self.pool
+                .as_mut()
+                .unwrap()
+                .mem
+                .as_mut_ptr()
+                .add(MultishotPool::offset(bid))
+        };
         let sqe = opcode::ProvideBuffers::new(ptr, READ_WINDOW as i32, 1, MSHOT_BGID, bid)
             .build()
             .user_data(PROVIDE_USER_DATA);
-        // SAFETY: `ptr` is within the stable pool slab; the buffer is not in the group (mark_in just
-        // claimed it), so the kernel is never handed the same buffer twice.
-        let _ = unsafe { self.ring.submission().push(&sqe) };
+        if !self.try_push(&sqe) {
+            // SQ+CQ both full (unreachable in practice): leave the buffer checked-out (honest ledger,
+            // never double-issued) rather than desyncing the count. It is retried by no one, so this
+            // is a rare bounded shrink, not a corruption.
+            return;
+        }
+        self.pool.as_mut().unwrap().mark_in(bid);
+        if was_empty {
+            self.rearm_all_starved();
+        }
+    }
+
+    /// Re-arm every connection that is un-armed + not cancelling (its multishot terminated on
+    /// exhaustion / churn and it is waiting for a buffer). Called when a `reprovide` refills a
+    /// previously-empty group. A re-armed op consumes no buffer until the kernel fills one, so all
+    /// starved conns can be armed against a single freed buffer; losers re-terminate on -ENOBUFS and
+    /// are swept again on the next reprovide. No explicit wake needed: the re-armed op's next CQE
+    /// wakes the parked `recv_batch`.
+    fn rearm_all_starved(&mut self) {
+        let starved: Vec<u64> = self
+            .mshot
+            .iter()
+            .filter(|(_, c)| !c.armed && !c.cancelling)
+            .map(|(ud, _)| *ud)
+            .collect();
+        for ud in starved {
+            self.rearm_if_needed(ud);
+        }
     }
 
     /// Re-arm the multishot recv for `ud` if it terminated (armed == false) AND the group has a buffer
-    /// to land into. Called after `recv_batch` re-provides buffers, upholding "never park un-armed".
+    /// to land into. Sets `armed` only if the SQE actually went in. Called from `recv_batch` after it
+    /// re-provides (upholding "never park un-armed") and from `rearm_all_starved` on a group refill.
     fn rearm_if_needed(&mut self, ud: u64) {
         let should = self
             .mshot
@@ -359,9 +423,9 @@ impl Driver {
             return;
         }
         let fd = self.mshot.get(&ud).map(|c| c.fd).expect("slot present");
-        self.push_recvmulti(fd, ud);
+        let armed = self.push_recvmulti(fd, ud);
         if let Some(c) = self.mshot.get_mut(&ud) {
-            c.armed = true;
+            c.armed = armed;
         }
     }
 
@@ -496,8 +560,9 @@ impl Driver {
         let cancel = opcode::AsyncCancel::new(ud)
             .build()
             .user_data(CANCEL_USER_DATA);
-        // SAFETY: AsyncCancel references only a user_data key (no user buffer); always valid to submit.
-        let _ = unsafe { self.ring.submission().push(&cancel) };
+        // Retry on a full SQ so the cancel is not silently dropped (a dropped cancel would strand the
+        // op until teardown). AsyncCancel references only a user_data key (no user buffer).
+        self.try_push(&cancel);
     }
 
     /// Transition the slab slot for a landed CQE.
@@ -573,12 +638,41 @@ impl Drop for Driver {
                 let _ = unsafe { self.ring.submission().push(&cancel) };
             }
         }
+        // Cancel in-flight MULTISHOT ops too (#513): they live in `self.mshot`, NOT `self.ops`, so
+        // the loop below must also drain them, else the ring fd would close while a multishot recv is
+        // still armed against the pool -- the kernel's async release could write into `pool.mem` AFTER
+        // it frees (teardown UAF). Mark each cancelling; AsyncCancel the armed ones so their terminal
+        // CQE removes the slot (`complete_multishot`); drop the un-armed ones now (their ready buffers
+        // were already filled -- the kernel is done with them).
+        let mshot_uds: Vec<u64> = self.mshot.keys().copied().collect();
+        for ud in mshot_uds {
+            let armed = match self.mshot.get_mut(&ud) {
+                Some(c) => {
+                    c.cancelling = true;
+                    c.waker = None;
+                    c.armed
+                }
+                None => continue,
+            };
+            if armed {
+                let cancel = opcode::AsyncCancel::new(ud)
+                    .build()
+                    .user_data(CANCEL_USER_DATA);
+                if unsafe { self.ring.submission().push(&cancel) }.is_err() {
+                    let _ = self.ring.submit();
+                    let _ = unsafe { self.ring.submission().push(&cancel) };
+                }
+            } else {
+                self.mshot.remove(&ud);
+            }
+        }
+
         // Reap to quiescence. `submit_and_wait(1)` submits the queued cancels (and any still-queued
         // original SQEs) and blocks for at least one CQE; `dispatch_completions` frees each `Ignored`
-        // slot on its CQE. The idle-round bound is a paranoia backstop against a slot that never
-        // completes -- it caps shutdown work rather than risking an unbounded hang.
+        // slot / removes each cancelled multishot slot on its CQE. The idle-round bound is a paranoia
+        // backstop against a slot that never completes -- it caps shutdown work rather than hanging.
         let mut idle_rounds = 0u32;
-        while !self.ops.is_empty() && idle_rounds < 4096 {
+        while (!self.ops.is_empty() || !self.mshot.is_empty()) && idle_rounds < 4096 {
             match self.ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
@@ -1304,9 +1398,12 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
             })
             .await;
         }
-        // Fallback: the shipped single-shot owned recv (append into read_buf, hand ownership back).
-        let res = self.recv(stream, core::mem::take(read_buf)).await?;
-        *read_buf = res.buf;
+        // Fallback (older kernel, no multishot): single-shot owned recv into a FRESH buffer, then
+        // APPEND. This is DROP-SAFE -- the subscriber idle-wait's `select!` can cancel this recv
+        // without losing `read_buf`'s partial-frame carryover (a `mem::take(read_buf)` would strand
+        // the carryover in the cancelled op). One copy on this cold path; the fast paths never take it.
+        let res = self.recv(stream, Vec::new()).await?;
+        read_buf.extend_from_slice(&res.buf[..res.n]);
         Ok(res.n)
     }
 
@@ -1559,7 +1656,9 @@ mod raw_uring_bootstrap {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, raw_uring_start};
+    use super::{
+        RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, raw_uring_start, with_driver,
+    };
     use crate::Runtime;
     use std::io::{Read, Write};
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -1871,6 +1970,48 @@ mod tests {
                 b"OK",
                 "runtime intact after a cancelled multishot conn"
             );
+        });
+    }
+
+    /// #513 DEAF-CONNECTION regression (the adversarial-review CRITICAL): a multishot connection that
+    /// terminated un-armed while the shared group was EXHAUSTED must be re-armed when a `reprovide`
+    /// refills the group -- else it hangs forever (no in-flight op => no CQE => its waker never fires).
+    /// Drives the `Driver` directly: arm two conns, simulate exhaustion (un-arm both + empty the
+    /// group), reprovide ONE buffer, assert BOTH were re-armed by the empty->non-empty sweep.
+    #[test]
+    fn multishot_reprovide_rearms_starved_connections() {
+        raw_uring_start(async {
+            let (s1, c1) = socket_pair();
+            let (s2, c2) = socket_pair();
+            std::mem::forget(c1); // keep peers open so the armed recvs genuinely park
+            std::mem::forget(c2);
+            if !with_driver(|d| d.multishot_ok) {
+                return; // older kernel: multishot inactive, nothing to test
+            }
+            let ud1 = with_driver(|d| d.arm_multishot(s1.fd));
+            let ud2 = with_driver(|d| d.arm_multishot(s2.fd));
+            // Simulate exhaustion: both conns terminated un-armed, the whole group checked out.
+            with_driver(|d| {
+                d.mshot.get_mut(&ud1).unwrap().armed = false;
+                d.mshot.get_mut(&ud2).unwrap().armed = false;
+                let pool = d.pool.as_mut().unwrap();
+                for bid in 0..super::MSHOT_NBUFS {
+                    pool.mark_out(bid);
+                }
+                assert_eq!(pool.in_group_count, 0, "group fully exhausted");
+            });
+            // Reprovide ONE buffer -> the empty->non-empty transition must re-arm EVERY starved conn.
+            with_driver(|d| d.reprovide(0));
+            with_driver(|d| {
+                assert!(
+                    d.mshot.get(&ud1).unwrap().armed,
+                    "conn1 re-armed on group refill (was permanently deaf before the fix)"
+                );
+                assert!(
+                    d.mshot.get(&ud2).unwrap().armed,
+                    "conn2 re-armed on group refill (was permanently deaf before the fix)"
+                );
+            });
         });
     }
 }
