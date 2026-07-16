@@ -896,8 +896,30 @@ pub fn run_server_observed(
     // types and need no nameable trait alias.
     let want_io_uring = config.runtime == ironcache_config::RuntimeBackend::IoUring;
 
+    // PROBE THE RUNNING KERNEL before committing to io_uring. `run_shards_uring` drives
+    // `tokio_uring::start`, whose ring setup PANICS the shard threads on a kernel that lacks
+    // io_uring (too old) or has it disabled (seccomp / a hardened kernel / a sysctl). Probing here
+    // and falling back to tokio CLEANLY means `runtime = io_uring` never dies a shard on an
+    // incapable kernel -- the robustness prerequisite for making io_uring a default (#284). The
+    // probe builds one tiny throwaway ring; its `Err` IS the fall-back signal.
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    let set = if want_io_uring && config.tls != ironcache_config::TlsMode::On {
+    let uring_kernel_ok = if want_io_uring && config.tls != ironcache_config::TlsMode::On {
+        match ironcache_runtime::uring_probe::probe_uring_caps() {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "runtime = io_uring requested, but this kernel cannot provide io_uring \
+                     ({e}); falling back to the tokio backend for this node"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    let set = if uring_kernel_ok {
         tracing::info!(
             "runtime = io_uring: using the Linux io_uring datapath (plaintext); the \
              registered-buffer / multishot fast path and a perf benchmark are deferred to a \
@@ -933,10 +955,11 @@ pub fn run_server_observed(
         };
         ironcache_runtime::run_shards_uring(&shard_cfg, uring_serve, rxs, drain)?
     } else {
-        if want_io_uring {
+        if want_io_uring && config.tls == ironcache_config::TlsMode::On {
             // io_uring + TLS do not compose in v1 (rustls drives tokio AsyncRead/AsyncWrite, not
             // io_uring submissions). Refusing would break a TLS deployment that asked for io_uring;
-            // FALL BACK to tokio (which serves TLS) and log it, never breaking TLS.
+            // FALL BACK to tokio (which serves TLS) and log it, never breaking TLS. The
+            // kernel-incapable fall-back already logged its own reason in `uring_kernel_ok`.
             tracing::warn!(
                 "runtime = io_uring requested with TLS on; the io_uring datapath does not support \
                  TLS in v1 -- falling back to the tokio backend for this node"
