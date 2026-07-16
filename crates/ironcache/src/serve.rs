@@ -758,6 +758,12 @@ pub fn run_server_observed(
     let ctx_template_for_uring = ctx_template.clone();
     let inbox_for_uring = inbox.clone();
     let persist_for_uring = persist.clone();
+    // A SECOND clone set for the RAW io_uring serve closure (#682 P2): io_uring and io_uring_raw are
+    // separate cfg branches that would each `move` the captures, so the raw branch needs its own set
+    // (only one backend runs; the unused set is bound to `_` in the tokio fallback below).
+    let ctx_template_for_raw_uring = ctx_template.clone();
+    let inbox_for_raw_uring = inbox.clone();
+    let persist_for_raw_uring = persist.clone();
 
     // EMBEDDED TRANSPORT TLS for the CLIENT listener (#105, docs/design/TLS.md). Build the rustls
     // acceptor ONCE at boot when `tls = on`, from the configured cert/key PEM, and clone the cheap
@@ -895,94 +901,142 @@ pub fn run_server_observed(
     // (not a helper fn) so the concrete `serve` / `drain` closures keep their inferred opaque
     // types and need no nameable trait alias.
     let want_io_uring = config.runtime == ironcache_config::RuntimeBackend::IoUring;
+    let want_raw_uring = config.runtime == ironcache_config::RuntimeBackend::IoUringRaw;
 
-    // PROBE THE RUNNING KERNEL before committing to io_uring. `run_shards_uring` drives
-    // `tokio_uring::start`, whose ring setup PANICS the shard threads on a kernel that lacks
-    // io_uring (too old) or has it disabled (seccomp / a hardened kernel / a sysctl). Probing here
-    // and falling back to tokio CLEANLY means `runtime = io_uring` never dies a shard on an
-    // incapable kernel -- the robustness prerequisite for making io_uring a default (#284). The
-    // probe builds one tiny throwaway ring; its `Err` IS the fall-back signal.
+    // PROBE THE RUNNING KERNEL before committing to EITHER io_uring backend (tokio-uring or the raw
+    // backend, #682). The per-shard ring setup would otherwise die a shard thread on a kernel that
+    // lacks io_uring / has it disabled; probing here and falling back to tokio CLEANLY means
+    // `runtime = io_uring[_raw]` never fails to start a node. Both backends share the same probe +
+    // the same TLS-off precondition (neither serves TLS in v1). Each `*_ok` is const-`false` unless
+    // its feature is compiled in, so the matching serve branch below is dead (not compiled) on a
+    // build without that feature.
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    let uring_kernel_ok = if want_io_uring && config.tls != ironcache_config::TlsMode::On {
-        match ironcache_runtime::uring_probe::probe_uring_caps() {
+    let io_uring_ok = want_io_uring
+        && config.tls != ironcache_config::TlsMode::On
+        && match ironcache_runtime::uring_probe::probe_uring_caps() {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!(
-                    "runtime = io_uring requested, but this kernel cannot provide io_uring \
+                    "runtime = io_uring requested, but this kernel cannot provide io_uring ({e}); \
+                     falling back to the tokio backend for this node"
+                );
+                false
+            }
+        };
+    #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+    let io_uring_ok = false;
+
+    #[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+    let raw_uring_ok = want_raw_uring
+        && config.tls != ironcache_config::TlsMode::On
+        && match ironcache_runtime::uring_probe::probe_uring_caps() {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "runtime = io_uring_raw requested, but this kernel cannot provide io_uring \
                      ({e}); falling back to the tokio backend for this node"
                 );
                 false
             }
-        }
-    } else {
-        false
-    };
-
-    #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    let set = if uring_kernel_ok {
-        tracing::info!(
-            "runtime = io_uring: using the Linux io_uring datapath (plaintext); the \
-             registered-buffer / multishot fast path and a perf benchmark are deferred to a \
-             Linux soak (no throughput claim made)"
-        );
-        let uring_serve = {
-            let ctx_template = ctx_template_for_uring;
-            let inbox = inbox_for_uring;
-            let persist = persist_for_uring;
-            move |rt: ironcache_runtime::IoUringRuntime,
-                  stream: ironcache_runtime::UringTcpStream,
-                  shard: ShardId,
-                  shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
-                let ctx = ctx_template.clone();
-                let inbox = inbox.clone();
-                let persist = persist.clone();
-                async move {
-                    serve_connection_uring(
-                        rt,
-                        stream,
-                        shard,
-                        ctx,
-                        default_proto,
-                        inbox,
-                        persist,
-                        // The shared shutdown flag (#543): mirror the tokio path so a parked
-                        // io_uring subscriber idle-wait also closes promptly on a graceful stop.
-                        shutdown,
-                    )
-                    .await;
-                }
-            }
         };
-        ironcache_runtime::run_shards_uring(&shard_cfg, uring_serve, rxs, drain)?
-    } else {
-        if want_io_uring && config.tls == ironcache_config::TlsMode::On {
-            // io_uring + TLS do not compose in v1 (rustls drives tokio AsyncRead/AsyncWrite, not
-            // io_uring submissions). Refusing would break a TLS deployment that asked for io_uring;
-            // FALL BACK to tokio (which serves TLS) and log it, never breaking TLS. The
-            // kernel-incapable fall-back already logged its own reason in `uring_kernel_ok`.
-            tracing::warn!(
-                "runtime = io_uring requested with TLS on; the io_uring datapath does not support \
-                 TLS in v1 -- falling back to the tokio backend for this node"
-            );
-        }
-        ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?
-    };
+    #[cfg(not(all(target_os = "linux", feature = "io_uring_raw")))]
+    let raw_uring_ok = false;
 
-    #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
-    let set = {
-        if want_io_uring {
-            // Requested but this build/target cannot provide it: fall back to tokio with a clear
-            // one-line log (never a boot failure). The `_for_uring` captures are unused on this
-            // build; bind them to `_` so the no-feature build has no dead-code warning.
+    // Assign the shard set exactly once. At most one of `io_uring_ok` / `raw_uring_ok` is true
+    // (`config.runtime` is a single value). Each io_uring body is cfg-gated so a build WITHOUT that
+    // feature compiles the (unreachable, provably-not-taken) fallback arm in its place.
+    let set = if io_uring_ok {
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        {
+            tracing::info!(
+                "runtime = io_uring: using the Linux io_uring datapath (plaintext); the \
+                 registered-buffer / multishot fast path and a perf benchmark are deferred to a \
+                 Linux soak (no throughput claim made)"
+            );
+            let uring_serve =
+                {
+                    let ctx_template = ctx_template_for_uring;
+                    let inbox = inbox_for_uring;
+                    let persist = persist_for_uring;
+                    move |rt: ironcache_runtime::IoUringRuntime,
+                      stream: ironcache_runtime::UringTcpStream,
+                      shard: ShardId,
+                      shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                    let ctx = ctx_template.clone();
+                    let inbox = inbox.clone();
+                    let persist = persist.clone();
+                    async move {
+                        serve_connection_uring(
+                            rt, stream, shard, ctx, default_proto, inbox, persist, shutdown,
+                        )
+                        .await;
+                    }
+                }
+                };
+            ironcache_runtime::run_shards_uring(&shard_cfg, uring_serve, rxs, drain)?
+        }
+        #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+        {
+            unreachable!("io_uring_ok is false unless the io_uring feature is compiled in")
+        }
+    } else if raw_uring_ok {
+        #[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+        {
+            tracing::info!(
+                "runtime = io_uring_raw: using the Linux RAW io_uring datapath (plaintext, #682); \
+                 it cross-builds on static-musl and reaches multishot (deferred to a Linux soak; no \
+                 throughput claim made)"
+            );
+            let raw_serve =
+                {
+                    let ctx_template = ctx_template_for_raw_uring;
+                    let inbox = inbox_for_raw_uring;
+                    let persist = persist_for_raw_uring;
+                    move |rt: ironcache_runtime::RawIoUringRuntime,
+                      stream: ironcache_runtime::RawUringTcpStream,
+                      shard: ShardId,
+                      shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                    let ctx = ctx_template.clone();
+                    let inbox = inbox.clone();
+                    let persist = persist.clone();
+                    async move {
+                        serve_connection_raw_uring(
+                            rt, stream, shard, ctx, default_proto, inbox, persist, shutdown,
+                        )
+                        .await;
+                    }
+                }
+                };
+            ironcache_runtime::run_shards_raw_uring(&shard_cfg, raw_serve, rxs, drain)?
+        }
+        #[cfg(not(all(target_os = "linux", feature = "io_uring_raw")))]
+        {
+            unreachable!("raw_uring_ok is false unless the io_uring_raw feature is compiled in")
+        }
+    } else {
+        // Tokio fallback: the default + non-Linux + no-feature + TLS-on + kernel-incapable path.
+        if (want_io_uring || want_raw_uring) && config.tls == ironcache_config::TlsMode::On {
             tracing::warn!(
-                "runtime = io_uring requested, but this build is not a Linux build with the \
-                 `io_uring` feature; falling back to the tokio backend"
+                "runtime = io_uring[_raw] requested with TLS on; the io_uring datapath does not \
+                 support TLS in v1 -- falling back to the tokio backend for this node"
+            );
+        } else if want_io_uring || want_raw_uring {
+            // Requested but this build/target/kernel cannot provide it (a compiled-in probe already
+            // logged the specific kernel reason above). Never a boot failure.
+            tracing::warn!(
+                "runtime = io_uring[_raw] requested, but this build/target/kernel cannot provide \
+                 it; falling back to the tokio backend for this node"
             );
         }
+        // Bind the OPTIONAL io_uring serve captures to `_` so an arm/build that did not consume them
+        // has no dead-code warning (they are cheap clones prepared unconditionally above).
         let _ = (
             &ctx_template_for_uring,
             &inbox_for_uring,
             &persist_for_uring,
+            &ctx_template_for_raw_uring,
+            &inbox_for_raw_uring,
+            &persist_for_raw_uring,
         );
         ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?
     };
@@ -2516,22 +2570,36 @@ async fn serve_connection(
 ///
 /// The registered-buffer / multishot fast path (IOURING_DATAPATH.md) and a perf benchmark are
 /// deferred to a Linux soak; no throughput claim is made here.
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn serve_connection_uring(
-    rt: ironcache_runtime::IoUringRuntime,
-    mut stream: ironcache_runtime::UringTcpStream,
+/// The io_uring serve loop, GENERIC over the [`ironcache_runtime::Runtime`] backend so BOTH the
+/// tokio-uring (`IoUringRuntime`) and the raw (`RawIoUringRuntime`) backends share ONE implementation
+/// (#682 P2). The backend-specific per-connection setup -- peer/local address + `SO_KEEPALIVE`, which
+/// need a borrowed-fd `unsafe` dance done in the runtime crate -- is performed by the thin wrappers
+/// `serve_connection_uring` / `serve_connection_raw_uring` and handed in as `addr`/`laddr`. Both
+/// backends fix `Buf = Vec<u8>`, so the loop's owned buffers are concrete `Vec<u8>`.
+async fn serve_connection_generic<R>(
+    rt: R,
+    mut stream: R::Stream,
     home: ShardId,
     mut ctx: ServerContext,
     default_proto: ProtoVersion,
     inbox: coordinator::Inbox,
     persist: Option<Arc<crate::persist::PersistState>>,
+    addr: String,
+    laddr: String,
     // The per-shard graceful-shutdown flag (#543), mirrored from the tokio serve path: the
     // subscribe-mode idle wait races a short poll of it so a PARKED io_uring subscriber closes
     // promptly on a graceful stop instead of blocking the shard-thread join until the drain grace.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
-) {
-    use ironcache_runtime::Runtime;
+) where
+    R: ironcache_runtime::BatchedRecvSend,
+{
+    // No `use` of the traits is needed: `rt`'s methods (`recv_batch`/`send_batch`, and the `Runtime`
+    // supertrait's `send`/`timer`) resolve through the generic `R: BatchedRecvSend` bound directly.
 
     let env = shard_env();
     adopt_metrics_cell(ctx.metrics_registry.as_ref(), home.index);
@@ -2571,18 +2639,9 @@ async fn serve_connection_uring(
         gate: Arc::clone(&ctx.conn_gate),
     };
 
-    // Peer/local addresses for CLIENT INFO. tokio-uring's TcpStream has no peer_addr/local_addr,
-    // so derive them from the borrowed fd (without taking fd ownership). The borrowed-fd dance
-    // needs `unsafe`, which THIS crate FORBIDS (`#![forbid(unsafe_code)]`), so it lives in the
-    // runtime crate's `peer_local_addrs` helper (mirroring the io_uring backend's nodelay helper).
-    // A failure leaves the field empty (cosmetic only).
-    let (addr, laddr) = ironcache_runtime::peer_local_addrs(&stream);
-
-    // TCP KEEPALIVE (Area C), the io_uring analog of the tokio accept path: apply SO_KEEPALIVE with
-    // the live `tcp-keepalive` idle interval at accept (the borrowed-fd helper lives in the runtime
-    // crate so the `unsafe` fd dance stays out of this crate). `0` disables it; a `CONFIG SET`
-    // applies to newly-accepted connections.
-    ironcache_runtime::set_keepalive_uring(&stream, ctx.runtime.tcp_keepalive_secs());
+    // `addr`/`laddr` (peer/local for CLIENT INFO) and the SO_KEEPALIVE application are done by the
+    // backend-specific wrapper before this generic loop is entered -- they need a borrowed-fd
+    // `unsafe` dance on the concrete stream type, which lives in the runtime crate.
 
     let client_id = {
         let mut s = state_rc.borrow_mut();
@@ -2879,7 +2938,7 @@ async fn serve_connection_uring(
             // OneShotFixed WRITE tier (#284): stage the reply through this shard's REGISTERED
             // fixed buffer when one is free and the reply fits, else the owned send. Byte-identical
             // output; hands the buffer back for reuse exactly like the owned `rt.send` did.
-            match ironcache_runtime::send_batch(&rt, &mut stream, std::mem::take(&mut out)).await {
+            match rt.send_batch(&mut stream, std::mem::take(&mut out)).await {
                 Ok(returned) => {
                     out = returned;
                     // #527: net output for the io_uring batch flush (one relaxed atomic add).
@@ -2914,7 +2973,7 @@ async fn serve_connection_uring(
         // this idle wait, so a push is rendered + sent only AFTER the in-flight command batch's
         // reply went out.
         if conn.is_subscriber() || conn.tracking_on {
-            if subscriber_idle_wait_uring(
+            if subscriber_idle_wait_generic(
                 &rt,
                 &mut stream,
                 &mut push_rx,
@@ -2937,7 +2996,7 @@ async fn serve_connection_uring(
             // recv seam -- both APPEND into `read_buf`, preserving any partial-frame carryover, so
             // this is behavior-preserving for the pipelining model. A clean EOF (`n == 0`) or any
             // error closes the connection.
-            let Ok(n) = ironcache_runtime::recv_batch(&rt, &mut stream, &mut read_buf).await else {
+            let Ok(n) = rt.recv_batch(&mut stream, &mut read_buf).await else {
                 break;
             };
             if n == 0 {
@@ -2970,6 +3029,69 @@ async fn serve_connection_uring(
         conn.clear_watch();
     }
     state_rc.borrow_mut().counters.on_connection_close();
+}
+
+/// Thin TOKIO-URING wrapper: does the concrete-`UringTcpStream` per-connection setup (peer/local
+/// address for CLIENT INFO + SO_KEEPALIVE, both via the runtime crate's borrowed-fd helpers so the
+/// `unsafe` stays out of this crate), then runs the shared [`serve_connection_generic`] loop.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection_uring(
+    rt: ironcache_runtime::IoUringRuntime,
+    stream: ironcache_runtime::UringTcpStream,
+    home: ShardId,
+    ctx: ServerContext,
+    default_proto: ProtoVersion,
+    inbox: coordinator::Inbox,
+    persist: Option<Arc<crate::persist::PersistState>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (addr, laddr) = ironcache_runtime::peer_local_addrs(&stream);
+    ironcache_runtime::set_keepalive_uring(&stream, ctx.runtime.tcp_keepalive_secs());
+    serve_connection_generic(
+        rt,
+        stream,
+        home,
+        ctx,
+        default_proto,
+        inbox,
+        persist,
+        addr,
+        laddr,
+        shutdown,
+    )
+    .await;
+}
+
+/// Thin RAW io_uring wrapper (#682 P2): the same per-connection setup as `serve_connection_uring`
+/// but on the raw backend's concrete `RawUringTcpStream`, then the SAME shared generic serve loop.
+#[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection_raw_uring(
+    rt: ironcache_runtime::RawIoUringRuntime,
+    stream: ironcache_runtime::RawUringTcpStream,
+    home: ShardId,
+    ctx: ServerContext,
+    default_proto: ProtoVersion,
+    inbox: coordinator::Inbox,
+    persist: Option<Arc<crate::persist::PersistState>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (addr, laddr) = ironcache_runtime::peer_local_addrs_raw(&stream);
+    ironcache_runtime::set_keepalive_raw(&stream, ctx.runtime.tcp_keepalive_secs());
+    serve_connection_generic(
+        rt,
+        stream,
+        home,
+        ctx,
+        default_proto,
+        inbox,
+        persist,
+        addr,
+        laddr,
+        shutdown,
+    )
+    .await;
 }
 
 /// How often a subscribe-mode idle wait re-checks the shared shutdown flag (#543). A subscriber
@@ -3117,19 +3239,25 @@ async fn subscriber_idle_wait(
 /// canonical tokio time driver under `tokio_uring::start`), so a subscriber parked on this `select!`
 /// observes a graceful stop within one interval and closes instead of blocking the shard-thread join
 /// until the drain grace. It fires only on a fully idle subscriber; a false wake re-arms the wait.
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
 #[allow(clippy::too_many_arguments)]
-async fn subscriber_idle_wait_uring(
-    rt: &ironcache_runtime::IoUringRuntime,
-    stream: &mut ironcache_runtime::UringTcpStream,
+async fn subscriber_idle_wait_generic<R>(
+    rt: &R,
+    stream: &mut R::Stream,
     push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
     shed: &std::sync::Arc<crate::pubsub::ShedSignal>,
     read_buf: &mut Vec<u8>,
     out: &mut Vec<u8>,
     proto: ProtoVersion,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> bool {
-    use ironcache_runtime::Runtime;
+) -> bool
+where
+    R: ironcache_runtime::Runtime<Buf = Vec<u8>>,
+{
+    // `rt`'s `recv`/`send`/`timer` resolve through the generic `R: Runtime` bound directly.
     // Fast pre-check: if the publisher already shed this connection between iterations, close now
     // without entering the select! (the table sender is gone; nothing more will arrive). This is
     // ALSO the close-on-shed for a pure-idle flooded subscriber (FIX2 non-negotiable).

@@ -21,7 +21,7 @@
 //! The split mirrors the rest of the runtime's Linux-only work: the DECISION ([`select_datapath`] +
 //! the [`UringCaps`]/[`DataPath`] types) is pure and cfg-FREE, so it is truth-table unit-tested on
 //! every host (including the macOS CI); the PROBE + its version-gating helpers are
-//! `#[cfg(all(target_os = "linux", feature = "io_uring"))]`, with the version-boundary logic
+//! `#[cfg(all(target_os = "linux", any(feature = "io_uring", feature = "io_uring_raw")))]`, with the version-boundary logic
 //! truth-table tested on SYNTHETIC kernel versions (so all the 5.6/5.7/5.19/6.0 boundaries are
 //! covered deterministically) and the real ring only smoke-tested (the CI io_uring datapath job + a
 //! local Linux container). The fast datapaths this selects between are built ON this probe (a
@@ -112,7 +112,10 @@ pub fn select_datapath(caps: UringCaps) -> DataPath {
 /// BACKSTOP: [`select_datapath`] requires BOTH `multishot_recv` (version) AND `provided_buffers`
 /// (opcode) for the fast path, so a kernel that reports a new VERSION but has the buffer opcode
 /// masked (a restricted/seccomp env) still falls back safely rather than submitting a doomed op.
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
 #[must_use]
 fn caps_from_version_and_opcodes(
     major: u32,
@@ -134,7 +137,10 @@ fn caps_from_version_and_opcodes(
 /// Parse a Linux `osrelease` string (e.g. `"6.8.0-117-generic"`) into `(major, minor)`. Returns
 /// `None` for anything unparseable, which the probe treats CONSERVATIVELY (no multishot -- the safe
 /// direction: a slower path, never an `EINVAL` from an unsupported flag).
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
 fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut fields = release.trim().split('.');
     let major = fields.next()?.parse().ok()?;
@@ -157,7 +163,10 @@ fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
 /// Returns the underlying `io::Error` if the ring cannot be created or the probe register fails
 /// (io_uring absent/disabled) -- a signal to fall back, not a crash. An unreadable/malformed kernel
 /// version is NOT an error: it degrades to the conservative no-multishot caps.
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
 pub fn probe_uring_caps() -> std::io::Result<UringCaps> {
     use io_uring::{IoUring, Probe, opcode};
 
@@ -244,7 +253,10 @@ mod tests {
     // without needing many real kernels, and the real probe is only smoke-tested (the environment's
     // actual caps vary across CI runners, so specific caps are NOT asserted -- the detection LOGIC is
     // what the synthetic truth tables pin down).
-    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "io_uring", feature = "io_uring_raw")
+    ))]
     mod linux {
         use super::super::{
             DataPath, caps_from_version_and_opcodes, parse_kernel_version, probe_uring_caps,

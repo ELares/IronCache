@@ -210,7 +210,9 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     // non-runtime-CONFIG layer. `None` (the no-flag default) leaves the lower layers showing through.
     let cli_runtime = match cli.runtime.as_deref() {
         Some(tok) => Some(ironcache_config::parse_runtime_backend(tok).ok_or_else(|| {
-            anyhow::anyhow!("--runtime: not a runtime backend (expected tokio/io_uring): {tok}")
+            anyhow::anyhow!(
+                "--runtime: not a runtime backend (expected tokio / io_uring / io_uring_raw): {tok}"
+            )
         })?),
         None => None,
     };
@@ -656,6 +658,31 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
                     .to_owned()
             }
         }
+        ironcache_config::RuntimeBackend::IoUringRaw
+            if cfg.tls == ironcache_config::TlsMode::On =>
+        {
+            "io_uring_raw requested -> tokio (TLS is on; the io_uring datapath is plaintext-only \
+             in v1)"
+                .to_owned()
+        }
+        ironcache_config::RuntimeBackend::IoUringRaw => {
+            #[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+            {
+                match ironcache_runtime::uring_probe::probe_uring_caps() {
+                    Ok(_) => "io_uring_raw (Linux, io_uring_raw feature, TLS off, kernel-capable)"
+                        .to_owned(),
+                    Err(e) => format!(
+                        "io_uring_raw requested -> tokio (this kernel cannot provide io_uring: {e})"
+                    ),
+                }
+            }
+            #[cfg(not(all(target_os = "linux", feature = "io_uring_raw")))]
+            {
+                "io_uring_raw requested -> tokio (this binary is not a Linux build with the \
+                 io_uring_raw feature)"
+                    .to_owned()
+            }
+        }
     };
     println!("  runtime     = {runtime_desc}");
     println!("  databases   = {}", cfg.databases);
@@ -740,6 +767,7 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
         match cfg.runtime {
             ironcache_config::RuntimeBackend::Tokio => "tokio",
             ironcache_config::RuntimeBackend::IoUring => "io_uring",
+            ironcache_config::RuntimeBackend::IoUringRaw => "io_uring_raw",
         }
     );
     println!("databases = {}", cfg.databases);

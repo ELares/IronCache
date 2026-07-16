@@ -184,7 +184,8 @@ pub use io_uring_rt::{IoUringRuntime, peer_local_addrs, run_shards_uring, set_ke
 pub mod io_uring_raw_rt;
 #[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
 pub use io_uring_raw_rt::{
-    RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, raw_uring_start,
+    RawIoUringRuntime, RawUringTcpListener, RawUringTcpStream, peer_local_addrs_raw,
+    raw_uring_start, run_shards_raw_uring, set_keepalive_raw,
 };
 // Re-export the io_uring transport stream type so the `ironcache` serve loop can name it
 // (`ironcache_runtime::UringTcpStream`) WITHOUT taking a direct dependency on `tokio-uring`: the
@@ -254,6 +255,37 @@ pub mod uring_probe;
 pub mod fixed_datapath;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub use fixed_datapath::{recv_batch, send_batch};
+
+/// Batched recv/send for the io_uring serve loop, provided PER BACKEND so ONE generic serve loop
+/// (the `ironcache` crate's `serve_connection_generic`, #682 P2) serves both io_uring backends
+/// without losing the tokio-uring fixed-buffer optimization:
+///
+/// * [`IoUringRuntime`] stages through its per-shard REGISTERED fixed-buffer slab (the OneShotFixed
+///   fast path, #284) when the kernel selected it, else the owned recv/send.
+/// * [`RawIoUringRuntime`] uses the plain owned recv/send (its registered/multishot fast path is
+///   #513 / P3).
+///
+/// The serve loop bounds `R: BatchedRecvSend`; the fixed-vs-owned choice is thus a static per-type
+/// dispatch, no `dyn`.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+pub trait BatchedRecvSend: Runtime<Buf = Vec<u8>, Error = std::io::Error> {
+    /// Read the next batch, APPENDING into `read_buf`; returns bytes read (`0` = clean peer close).
+    fn recv_batch(
+        &self,
+        stream: &mut Self::Stream,
+        read_buf: &mut Vec<u8>,
+    ) -> impl Future<Output = std::io::Result<usize>>;
+
+    /// Write the reply `data` in full, RETURNING the owned buffer for the serve loop to reuse.
+    fn send_batch(
+        &self,
+        stream: &mut Self::Stream,
+        data: Vec<u8>,
+    ) -> impl Future<Output = std::io::Result<Vec<u8>>>;
+}
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
