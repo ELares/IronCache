@@ -806,19 +806,17 @@ is no `REPLICAOF`/`SLAVEOF` here). The replica full-syncs over the repl plane an
 serves reads only on `READONLY` connections.
 
 **Scale-out (adding a fourth host).** The Raft-native join flow is: the new node
-boots as a NON-VOTER (the `cluster_raft_joining` switch, with the FULL topology
-including itself), the operator runs `CLUSTER MEET <host> <client-port>` ON THE
-LEADER (a membership change is NOT forwarded like slot writes -- find the leader
-via `cluster_raft_leader` in `CLUSTER INFO` or the `,leader` mark in
-`CLUSTER NODES`), the joiner is staged as a non-voting LEARNER (the quorum stays
-3), AUTO-PROMOTES to a voter once its log catches up, and `CLUSTER FORGET <id>`
-removes it again (quorum-guarded). This is integration-tested end to end
+boots as a NON-VOTER (`cluster_raft_joining = true` in its TOML, or
+`IRONCACHE_CLUSTER_RAFT_JOINING=true` for per-pod injection in a stateful set, with
+`cluster_mode = "raft"` and the FULL topology including itself), the operator runs
+`CLUSTER MEET <host> <client-port>` ON THE LEADER (a membership change is NOT
+forwarded like slot writes -- find the leader via `cluster_raft_leader` in
+`CLUSTER INFO` or the `,leader` mark in `CLUSTER NODES`), the joiner is staged as a
+non-voting LEARNER (the quorum stays 3), AUTO-PROMOTES to a voter once its log
+catches up, and `CLUSTER FORGET <id>` removes it again (quorum-guarded). This is
+integration-tested end to end
 (`raft_mode_meet_stages_a_learner_auto_promotes_then_forget_removes_it` in
-`crates/ironcache/tests/raft_cluster.rs`). HONEST LIMITATION: `cluster_raft_joining`
-is a Config field the strict TOML/env layer does not yet expose (it is not in the
-config schema, so a `cluster_raft_joining = true` line fails boot) -- today only
-the test harness can boot a joiner, so treat multi-host scale-out as
-engine-proven but not yet operator-wireable from a config file.
+`crates/ironcache/tests/raft_cluster.rs`).
 
 **Moving slots after growth**: `CLUSTER REBALANCE` (or `... DRYRUN`) prints the
 read-only per-node plan (`current_slots` / `target_slots` / `slots_to_move`).

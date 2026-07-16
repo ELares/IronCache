@@ -1628,6 +1628,12 @@ pub struct ConfigOverlay {
     /// How the slot map is governed (HA-4c). TOML (`cluster_mode = "raft"`) + the
     /// `IRONCACHE_CLUSTER_MODE` env var. `None` leaves the lower layer (default `Static`).
     pub cluster_mode: Option<ClusterMode>,
+    /// Whether this node is JOINING an already-formed Raft cluster at runtime as a non-voter
+    /// learner (HA-prod-membership), rather than a boot-time voter. TOML (`cluster_raft_joining =
+    /// true`) + the `IRONCACHE_CLUSTER_RAFT_JOINING` env var (useful for per-pod scale-out in a
+    /// stateful set). `None` leaves the lower layer (default `false`, a normal boot voter). See
+    /// [`Config::cluster_raft_joining`].
+    pub cluster_raft_joining: Option<bool>,
     /// HA-8 replication-lag bound (logical writes) for promotion + replica-read staleness.
     /// TOML (`replica_max_lag = N`) + the `IRONCACHE_REPLICA_MAX_LAG` env var. `None` leaves
     /// the lower layer (default [`DEFAULT_REPLICA_MAX_LAG`]).
@@ -1784,6 +1790,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "cluster_topology",
     "cluster_announce_id",
     "cluster_mode",
+    "cluster_raft_joining",
     "replica_max_lag",
     "failover_timeout_secs",
     "min_replicas_to_write",
@@ -2087,6 +2094,15 @@ impl ConfigOverlay {
                 reason: format!("not a cluster mode (expected static/raft/shard-owners): {v}"),
             })?);
         }
+        // Runtime scale-out (HA-prod-membership): a joining node boots as a non-voter learner.
+        // A single scalar, so env-encodable for per-pod injection in a stateful set -- the exact
+        // knob a scale-out job flips before `CLUSTER MEET`. Meaningful only in raft mode.
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_RAFT_JOINING") {
+            o.cluster_raft_joining = Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "cluster-raft-joining",
+                reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
+            })?);
+        }
         // HA-8 knobs (single scalars, so env-encodable for per-pod injection). Both are
         // meaningful only in raft-mode; a malformed value hard-fails boot rather than
         // silently picking a default.
@@ -2385,6 +2401,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.cluster_mode {
             cfg.cluster_mode = v;
+        }
+        if let Some(v) = self.cluster_raft_joining {
+            cfg.cluster_raft_joining = v;
         }
         if let Some(v) = self.replica_max_lag {
             cfg.replica_max_lag = v;
@@ -4000,6 +4019,27 @@ mod tests {
         let cfg = Config::resolve(&[o]).unwrap();
         cfg.validate()
             .expect("a full 3-way split with a matching announce id is valid");
+    }
+
+    /// Runtime scale-out (#663): `cluster_raft_joining` is OPERATOR-SETTABLE via TOML. Before it
+    /// was only a `Config` field with no overlay/KNOWN_TOML_KEYS entry, so a config file naming it
+    /// HARD-FAILED the strict `deny_unknown_fields` parse -- a joining node could not be configured
+    /// at all. This asserts the key now parses and threads through to the resolved `Config`.
+    #[test]
+    fn cluster_raft_joining_is_settable_from_toml() {
+        // Previously this exact TOML failed to parse (unknown key); now it resolves.
+        let overlay = ConfigOverlay::from_toml_str("cluster_raft_joining = true\n")
+            .expect("key is now known");
+        assert_eq!(overlay.cluster_raft_joining, Some(true));
+        let cfg = Config::resolve(&[overlay]).unwrap();
+        assert!(
+            cfg.cluster_raft_joining,
+            "cluster_raft_joining = true must thread through to the resolved Config"
+        );
+        // The default (absent) stays a normal boot voter.
+        let empty = ConfigOverlay::from_toml_str("").unwrap();
+        assert_eq!(empty.cluster_raft_joining, None);
+        assert!(!Config::resolve(&[empty]).unwrap().cluster_raft_joining);
     }
 
     #[test]
