@@ -1,0 +1,25 @@
+=== IOURING SWEEP START Thu Jul 16 08:00:15 UTC 2026 ===
+6.1.176-221.360.amzn2023.aarch64
+SRV tokio-r1 log tail:
+SWEEP tokio-r1 pipe=1 qps=263626.52
+SWEEP tokio-r1 pipe=8 qps=1788916.83
+SWEEP tokio-r1 pipe=16 qps=1419230.06
+SWEEP tokio-r1 pipe=32 qps=1078571.85
+SRV uring-r1 log tail:
+2026-07-16T08:04:41.847494Z  INFO ironcache::serve: runtime = io_uring: using the Linux io_uring datapath (plaintext); the registered-buffer / multishot fast path and a perf benchmark are deferred to a Linux soak (no throughput claim made)
+SWEEP uring-r1 pipe=1 qps=241144.89
+SWEEP uring-r1 pipe=8 qps=1766602.09
+SWEEP uring-r1 pipe=16 qps=2573021.50
+SWEEP uring-r1 pipe=32 qps=3132408.07
+SRV tokio-r2 log tail:
+SWEEP tokio-r2 pipe=1 qps=260795.75
+SWEEP tokio-r2 pipe=8 qps=1781675.19
+SWEEP tokio-r2 pipe=16 qps=1503738.65
+SWEEP tokio-r2 pipe=32 qps=1110727.98
+SRV uring-r2 log tail:
+2026-07-16T08:06:14.906123Z  INFO ironcache::serve: runtime = io_uring: using the Linux io_uring datapath (plaintext); the registered-buffer / multishot fast path and a perf benchmark are deferred to a Linux soak (no throughput claim made)
+SWEEP uring-r2 pipe=1 qps=242056.95
+SWEEP uring-r2 pipe=8 qps=1790904.23
+SWEEP uring-r2 pipe=16 qps=2630627.88
+SWEEP uring-r2 pipe=32 qps=3139522.90
+=== IOURING SWEEP DONE Thu Jul 16 08:07:01 UTC 2026 ===
