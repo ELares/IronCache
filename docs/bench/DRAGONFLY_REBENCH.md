@@ -42,12 +42,38 @@ build. This run removes every one of those unfairnesses.
 | 32 | 1.74 / 1.34 | **2.60** / 2.83 | 1.14 / **3.01** |
 | 64 | 1.25 / 1.27 | **2.92** / 2.76 | 1.13 / **2.99** |
 
-## Memory (bytes/key, exactly-N distinct keys, 128B values, same box + method)
-| keys | IronCache (Dash default) | Dragonfly v1.39.0 |
+## Memory (bytes/key, exactly-N distinct 128B keys)
+
+FINE keycount sweep, both engines in ONE environment (raw:
+[dragonfly-memory-fine-sweep-2026-07-15.raw.txt](dragonfly-memory-fine-sweep-2026-07-15.raw.txt)).
+This SUPERSEDES an earlier coarse 3-point run whose IC@700k=173.4 was a
+measurement transient; the clean sweep shows IronCache FLAT there. Dragonfly's
+own numbers reproduced exactly (156.95@700k, 177.03@1M).
+
+| keys | IronCache (Dash) | Dragonfly v1.39.0 |
 | ---: | ---: | ---: |
-| 700k | 173.42 | **156.95** |
-| 900k | **163.17** | 182.91 |
-| 1M   | **165.21** | 177.03 |
+| 550k | 175.4 | **169.2** |
+| 650k | 161.4 | **160.4** |
+| 700k | 160.6 | **157.0** |
+| 750k | 160.6 | **154.0** |
+| 800k | 161.3 | **154.6** |
+| 850k | **161.8** | 171.7 |
+| 900k | **162.1** | 182.8 |
+| 950k | **163.4** | 180.4 |
+| 1M   | **163.8** | 177.0 |
+
+IronCache is FLAT (160 to 164); Dragonfly OSCILLATES (154 to 183). IronCache wins
+the 850k to 1M range decisively and its WORST case (164) beats Dragonfly's WORST
+case (183); Dragonfly wins a narrow 550k to 800k window by about 4%.
+
+DECOMPOSITION (memmodel, resize-free, dash default): the table SLOT cost is about
+12 to 14 B/key reserved, and organic fill slack adds only about 2 to 3 more. So
+the 550k-800k window gap (~7 B/key) is OBJECT-ENCODING, not table load factor:
+Dragonfly's CompactObj inlines these short keys and bins the value exactly, while
+IronCache fuses key+value into one jemalloc-rounded blob. An in-segment
+displacement / higher-load-factor index change (the parked #670 idea) would save
+only the ~2-3 B/key of table slack and cannot close this window -- the reason
+#670 was retargeted away from memory.
 
 ## Tail (memtier pipeline 1, ~500k ops/s, 90/10 GET/SET, 128B)
 p50 / p99 / p99.9 (ms): IronCache 0.183 / 0.295 / 0.319; Dragonfly 0.183 /

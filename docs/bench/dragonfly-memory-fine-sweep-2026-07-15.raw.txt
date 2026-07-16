@@ -1,0 +1,27 @@
+Fine-grained organic memory sweep, IronCache (Dash default) vs Dragonfly v1.39.0,
+SAME environment (colima aarch64 Linux, jemalloc for IC / mimalloc for DF), 128B
+values, exactly-N distinct keys "key:0..N-1". IC via redis-cli --pipe SET; DF via
+DEBUG POPULATE. bytes/key = used_memory delta / N.
+
+N        IC(dash)  DF-1.39.0
+550000   175.41    169.21
+600000   163.45    164.44
+650000   161.40    160.41
+700000   160.60    156.95
+750000   160.62    154.00
+800000   161.30    154.58
+850000   161.84    171.73
+900000   162.11    182.80
+950000   163.40    180.38
+1000000  163.78    177.03
+
+Decomposition (memmodel, resize-free, dash default): table slot cost ~12-14 B/key
+(reserved); organic fill slack adds only ~2-3. The IC-vs-DF window gap (~7 B/key at
+700-800k) is therefore OBJECT-LAYOUT, not table load factor: DF's CompactObj inlines
+the short key + lands the value in an exact mimalloc bin; IC fuses key+value into one
+jemalloc-rounded blob. Displacement (a table change) cannot close it.
+
+Correction: the earlier c7g point IC@700k=173.42 was a measurement transient; the clean
+fine sweep shows IC flat ~161 there (DF's own numbers reproduced exactly: 156.95@700k,
+177.03@1M). IC is FLAT (160-164) and beats DF's worst case (164 vs 183); DF wins only a
+narrow 650-800k short-key window.
