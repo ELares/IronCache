@@ -75,17 +75,37 @@ pub const INBOX_DEPTH: usize = 1024;
 ///
 /// All fields are `Send` so the envelope crosses the thread boundary: [`Request`] is
 /// `Vec<Bytes>` (refcounted byte buffers), `db` is a `u32`, and the oneshot sender is
-/// `Send`. The reply travels back as a [`ShardReply`].
+/// `Send`. The reply travels back as a [`ShardReply`] (or, for a `Batch`, a `Vec` of them).
+///
+/// `Batch` is the deep-pipeline SET-squash (#674): a RUN of pipelined cross-shard commands destined
+/// for the SAME owning shard is coalesced into ONE message (one mpsc send + one oneshot) instead of
+/// N, mirroring Dragonfly's MultiCommandSquasher. The owning shard runs each request in order and
+/// replies with a `Vec<ShardReply>` in the SAME order; the home core demuxes them back to their wire
+/// positions. `Single` is the un-coalesced path (a lone hop, or a fan-out leg), byte-identical to the
+/// pre-#674 message.
 #[derive(Debug)]
-pub struct ShardWork {
-    /// The decoded request to run on the owning shard (cloned/moved from the home core;
-    /// the clone is cheap, `Bytes` are refcounted).
-    pub request: Request,
-    /// The logical database the issuing connection had selected (`SELECT`), so the
-    /// remote command runs against the right DB on the owning shard.
-    pub db: u32,
-    /// The channel the owning shard sends the reply back on (consumed once).
-    pub reply: oneshot::Sender<ShardReply>,
+pub enum ShardWork {
+    /// One request to run on the owning shard, its reply on a single-use oneshot.
+    Single {
+        /// The decoded request to run on the owning shard (cloned/moved from the home core;
+        /// the clone is cheap, `Bytes` are refcounted).
+        request: Request,
+        /// The logical database the issuing connection had selected (`SELECT`), so the
+        /// remote command runs against the right DB on the owning shard.
+        db: u32,
+        /// The channel the owning shard sends the reply back on (consumed once).
+        reply: oneshot::Sender<ShardReply>,
+    },
+    /// A COALESCED run of requests for one owning shard (#674): run in order, one reply `Vec` back.
+    Batch {
+        /// The requests to run IN ORDER on the owning shard. All share one `db` (a run cannot cross a
+        /// `SELECT`, which is `AlwaysHome` and forces a barrier that drains the run first).
+        requests: Vec<Request>,
+        /// The DB the whole run shares.
+        db: u32,
+        /// The reply channel: one [`ShardReply`] per request, in request order (consumed once).
+        reply: oneshot::Sender<Vec<ShardReply>>,
+    },
 }
 
 /// The reply for one [`ShardWork`]: the command's [`Value`] plus the counter deltas it
@@ -119,17 +139,19 @@ pub type Inbox = Arc<[mpsc::Sender<ShardWork>]>;
 pub type HopReceiver = oneshot::Receiver<ShardReply>;
 
 /// The out-param `route_and_dispatch` sets to tell the serve loop whether the command was DEFERRED
-/// as a cross-shard hop (#8 overlap): `NotHop` = a synchronous/barrier command whose reply is
-/// already in `out` (run its hooks now); `Deferred(rx)` = a remote hop that was enqueued but not
-/// awaited (park it, drain the reply in order later). `Deferred(None)` means the owner was gone at
-/// send time, so `finish_hop` will encode the shard-unavailable error in order.
+/// as a cross-shard hop (#8 overlap + #674 coalescing): `NotHop` = a synchronous/barrier command
+/// whose reply is already in `out` (run its hooks now); `Deferred(target)` = a remote hop bound for
+/// owning shard `target`, RECORDED but not yet sent (the drain groups a run's hops per shard and
+/// sends ONE coalesced [`ShardWork::Batch`] per shard with >= 2, a [`ShardWork::Single`] for a lone
+/// hop, then demuxes the replies in wire order -- so the per-command send is deferred to drain time,
+/// where the coalescing happens).
 #[derive(Debug, Default)]
 pub enum HopOutcome {
     /// The command produced its reply synchronously (or is a park/close); not a deferred hop.
     #[default]
     NotHop,
-    /// A remote single-key hop was enqueued; its reply receiver (`None` = owner gone at send).
-    Deferred(Option<HopReceiver>),
+    /// A remote single-key hop bound for owning shard `usize`; recorded, sent + coalesced at drain.
+    Deferred(usize),
 }
 
 /// Build `n` bounded per-shard inbound queues, returning the shared [`Inbox`] of senders
@@ -385,20 +407,10 @@ pub async fn run_drain_loop(
             maybe = rx.recv() => {
                 match maybe {
                     Some(work) => {
-                        let reply = run_drained_unit(&ctx, &work.request, work.db).await;
-                        let _ = work.reply.send(reply);
-                        // BLOCKING WAKE (PROD-9): a cross-shard WRITE that ran on THIS shard and may
-                        // have ADDED an element to a list/zset wakes a blocking waiter parked on
-                        // THIS shard's registry (a BLPOP/BZPOPMIN/... blocked on a key whose owner
-                        // is this shard, while the WRITER issued the push from a connection homed on
-                        // a different shard). Cheap: a single match + an empty-Vec check off the hot
-                        // path (`wake_keys_for_write` is empty for every read / non-adding command).
-                        crate::serve::wake_blocking_waiters_for_shard(work.db, &work.request);
-                        // KEYSPACE NOTIFICATIONS (PROD-8): a cross-shard keyed write that ran on
-                        // THIS shard recorded its keyspace events into this shard's pending buffer;
-                        // drain + publish them AFTER the reply is sent. Short-circuits on an empty
-                        // buffer (the common case: a read, or notifications disabled).
-                        publish_pending_keyspace_events(&inbox, shard_index);
+                        // Run the unit(s) + fire the per-request blocking-wake (PROD-9) + keyspace-
+                        // publish (PROD-8) side effects. A `Batch` (#674) runs each request in order
+                        // with the same per-request side effects, one reply Vec back.
+                        process_shard_work(&ctx, &inbox, shard_index, work).await;
                     }
                     // All senders dropped (the process is already tearing down): stop the loop. Not a
                     // flag-driven stop, so no save is attempted here.
@@ -467,12 +479,10 @@ pub async fn run_drain_loop(
                     match maybe {
                         Some(work) => {
                             idle_ticks = 0;
-                            let reply = run_drained_unit(&ctx, &work.request, work.db).await;
-                            let _ = work.reply.send(reply);
-                            // KEYSPACE NOTIFICATIONS (PROD-8): publish any events this cross-shard
-                            // write recorded, exactly as the steady-state arm above (the
-                            // post-shutdown window still services live cross-shard work).
-                            publish_pending_keyspace_events(&inbox, shard_index);
+                            // Same processing as the steady-state arm (Single or #674 Batch): run +
+                            // reply + per-request side effects. The post-shutdown window still
+                            // services live cross-shard work (the save fan-out reaching this shard).
+                            process_shard_work(&ctx, &inbox, shard_index, work).await;
                         }
                         None => return,
                     }
@@ -571,6 +581,51 @@ fn spawn_shard_cutover(
     start: crate::upgrade::cutover_coord::CutoverStart,
 ) {
     match start {}
+}
+
+/// Process ONE received [`ShardWork`] on the owning shard's drain loop: run its request(s), send the
+/// reply, and fire the per-request side effects (blocking-wake + keyspace-publish). A `Batch` (#674)
+/// runs each request IN ORDER, folds the per-request side effects for each (identical to the `Single`
+/// path), collects one [`ShardReply`] per request, and sends the `Vec` back once. The final DATA
+/// STATE, the wire bytes, and every counter/keyspace event are identical to N `Single`s; the one
+/// nuance is WAKE-INTERLEAVE TIMING: the shard is single-threaded and `run_drained_unit` yields only for
+/// `__ICSAVE` (never a keyed hop, so never inside a batch), so a batch runs to COMPLETION before any
+/// woken blocking waiter is scheduled -- whereas N Singles have a yield point between each. A woken
+/// waiter re-attempts against LIVE state (it snapshots nothing), so this changes only WHEN it observes
+/// the data, not the result, and Redis anyway serves a client's whole input buffer before blocked
+/// clients -- so if anything this is closer to Redis, not a divergence.
+async fn process_shard_work(
+    ctx: &ServerContext,
+    inbox: &Inbox,
+    shard_index: usize,
+    work: ShardWork,
+) {
+    match work {
+        ShardWork::Single { request, db, reply } => {
+            let r = run_drained_unit(ctx, &request, db).await;
+            let _ = reply.send(r);
+            // BLOCKING WAKE (PROD-9) + KEYSPACE NOTIFICATIONS (PROD-8): a cross-shard write that ran
+            // here may wake a blocking waiter parked on THIS shard and recorded keyspace events; both
+            // short-circuit on the empty common case (a read / no waiter / notifications off).
+            crate::serve::wake_blocking_waiters_for_shard(db, &request);
+            publish_pending_keyspace_events(inbox, shard_index);
+        }
+        ShardWork::Batch {
+            requests,
+            db,
+            reply,
+        } => {
+            let mut replies = Vec::with_capacity(requests.len());
+            for request in &requests {
+                let r = run_drained_unit(ctx, request, db).await;
+                replies.push(r);
+                // Per-request side effects, IN ORDER -- identical to the Single path per command.
+                crate::serve::wake_blocking_waiters_for_shard(db, request);
+                publish_pending_keyspace_events(inbox, shard_index);
+            }
+            let _ = reply.send(replies);
+        }
+    }
 }
 
 /// Dispatch ONE drained cross-shard unit, routing the async YIELDING save path for `__ICSAVE`
@@ -886,9 +941,52 @@ pub async fn dispatch_via_send(
     db: u32,
 ) -> Option<oneshot::Receiver<ShardReply>> {
     let (tx, rx) = oneshot::channel::<ShardReply>();
-    let work = ShardWork {
+    let work = ShardWork::Single {
         // Clone is cheap: Request is Vec<Bytes> (refcounted buffers).
         request: request.clone(),
+        db,
+        reply: tx,
+    };
+    if inbox[target].send(work).await.is_err() {
+        return None;
+    }
+    Some(rx)
+}
+
+/// As [`dispatch_via_send`] but takes the request BY VALUE (no clone) -- used by the #674 drain, which
+/// already owns the request clone it grouped into a per-shard bucket. `None` = owner gone at send.
+pub async fn dispatch_via_send_owned(
+    inbox: &Inbox,
+    target: usize,
+    request: Request,
+    db: u32,
+) -> Option<oneshot::Receiver<ShardReply>> {
+    let (tx, rx) = oneshot::channel::<ShardReply>();
+    let work = ShardWork::Single {
+        request,
+        db,
+        reply: tx,
+    };
+    if inbox[target].send(work).await.is_err() {
+        return None;
+    }
+    Some(rx)
+}
+
+/// The COALESCED send (#674): enqueue ONE [`ShardWork::Batch`] of `requests` (all for owning shard
+/// `target`, all sharing `db`) and return the reply receiver -- one [`ShardReply`] per request, in
+/// order. Collapses a run of same-shard pipelined hops from N messages+oneshots to ONE. `None` = the
+/// owning shard's queue receiver is gone (shutdown / shard died); the drain encodes shard-unavailable
+/// for every hop in the batch, IN ORDER. Same bounded-queue back-pressure as the single send.
+pub async fn dispatch_batch_send(
+    inbox: &Inbox,
+    target: usize,
+    requests: Vec<Request>,
+    db: u32,
+) -> Option<oneshot::Receiver<Vec<ShardReply>>> {
+    let (tx, rx) = oneshot::channel::<Vec<ShardReply>>();
+    let work = ShardWork::Batch {
+        requests,
         db,
         reply: tx,
     };
@@ -922,6 +1020,21 @@ pub async fn finish_hop(
     }
 }
 
+/// The receiver for a coalesced [`ShardWork::Batch`] (#674): one [`ShardReply`] per request, in order.
+pub type BatchReceiver = oneshot::Receiver<Vec<ShardReply>>;
+
+/// Encode ONE already-awaited, demuxed hop reply into `out` (the #674 coalescing drain): `Some(value)`
+/// encodes it with `proto`; `None` (the owning shard was gone, or a short batch reply) encodes the
+/// proto-shaped shard-unavailable error IN ORDER -- byte-identical to [`finish_hop`]'s paths. The
+/// caller has already awaited the (batched) reply and pulled this hop's `Value` out of it in wire
+/// order, so this is the pure encode step.
+pub fn encode_hop_reply(value: Option<Value>, out: &mut Vec<u8>, proto: ProtoVersion) {
+    match value {
+        Some(v) => encode_into(out, &v, proto),
+        None => encode_into(out, &Value::error(shard_unavailable_error()), proto),
+    }
+}
+
 /// A SINGLE-TARGET cross-shard hop that returns the owning shard's reply [`Value`] (NOT
 /// encoded), so the home core can POST-PROCESS it before encoding -- used by the
 /// cross-shard SCAN, which hops to ONE shard per call (the current composite-cursor shard
@@ -934,7 +1047,7 @@ pub async fn finish_hop(
 /// `commands_processed` separately.
 pub async fn dispatch_one_value(inbox: &Inbox, target: usize, request: &Request, db: u32) -> Value {
     let (tx, rx) = oneshot::channel::<ShardReply>();
-    let work = ShardWork {
+    let work = ShardWork::Single {
         request: request.clone(),
         db,
         reply: tx,
@@ -976,7 +1089,7 @@ pub async fn presence_via(inbox: &Inbox, target: usize, key: &[u8], db: u32) -> 
         ],
     };
     let (tx, rx) = oneshot::channel::<ShardReply>();
-    let work = ShardWork {
+    let work = ShardWork::Single {
         request,
         db,
         reply: tx,
@@ -1030,7 +1143,7 @@ pub async fn fan_out_all(
             continue;
         }
         let (tx, rx) = oneshot::channel::<ShardReply>();
-        let work = ShardWork {
+        let work = ShardWork::Single {
             request: request.clone(),
             db,
             reply: tx,
@@ -1110,7 +1223,7 @@ pub async fn fan_out_split(
             continue;
         }
         let (tx, rx) = oneshot::channel::<ShardReply>();
-        let work = ShardWork {
+        let work = ShardWork::Single {
             request: req,
             db,
             reply: tx,
@@ -1178,7 +1291,7 @@ pub async fn fan_out_save(
             continue;
         }
         let (tx, rx) = oneshot::channel::<ShardReply>();
-        let work = ShardWork {
+        let work = ShardWork::Single {
             request: req,
             db,
             reply: tx,
@@ -2113,7 +2226,7 @@ pub async fn fan_out_publish(
             continue;
         }
         let (tx, rx) = oneshot::channel::<ShardReply>();
-        let work = ShardWork {
+        let work = ShardWork::Single {
             request: request.clone(),
             db,
             reply: tx,
@@ -2187,7 +2300,7 @@ pub fn fan_out_publish_notify(inbox: &Inbox, channel: &[u8], payload: &[u8], db:
             continue;
         }
         let (tx, _rx) = oneshot::channel::<ShardReply>();
-        let work = ShardWork {
+        let work = ShardWork::Single {
             request: request.clone(),
             db,
             reply: tx,
@@ -2228,7 +2341,7 @@ pub async fn fan_out_spublish(
             continue;
         }
         let (tx, rx) = oneshot::channel::<ShardReply>();
-        let work = ShardWork {
+        let work = ShardWork::Single {
             request: request.clone(),
             db,
             reply: tx,
