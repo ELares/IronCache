@@ -3255,9 +3255,14 @@ async fn subscriber_idle_wait_generic<R>(
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> bool
 where
-    R: ironcache_runtime::Runtime<Buf = Vec<u8>>,
+    R: ironcache_runtime::BatchedRecvSend,
 {
-    // `rt`'s `recv`/`send`/`timer` resolve through the generic `R: Runtime` bound directly.
+    // The socket-read arm uses `recv_batch` (NOT a fresh single-shot `rt.recv`): on the raw backend a
+    // MULTISHOT recv may already be armed on this fd from the main loop, and opening a competing
+    // single-shot `Read` would split the byte stream between two ops (#513 review). `recv_batch`
+    // drains the SAME multishot slot; a `select!`-cancel of it is drop-safe (the multishot slot is
+    // persistent, and the owned fallback appends into a fresh buffer). `rt`'s methods resolve through
+    // the `R: BatchedRecvSend` bound directly.
     // Fast pre-check: if the publisher already shed this connection between iterations, close now
     // without entering the select! (the table sender is gone; nothing more will arrive). This is
     // ALSO the close-on-shed for a pure-idle flooded subscriber (FIX2 non-negotiable).
@@ -3301,14 +3306,14 @@ where
             // unchanged `read_buf`, flushes the empty `out`, and re-enters here).
             shutdown.load(std::sync::atomic::Ordering::Relaxed)
         }
-        res = rt.recv(stream, Vec::new()) => {
-            let Ok(res) = res else { return true; };
-            if res.n == 0 {
+        n = rt.recv_batch(stream, read_buf) => {
+            let Ok(n) = n else { return true; };
+            if n == 0 {
                 return true; // peer closed
             }
-            read_buf.extend_from_slice(&res.buf[..res.n]);
-            // #527: net input for a command read while in the io_uring subscriber idle wait.
-            shard_state().borrow().counters.on_net_input(res.n as u64);
+            // recv_batch already APPENDED the newly-arrived bytes into `read_buf` (multishot slot or
+            // owned fallback); count them. #527: net input for a subscriber-idle-wait command read.
+            shard_state().borrow().counters.on_net_input(n as u64);
             false
         }
     }
