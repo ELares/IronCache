@@ -642,14 +642,21 @@ impl Runtime for RawIoUringRuntime {
         let mut owned = Box::new(AcceptAddr::new());
         let sa_ptr = core::ptr::addr_of_mut!(owned.storage).cast::<libc::sockaddr>();
         let len_ptr = core::ptr::addr_of_mut!(owned.len);
-        let sqe = opcode::Accept::new(types::Fd(listener.fd), sa_ptr, len_ptr).build();
+        // `SOCK_CLOEXEC`: the accepted DATA socket must not survive an `exec` (the streamed live
+        // cutover #391 re-execs the server); only the inherited listen fd should. The std/tokio
+        // siblings get this via `accept4(SOCK_CLOEXEC)`, and socket2 sets it on the connect socket.
+        let sqe = opcode::Accept::new(types::Fd(listener.fd), sa_ptr, len_ptr)
+            .flags(libc::SOCK_CLOEXEC)
+            .build();
         let (res, owned) = OpFuture::submit_closing_result_fd(sqe, owned).await;
         let fd = res?;
+        // Adopt the accepted fd into an OWNING stream BEFORE the fallible peer parse: if
+        // `to_socket_addr` errors (a non-IP family), the early return then closes the fd via the
+        // stream's Drop rather than leaking it. Match the other backends: disable Nagle.
+        let stream = RawUringTcpStream { fd };
         let peer = owned.to_socket_addr()?;
-        // The accepted fd is now solely owned by the stream (closed on its Drop). Match the other
-        // backends: disable Nagle for request/reply latency.
-        set_nodelay_raw(fd);
-        Ok((RawUringTcpStream { fd }, peer))
+        set_nodelay_raw(stream.fd);
+        Ok((stream, peer))
     }
 
     async fn connect(&self, addr: SocketAddr) -> Result<Self::Stream, Self::Error> {
