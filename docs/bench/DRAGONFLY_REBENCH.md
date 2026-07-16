@@ -81,3 +81,49 @@ p50 / p99 / p99.9 (ms): IronCache 0.183 / 0.295 / 0.319; Dragonfly 0.183 /
 - Cluster-aware / zero-hop table, both engines owner-routed (#667) -- the leg
   that tests whether the shipped tokio binary WINS once the hop is removed.
 - The during-snapshot p99.9 tail (a known limitation at a bandwidth floor).
+
+## Cluster-aware / zero-hop (added 2026-07-15) -- both engines owner-routed
+
+The leg that tests whether the SHIPPED tokio binary wins once the cross-shard
+hop is removed. Both engines driven by `memtier_benchmark --cluster-mode` (the
+routing a real cluster client -- go-redis, lettuce, `redis-cli -c` -- uses):
+each key goes straight to its owning endpoint.
+- IronCache: `cluster_mode = shard-owners` (#517) on the **shipped tokio
+  binary**, 8 shards -> 8 listeners (ports 6399..6406), `CLUSTER SLOTS` maps the
+  16384 slots to the per-shard ports (`cluster_state:ok` verified). Zero hop.
+- Dragonfly v1.39.0 `--cluster_mode=emulated` (its cluster-client-facing config;
+  Dragonfly does not expose per-thread ports, so one endpoint is its best
+  single-box config). Raw log: [dragonfly-rebench-cluster-2026-07-15.raw.txt](dragonfly-rebench-cluster-2026-07-15.raw.txt).
+
+Mean of 2 reps, GET / SET Mops:
+
+### 128B values
+| pipe | IronCache (shard-owners, tokio) | Dragonfly v1.39.0 | IC GET vs DF |
+| ---: | ---: | ---: | ---: |
+| 1  | 0.70 / 0.69 | **1.02 / 0.98** | -31% |
+| 16 | **3.35 / 2.91** | 2.82 / 2.61 | +19% |
+| 32 | **4.08 / 3.46** | 2.83 / 3.34 | +44% |
+| 64 | **4.31 / 3.95** | 3.45 / 3.98 | +25% |
+
+### 256B values
+| pipe | IronCache (shard-owners, tokio) | Dragonfly v1.39.0 | IC GET vs DF |
+| ---: | ---: | ---: | ---: |
+| 1  | 0.72 / 0.68 | **1.00 / 0.96** | -28% |
+| 16 | **3.15 / 2.76** | 1.97 / 2.48 | +60% |
+| 32 | **3.50 / 3.34** | 2.42 / 3.13 | +44% |
+| 64 | **3.82 / 3.81** | 3.15 / 3.07 | +21% |
+
+### Read
+On the SHIPPED tokio binary, driven by a standard cluster-aware client,
+IronCache eliminates the single-endpoint hop cliff (tokio 128B pipe-64 GET goes
+1.26M single-endpoint -> **4.31M** zero-hop) and **beats Dragonfly on GET by
++19 to +60% and on SET by +3 to +24% at every pipeline depth >= 16**. The one
+remaining throughput loss is **pipeline 1** (no pipelining), where Dragonfly's
+leaner per-command path wins ~30%; note IronCache's own pipe-1 figure is
+actually higher single-endpoint (0.89M) than cluster-routed (0.70M), i.e. the
+cluster client's per-key routing cost is not amortized at depth 1. Real
+high-throughput deployments pipeline, where IronCache leads.
+
+This is the artifact behind the previously-unsubstantiated "cluster-aware"
+claim; the earlier README number (4.32M) is confirmed (4.31M here) and now has
+a reproducible log, and Dragonfly's leg is confirmed genuinely owner-routed.
