@@ -413,6 +413,30 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// (kept in lockstep with `repl_observer.is_some()`), so the funnel can branch on a
     /// plain bool with no `Option` probe on the non-observing hot path.
     repl_active: bool,
+    /// SNAPSHOT DIRTY-KEY TRACKING (#676 Phase 1, INERT/default-off): the per-shard set of
+    /// `(db, key)` MUTATED since the last capture. It is the foundation for incremental delta
+    /// snapshots -- only the keys written since the last base need re-reading/re-encoding,
+    /// which shrinks the persist-thread READ footprint that sets the during-snapshot p99.9
+    /// bandwidth floor (#676). Like `watch_versions`/`repl_observer` it is a plain
+    /// single-writer-per-shard field (no atomics, ADR-0002/0005), fired from the same
+    /// `observe_put`/`observe_remove` write-funnel chokepoints the observer uses, so its
+    /// per-key coverage is the COMPLETE mutation set: create/overwrite, every in-place edit and
+    /// TTL change (`rmw`/`rmw_mut`), delete/expiry/eviction, and FLUSHDB/FLUSHALL (which fan out
+    /// to per-key removes). SWAPDB creates/destroys no entry so it bypasses the funnel; it is
+    /// covered EXPLICITLY in [`Store::swap_db`] (dirties both dbs). Two known exceptions remain
+    /// for the Phase-2 delta consumer to handle and are documented at their sites: the
+    /// aborted-migration purge [`Self::remove_keys_where`] (deliberately observer-silent; its
+    /// keys must be proven never-in-a-base) and the currently-DEAD read-only-`rmw` `Mutated`-TTL
+    /// arm (no live caller; a pre-existing gap shared with the WATCH observer).
+    /// `None` by default and nothing consumes it yet (the v2 delta format is a later slice), so
+    /// the tracking is fully INERT until [`Self::enable_dirty_tracking`].
+    ///
+    /// The `Option` IS the fast-path gate (unlike `repl_active`/`watched_count`, which carry a
+    /// separate lockstep bool): `Option<HashSet>` is niche-optimized on the table's non-null
+    /// pointer, so `is_some()`/`as_mut()` is one load-and-compare, the same cost as a bool, with
+    /// no second field to keep in sync. When `None`, [`Self::touch_dirty`] does that single
+    /// compare and returns with NO set probe and NO key allocation on the non-tracking hot path.
+    dirty_keys: Option<HashSet<(u32, Box<[u8]>)>>,
     /// PASSIVE-REPLICA mode (HA-7d, CARRY-FORWARD 2): when `true`, this shard is a replica
     /// that mirrors a primary, so it removes keys ONLY from the replication stream (the
     /// primary's `StreamDel`), never on its own. A due key is reported as logically expired
@@ -637,6 +661,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // observer later via `set_write_observer`.
             repl_observer: None,
             repl_active: false,
+            // No dirty-key tracking at boot (#676 Phase 1): `None` is the fast-path gate, so
+            // `touch_dirty` is a single compare-and-return at each write-funnel fire (the same
+            // cost profile as the WATCH / observer gates). `enable_dirty_tracking` turns it on.
+            dirty_keys: None,
             passive: false,
             // The collection-encoding thresholds default to the compiled Redis defaults (#40), so a
             // store built without an explicit snapshot is byte-identical to the pre-runtime-threshold
@@ -869,6 +897,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// no double-borrow of `self`. A key that is somehow absent post-write (it never is on
     /// the put paths) is a no-op.
     fn observe_put(&mut self, db: u32, db_idx: usize, key: &[u8]) {
+        // Dirty-track this write FIRST, before the observer gate: dirty-tracking (#676) is
+        // independent of whether a replication observer is installed, and this chokepoint is
+        // the complete put/overwrite/TTL mutation surface. Own fast-path gate inside.
+        self.touch_dirty(db, key);
         // FAST PATH: no observer installed -> one branch, no probe, no box deref.
         if !self.repl_active {
             return;
@@ -895,6 +927,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// immediate return when no observer is installed (the default), so the non-observing
     /// hot path pays the same ~one-branch cost as the `watched_count == 0` WATCH gate.
     fn observe_remove(&mut self, db: u32, key: &[u8]) {
+        // Dirty-track this removal FIRST, before the observer gate (see `observe_put`): every
+        // real removal (delete/expiry/flush/eviction) funnels through here via `remove_object`,
+        // so the dirty set will tombstone it in a delta rather than resurrect it on warm-start.
+        self.touch_dirty(db, key);
         // FAST PATH: no observer installed -> one branch, no box deref.
         if !self.repl_active {
             return;
@@ -902,6 +938,60 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         if let Some(observer) = self.repl_observer.as_mut() {
             observer.on_remove(db, key);
         }
+    }
+
+    /// Record `(db, key)` as MUTATED for incremental snapshotting (#676 Phase 1). Fired from
+    /// the `observe_put`/`observe_remove` write-funnel chokepoints BEFORE their `repl_active`
+    /// gate, so its coverage is the COMPLETE mutation set and is INDEPENDENT of whether a
+    /// replication observer is installed.
+    ///
+    /// FAST PATH: gated by `dirty_keys` being `None` (the default). When tracking is off this is
+    /// a single compare-and-return: NO set probe, NO key allocation. Only when tracking is
+    /// enabled does it insert the owned `(db, key)` into the dirty set (the allocation mirrors
+    /// `touch_watch`'s owned probe key and is off the non-tracking path).
+    ///
+    /// Determinism (ADR-0003): the set records membership only; a later delta build iterates it
+    /// in a caller-imposed deterministic order (sorted), never relying on hash order.
+    #[inline]
+    fn touch_dirty(&mut self, db: u32, key: &[u8]) {
+        if let Some(set) = self.dirty_keys.as_mut() {
+            set.insert((db, key.to_vec().into_boxed_slice()));
+        }
+    }
+
+    /// Enable per-shard dirty-key tracking (#676 Phase 1): allocate the dirty set, which arms the
+    /// `dirty_keys.is_some()` fast-path gate so subsequent writes accumulate their `(db, key)`.
+    /// Re-enabling while already on keeps any already-tracked keys.
+    pub fn enable_dirty_tracking(&mut self) {
+        if self.dirty_keys.is_none() {
+            self.dirty_keys = Some(HashSet::new());
+        }
+    }
+
+    /// Disable dirty-key tracking and drop the set (#676 Phase 1): resets the gate to `None` so
+    /// the write funnel returns to a single compare, and frees the accumulated keys.
+    pub fn disable_dirty_tracking(&mut self) {
+        self.dirty_keys = None;
+    }
+
+    /// TAKE the accumulated dirty-key set, leaving an EMPTY set in place for the next window
+    /// (#676 Phase 1: the epoch-cut capture a delta base/save performs). Returns `None` when
+    /// tracking is disabled. The returned set is UNORDERED; a delta builder sorts it for the
+    /// deterministic on-disk order (ADR-0003).
+    pub fn take_dirty_keys(&mut self) -> Option<HashSet<(u32, Box<[u8]>)>> {
+        self.dirty_keys.as_mut().map(std::mem::take)
+    }
+
+    /// The number of distinct `(db, key)` pairs currently tracked as dirty (#676 Phase 1: the
+    /// numerator for the dirty-fraction measurement that gates the XL delta phases). `None`
+    /// when tracking is disabled.
+    pub fn dirty_key_count(&self) -> Option<usize> {
+        self.dirty_keys.as_ref().map(HashSet::len)
+    }
+
+    /// Whether dirty-key tracking is currently enabled (the `dirty_keys.is_some()` fast-path gate).
+    pub fn dirty_tracking_active(&self) -> bool {
+        self.dirty_keys.is_some()
     }
 
     /// Charge `bytes` to both the accounting hook and the running total.
@@ -2503,6 +2593,31 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
             // different value or to absence). Bumps all watch slots in both dbs.
             self.touch_all_watches_in_db(a);
             self.touch_all_watches_in_db(b);
+            // SNAPSHOT DIRTY-TRACKING (#676): SWAPDB creates/destroys no entry, so the write
+            // funnel fires no `observe_*` hook, yet both dbs' contents changed wholesale. When a
+            // delta is tracking, dirty (a, k) AND (b, k) for every key now resident in EITHER db:
+            // a present key is re-encoded under its new db, and a key that moved OUT of a db is
+            // tombstoned there (it now reads absent). This restores, for SWAPDB, the complete
+            // mutation coverage the funnel hooks give every other write. Two-phase (collect then
+            // dirty) so no table borrow is held across `touch_dirty`; gated on `dirty_keys` so a
+            // default-off server keeps SWAPDB O(1) with no keyspace walk.
+            if self.dirty_keys.is_some() {
+                let mut keys: Vec<Box<[u8]>> = Vec::new();
+                for idx in [ai, bi] {
+                    if let Some(slots) = self.dbs.get(idx) {
+                        keys.extend(
+                            slots
+                                .iter()
+                                .flat_map(|t| t.iter())
+                                .map(|e| e.key().to_vec().into_boxed_slice()),
+                        );
+                    }
+                }
+                for k in &keys {
+                    self.touch_dirty(a, k);
+                    self.touch_dirty(b, k);
+                }
+            }
         }
     }
 }
@@ -4357,5 +4472,153 @@ mod arc_cow_tests {
             n - deleted,
             "a third of the keys were deleted from the live store"
         );
+    }
+}
+
+#[cfg(test)]
+mod dirty_tracking_tests {
+    //! #676 Phase 1a: the per-shard dirty-key set on the write funnel. Verifies it is
+    //! INERT/zero-observable by default, that enabling it captures the COMPLETE mutation set
+    //! (put, overwrite, delete) via the same `observe_put`/`observe_remove` chokepoints, that
+    //! `take_dirty_keys` drains and resets the window, and that disabling gates it back off.
+    //! Eviction removals share the `remove_object` -> `observe_remove` funnel exercised by the
+    //! delete case, so tombstone coverage of an evicted key follows from the delete assertion.
+
+    use super::*;
+    use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+    const NOW: UnixMillis = UnixMillis(0);
+
+    /// Sorted `(db, key-bytes)` view of a taken set, so assertions are order-independent (the
+    /// set is a `hashbrown::HashSet`; ADR-0003 delta order is imposed by the builder, not here).
+    fn sorted(set: HashSet<(u32, Box<[u8]>)>) -> Vec<(u32, Vec<u8>)> {
+        let mut v: Vec<(u32, Vec<u8>)> = set.into_iter().map(|(d, k)| (d, k.into_vec())).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn off_by_default_and_inert() {
+        let mut store = ShardStore::new(2);
+        assert!(!store.dirty_tracking_active());
+        assert_eq!(store.dirty_key_count(), None);
+        // Writes and a delete while tracking is OFF accumulate nothing and hold no set.
+        store.upsert(0, b"a", NewValue::Bytes(b"1"), ExpireWrite::Clear, NOW);
+        store.upsert(1, b"b", NewValue::Bytes(b"2"), ExpireWrite::Clear, NOW);
+        assert!(store.delete(0, b"a", NOW));
+        assert_eq!(store.dirty_key_count(), None);
+        assert!(store.take_dirty_keys().is_none());
+    }
+
+    #[test]
+    fn enabled_tracking_captures_puts_overwrites_and_deletes() {
+        let mut store = ShardStore::new(2);
+        store.enable_dirty_tracking();
+        assert!(store.dirty_tracking_active());
+
+        store.upsert(0, b"k1", NewValue::Bytes(b"v1"), ExpireWrite::Clear, NOW); // put
+        store.upsert(0, b"k2", NewValue::Bytes(b"v2"), ExpireWrite::Clear, NOW); // put
+        store.upsert(0, b"k1", NewValue::Bytes(b"v1b"), ExpireWrite::Clear, NOW); // overwrite (same key)
+        store.upsert(1, b"k1", NewValue::Int(7), ExpireWrite::Clear, NOW); // put in another db
+        assert!(store.delete(0, b"k2", NOW)); // delete MUST be tracked (tombstone coverage)
+
+        // Distinct (db, key): (0,k1), (0,k2), (1,k1) = 3 (the overwrite of (0,k1) is not new).
+        assert_eq!(store.dirty_key_count(), Some(3));
+        let taken = sorted(store.take_dirty_keys().expect("tracking on"));
+        assert_eq!(
+            taken,
+            vec![
+                (0, b"k1".to_vec()),
+                (0, b"k2".to_vec()),
+                (1, b"k1".to_vec())
+            ],
+            "the dirty set is exactly the mutated (db,key) pairs incl. the deleted key"
+        );
+        // take() reset the window: it is now empty, still active.
+        assert_eq!(store.dirty_key_count(), Some(0));
+        assert!(store.dirty_tracking_active());
+    }
+
+    #[test]
+    fn take_resets_the_window() {
+        let mut store = ShardStore::new(1);
+        store.enable_dirty_tracking();
+        store.upsert(0, b"first", NewValue::Bytes(b"x"), ExpireWrite::Clear, NOW);
+        let _ = store.take_dirty_keys();
+        // Only writes AFTER the take land in the next window.
+        store.upsert(0, b"second", NewValue::Bytes(b"y"), ExpireWrite::Clear, NOW);
+        let taken = sorted(store.take_dirty_keys().unwrap());
+        assert_eq!(taken, vec![(0, b"second".to_vec())]);
+    }
+
+    #[test]
+    fn swapdb_dirties_both_dbs_for_present_and_tombstone() {
+        // SWAPDB bypasses the write funnel (O(1) db-vector swap), so `swap_db` must dirty both
+        // dbs explicitly. db0 = {ka, kboth}; db1 = {kb, kboth}. After SWAPDB 0<->1 the union of
+        // affected (db, key) is every key under EITHER db, each under BOTH db ids: a present key
+        // re-encodes under its new db, a moved-out key tombstones where it is now absent.
+        let mut store = ShardStore::new(2);
+        store.upsert(0, b"ka", NewValue::Bytes(b"a0"), ExpireWrite::Clear, NOW);
+        store.upsert(
+            0,
+            b"kboth",
+            NewValue::Bytes(b"both0"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        store.upsert(1, b"kb", NewValue::Bytes(b"b1"), ExpireWrite::Clear, NOW);
+        store.upsert(
+            1,
+            b"kboth",
+            NewValue::Bytes(b"both1"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        // Enable AFTER the load (the epoch cut): only the swap is tracked, not the initial fill.
+        store.enable_dirty_tracking();
+        store.swap_db(0, 1);
+        let taken = sorted(store.take_dirty_keys().unwrap());
+        assert_eq!(
+            taken,
+            vec![
+                (0, b"ka".to_vec()),
+                (0, b"kb".to_vec()),
+                (0, b"kboth".to_vec()),
+                (1, b"ka".to_vec()),
+                (1, b"kb".to_vec()),
+                (1, b"kboth".to_vec()),
+            ],
+            "SWAPDB dirties every key under both db ids (present re-encode + moved-out tombstone)"
+        );
+    }
+
+    #[test]
+    fn swapdb_is_inert_when_tracking_off() {
+        // Default-off: SWAPDB stays a pure O(1) swap with no dirty accumulation.
+        let mut store = ShardStore::new(2);
+        store.upsert(0, b"x", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        store.swap_db(0, 1);
+        assert_eq!(store.dirty_key_count(), None);
+    }
+
+    #[test]
+    fn disable_gates_off_and_drops_the_set() {
+        let mut store = ShardStore::new(1);
+        store.enable_dirty_tracking();
+        store.upsert(0, b"k", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        assert_eq!(store.dirty_key_count(), Some(1));
+        store.disable_dirty_tracking();
+        assert!(!store.dirty_tracking_active());
+        assert_eq!(store.dirty_key_count(), None);
+        // Writes while disabled accumulate nothing; re-enabling starts a fresh empty window.
+        store.upsert(
+            0,
+            b"ignored",
+            NewValue::Bytes(b"z"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        store.enable_dirty_tracking();
+        assert_eq!(store.dirty_key_count(), Some(0));
     }
 }
