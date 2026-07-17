@@ -396,24 +396,110 @@ pub fn write_manifest(
     dir: &Path,
     save_id: u64,
     save_unix_secs: u64,
-    mut entries: Vec<ShardManifestEntry>,
+    entries: Vec<ShardManifestEntry>,
 ) -> io::Result<Manifest> {
-    // Sort by shard so the manifest is deterministic regardless of the order shards reported in.
-    entries.sort_by_key(|e| e.shard);
+    // A base-only save: no delta chain, so the manifest encodes byte-identically to a pre-delta v1
+    // manifest (an older binary loads it unchanged).
+    write_manifest_v2(dir, save_id, save_unix_secs, entries, Vec::new())
+}
+
+/// WRITE a v2-capable manifest that ties per-shard BASE files AND a per-shard DELTA CHAIN into one
+/// committed snapshot (#676). `deltas` empty -> a byte-identical v1 base-only manifest (this is the
+/// [`write_manifest`] path). `deltas` non-empty -> a v2 manifest; `save_id` MUST be the base
+/// generation the deltas apply onto (each [`DeltaManifestEntry::base_epoch`] equals it). Both lists
+/// are sorted deterministically -- base entries by shard, deltas by `(shard, delta_epoch)` -- so the
+/// manifest is byte-stable regardless of the order shards reported in, and the delta list is in the
+/// loader's authoritative apply order. Written atomically (tmp -> fsync -> rename), the LAST write of
+/// a save (the single commit point).
+///
+/// # Errors
+///
+/// Returns any underlying [`io::Error`] from the atomic manifest write.
+pub fn write_manifest_v2(
+    dir: &Path,
+    save_id: u64,
+    save_unix_secs: u64,
+    mut base_entries: Vec<ShardManifestEntry>,
+    mut deltas: Vec<format::DeltaManifestEntry>,
+) -> io::Result<Manifest> {
+    base_entries.sort_by_key(|e| e.shard);
+    deltas.sort_by(|a, b| {
+        a.shard
+            .cmp(&b.shard)
+            .then(a.delta_epoch.cmp(&b.delta_epoch))
+    });
     #[allow(clippy::cast_possible_truncation)]
     let manifest = Manifest {
-        version: format::MANIFEST_VERSION_BASE,
-        shards: entries.len() as u32,
+        version: if deltas.is_empty() {
+            format::MANIFEST_VERSION_BASE
+        } else {
+            format::MANIFEST_VERSION_DELTA
+        },
+        shards: base_entries.len() as u32,
         save_id,
         save_unix_secs,
-        entries,
-        // Base-only save: no delta chain yet (the save-path delta build is a later slice), so the
-        // manifest encodes byte-identically to a pre-delta v1 manifest.
-        deltas: Vec::new(),
+        entries: base_entries,
+        deltas,
     };
     let path = format::manifest_path(dir);
     format::write_file_atomic(&path, &manifest.encode())?;
     Ok(manifest)
+}
+
+/// The maximum number of DELTA rounds chained onto one base before a save COMPACTS to a fresh base
+/// (#676 whole-snapshot). Bounds warm-start replay ([`fold_deltas`] over the chain) and on-disk delta
+/// count. A "round" appends one delta per shard, so this counts rounds (the max `delta_epoch`), not
+/// files.
+pub const MAX_DELTAS_PER_BASE: u32 = 8;
+
+/// The mode of the NEXT whole-snapshot save (#676): every shard does the SAME thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode {
+    /// A full BASE save: every shard writes a fresh base file, `save_id` is a NEW base generation, the
+    /// delta chain resets to empty. Forced on the first save, when deltas are disabled, or on
+    /// compaction (the chain reached the cap).
+    Base,
+    /// A DELTA save onto the current base generation: every shard appends one delta, the manifest
+    /// carries forward the base + prior deltas, and its `save_id` STAYS `base_epoch` (the base
+    /// generation) so a delta's `base_epoch` equals the manifest `save_id`.
+    Delta {
+        /// The base generation this delta round applies onto (== the prior manifest's `save_id`).
+        base_epoch: u64,
+        /// This round's position in the chain (prior max `delta_epoch` + 1).
+        delta_epoch: u64,
+    },
+}
+
+/// Decide whether the NEXT whole-snapshot save is a BASE or a DELTA (#676), purely from the PRIOR
+/// committed manifest. A BASE is forced when deltas are disabled, there is no prior snapshot (nothing
+/// to delta onto), or the chain has reached `max_deltas` (compaction). Otherwise a DELTA onto the
+/// prior base generation (`prior.save_id`) at the next `delta_epoch` (prior max + 1).
+#[must_use]
+pub fn decide_snapshot_mode(
+    prior: Option<&Manifest>,
+    deltas_enabled: bool,
+    max_deltas: u32,
+) -> SaveMode {
+    if !deltas_enabled {
+        return SaveMode::Base;
+    }
+    let Some(prior) = prior else {
+        return SaveMode::Base; // no base generation to delta onto yet.
+    };
+    // The chain depth = the highest delta_epoch across the prior manifest's deltas (0 = base-only).
+    let depth = prior
+        .deltas
+        .iter()
+        .map(|d| d.delta_epoch)
+        .max()
+        .unwrap_or(0);
+    if depth >= u64::from(max_deltas) {
+        return SaveMode::Base; // compaction: the chain is full -> fold it back into a fresh base.
+    }
+    SaveMode::Delta {
+        base_epoch: prior.save_id,
+        delta_epoch: depth + 1,
+    }
 }
 
 /// Read + validate the committed manifest in `dir`, or `None` if there is no loadable snapshot
@@ -1345,6 +1431,100 @@ mod tests {
             "d2 (the torn link) was NOT applied: b stays base"
         );
         dst.end_save();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn base_manifest(save_id: u64, delta_depth: u64) -> Manifest {
+        Manifest {
+            version: if delta_depth == 0 {
+                format::MANIFEST_VERSION_BASE
+            } else {
+                format::MANIFEST_VERSION_DELTA
+            },
+            shards: 1,
+            save_id,
+            save_unix_secs: 1,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 1,
+                crc: 0,
+            }],
+            deltas: (1..=delta_depth)
+                .map(|e| format::DeltaManifestEntry {
+                    shard: 0,
+                    file: format!("d{e}.icsd"),
+                    puts: 1,
+                    tombstones: 0,
+                    crc: 0,
+                    base_epoch: save_id,
+                    delta_epoch: e,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn decide_snapshot_mode_base_delta_and_compaction() {
+        // Disabled -> always base.
+        assert_eq!(decide_snapshot_mode(None, false, 8), SaveMode::Base);
+        assert_eq!(
+            decide_snapshot_mode(Some(&base_manifest(5, 0)), false, 8),
+            SaveMode::Base
+        );
+        // Enabled but no prior snapshot -> base (nothing to delta onto).
+        assert_eq!(decide_snapshot_mode(None, true, 8), SaveMode::Base);
+        // Enabled + a prior BASE (no deltas) -> a delta onto that generation, epoch 1.
+        assert_eq!(
+            decide_snapshot_mode(Some(&base_manifest(5, 0)), true, 8),
+            SaveMode::Delta {
+                base_epoch: 5,
+                delta_epoch: 1
+            }
+        );
+        // A chain at depth 3 (< cap) -> the next delta is epoch 4, same base generation.
+        assert_eq!(
+            decide_snapshot_mode(Some(&base_manifest(9, 3)), true, 8),
+            SaveMode::Delta {
+                base_epoch: 9,
+                delta_epoch: 4
+            }
+        );
+        // A chain at the cap -> compaction (a fresh base).
+        assert_eq!(
+            decide_snapshot_mode(Some(&base_manifest(9, 8)), true, 8),
+            SaveMode::Base
+        );
+    }
+
+    #[test]
+    fn write_manifest_v2_is_v1_base_only_and_v2_with_deltas() {
+        let dir = temp_dir("wm-v2");
+        let base = vec![ShardManifestEntry {
+            shard: 0,
+            file: shard_file_name(0),
+            keys: 3,
+            crc: 7,
+        }];
+        // No deltas -> a v1 base-only manifest (write_manifest delegates here, so byte-compatible).
+        let m1 = write_manifest_v2(&dir, 4, 100, base.clone(), vec![]).unwrap();
+        assert_eq!(m1.version, format::MANIFEST_VERSION_BASE);
+        assert!(m1.deltas.is_empty());
+        assert_eq!(read_manifest(&dir).unwrap(), m1);
+        // With a delta -> a v2 manifest that round-trips + carries the delta.
+        let deltas = vec![format::DeltaManifestEntry {
+            shard: 0,
+            file: "d1.icsd".to_string(),
+            puts: 2,
+            tombstones: 1,
+            crc: 0xABCD,
+            base_epoch: 4,
+            delta_epoch: 1,
+        }];
+        let m2 = write_manifest_v2(&dir, 4, 100, base, deltas).unwrap();
+        assert_eq!(m2.version, format::MANIFEST_VERSION_DELTA);
+        assert_eq!(read_manifest(&dir).expect("v2 reads back"), m2);
+        assert_eq!(m2.deltas.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
