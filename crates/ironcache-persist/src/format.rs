@@ -50,6 +50,19 @@ pub const MAGIC: [u8; 4] = *b"ICSS";
 /// fails LOUDLY instead of silently starting empty (#530).
 pub const FORMAT_VERSION: u32 = 1;
 
+/// The MANIFEST layout version written for a BASE-ONLY snapshot (no delta chain): byte-identical to
+/// every pre-delta manifest (#676 Phase 1b), so an OLDER binary loads it unchanged. Equal to
+/// [`FORMAT_VERSION`]; the shard-file header version and this base-manifest version move together.
+pub const MANIFEST_VERSION_BASE: u32 = 1;
+
+/// The MANIFEST layout version written when the snapshot carries a per-shard DELTA CHAIN (#676).
+/// An older binary that does not understand deltas CLASSIFIES this as
+/// [`SnapshotLoadError::UnknownVersion`] (fail-closed, #530) rather than loading the bases ALONE and
+/// silently serving STALE data (it cannot apply the deltas). This binary reads BOTH versions; a
+/// base-only save still writes [`MANIFEST_VERSION_BASE`] so nothing regresses until a delta is
+/// actually produced.
+pub const MANIFEST_VERSION_DELTA: u32 = 2;
+
 /// A committed on-disk snapshot this binary CANNOT load, CLASSIFIED so the boot path can react
 /// (surface it LOUDLY, and optionally FAIL CLOSED) instead of the pre-#530 behavior of silently
 /// starting with an EMPTY keyspace. This is DISTINCT from a genuinely MISSING / TORN / FOREIGN file,
@@ -69,7 +82,8 @@ pub enum SnapshotLoadError {
     UnknownVersion {
         /// The format version recorded in the committed manifest on disk.
         found: u32,
-        /// The format version THIS binary understands ([`FORMAT_VERSION`]).
+        /// The NEWEST manifest version THIS binary understands ([`MANIFEST_VERSION_DELTA`]; it reads
+        /// every version up through it).
         supported: u32,
     },
 }
@@ -150,12 +164,41 @@ pub struct ShardManifestEntry {
     pub crc: u32,
 }
 
+/// One DELTA file's entry in a v2 manifest CHAIN (#676 Phase 1b): which file holds the delta, its
+/// record counts, its body CRC (recomputed on load to catch a torn delta), and the two epochs that
+/// BIND it -- `base_epoch` (the base snapshot it applies onto; must match the base's epoch) and
+/// `delta_epoch` (its position in the shard's chain; the loader asserts these are strictly
+/// increasing so a HOLE in the chain is detected).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaManifestEntry {
+    /// The shard this delta belongs to (0-based).
+    pub shard: u32,
+    /// The delta file name (relative to the data directory).
+    pub file: String,
+    /// The number of PUT records in the delta.
+    pub puts: u64,
+    /// The number of TOMBSTONE records in the delta.
+    pub tombstones: u64,
+    /// The CRC-32 of the delta file's RECORD BODY (after its header), recomputed on load.
+    pub crc: u32,
+    /// The base snapshot epoch this delta applies ONTO: equals the manifest [`Manifest::save_id`] of
+    /// the base generation (rejected on load if it does not match the loaded base's `save_id`).
+    pub base_epoch: u64,
+    /// This delta's own epoch, strictly increasing within a shard's chain (the loader's hole check).
+    pub delta_epoch: u64,
+}
+
 /// The committed MANIFEST: the single point that ties a set of per-shard files into ONE
 /// consistent, loadable snapshot. Written + fsync'd LAST in a save, so a crash mid-save leaves
 /// the prior good manifest (and the prior good files) intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    /// The on-disk format version ([`FORMAT_VERSION`] at write time; load rejects an unknown one).
+    /// The on-disk manifest layout version, AUTHORITATIVE on encode: the writer sets
+    /// [`MANIFEST_VERSION_BASE`] for a base-only save and [`MANIFEST_VERSION_DELTA`] for one with a
+    /// delta chain, and [`Self::encode`] writes the v2 delta section iff this is
+    /// [`MANIFEST_VERSION_DELTA`] (a `debug_assert` guards that it matches `deltas` presence). A
+    /// base-only manifest (`MANIFEST_VERSION_BASE`, empty `deltas`) encodes byte-identically to a
+    /// pre-delta manifest, so an older binary loads it unchanged.
     pub version: u32,
     /// The number of shards this snapshot was taken from (the partition count at SAVE TIME). The
     /// loading node may have a DIFFERENT shard count (a reconfiguration); load handles this by
@@ -165,14 +208,28 @@ pub struct Manifest {
     /// re-shard; the WITHIN-store re-hash on `insert_object` only places a key into its owning DB,
     /// NOT across shards, so the across-shard placement MUST come from the re-shard on load.
     pub shards: u32,
-    /// A monotone SAVE ID (incremented per successful save). Informational / debugging; the
-    /// commit ordering is the manifest rename, not this id.
+    /// A monotone SAVE ID that ALSO serves as the BASE-GENERATION EPOCH a delta chain matches
+    /// against (#676): the save-path convention is that `save_id` identifies the current BASE
+    /// generation, so a [`DeltaManifestEntry::base_epoch`] equals it (there is exactly ONE per
+    /// manifest, shared by every base entry -- no per-entry epoch field is needed). While the delta
+    /// build ships dark every save is a base save, so this increments per save exactly as before; a
+    /// later slice preserves it across delta-appends and advances it only when a fresh base is
+    /// written (compaction), so the loader can reject a delta whose `base_epoch` does not match the
+    /// base it is loading. Commit ordering is the manifest rename, not this id.
     pub save_id: u64,
     /// The unix-time (SECONDS) of this save, sourced from the env Clock seam by the caller
     /// (ADR-0003: this module reads no clock). Reported by `LASTSAVE`.
     pub save_unix_secs: u64,
     /// The per-shard entries (file + key count + CRC), in shard order.
     pub entries: Vec<ShardManifestEntry>,
+    /// The per-shard DELTA CHAIN (#676 Phase 1b): the deltas that apply onto the base `entries`,
+    /// in chain (apply) order. EMPTY for a base-only snapshot (the overwhelming default while the
+    /// save-path delta build ships dark), in which case the manifest encodes byte-identically to a
+    /// pre-delta (v1) manifest. Non-empty only once a save actually produces deltas, which flips the
+    /// wire version to [`MANIFEST_VERSION_DELTA`]. The save-path MUST emit these in a DETERMINISTIC
+    /// order (e.g. sorted by `(shard, delta_epoch)`, mirroring how `entries` is sorted by shard),
+    /// since the manifest list-order is the authoritative chain-apply order (ADR-0003).
+    pub deltas: Vec<DeltaManifestEntry>,
 }
 
 impl Manifest {
@@ -188,9 +245,20 @@ impl Manifest {
     /// detected and treated as no-snapshot). All integers little-endian, matching the kvcodec.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.entries.len() * 48);
+        // `version` is authoritative: the writer sets BASE for a base-only save (byte-identical to a
+        // pre-delta manifest) and DELTA for a chain; the delta section is written iff it is DELTA.
+        // The guard catches a writer that set the version and the deltas inconsistently (a
+        // hypothetical future version > DELTA is exempt, since its layout is not ours to constrain).
+        let is_delta_version = self.version == MANIFEST_VERSION_DELTA;
+        let has_deltas = !self.deltas.is_empty();
+        debug_assert!(
+            is_delta_version == has_deltas || self.version > MANIFEST_VERSION_DELTA,
+            "manifest version must match delta presence"
+        );
+        let version = self.version;
+        let mut out = Vec::with_capacity(64 + self.entries.len() * 48 + self.deltas.len() * 56);
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&self.shards.to_le_bytes());
         out.extend_from_slice(&self.save_id.to_le_bytes());
         out.extend_from_slice(&self.save_unix_secs.to_le_bytes());
@@ -204,6 +272,24 @@ impl Manifest {
             #[allow(clippy::cast_possible_truncation)]
             out.extend_from_slice(&(name.len() as u32).to_le_bytes());
             out.extend_from_slice(name);
+        }
+        // v2 DELTA SECTION: present ONLY when deltas exist, so a base-only manifest carries no extra
+        // bytes. Count-prefixed, then each entry; the trailing CRC below covers it as well.
+        if version == MANIFEST_VERSION_DELTA {
+            #[allow(clippy::cast_possible_truncation)]
+            out.extend_from_slice(&(self.deltas.len() as u32).to_le_bytes());
+            for d in &self.deltas {
+                out.extend_from_slice(&d.shard.to_le_bytes());
+                out.extend_from_slice(&d.puts.to_le_bytes());
+                out.extend_from_slice(&d.tombstones.to_le_bytes());
+                out.extend_from_slice(&d.crc.to_le_bytes());
+                out.extend_from_slice(&d.base_epoch.to_le_bytes());
+                out.extend_from_slice(&d.delta_epoch.to_le_bytes());
+                let name = d.file.as_bytes();
+                #[allow(clippy::cast_possible_truncation)]
+                out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                out.extend_from_slice(name);
+            }
         }
         let crc = crc32(&out);
         out.extend_from_slice(&crc.to_le_bytes());
@@ -230,7 +316,7 @@ impl Manifest {
             return None;
         }
         let version = r.u32()?;
-        if version != FORMAT_VERSION {
+        if version != MANIFEST_VERSION_BASE && version != MANIFEST_VERSION_DELTA {
             return None; // an unknown version: do not guess at its layout.
         }
         let shards = r.u32()?;
@@ -252,6 +338,35 @@ impl Manifest {
                 crc,
             });
         }
+        // v2 DELTA SECTION: present only for MANIFEST_VERSION_DELTA; a v1 manifest ends after the
+        // base entries (its `deltas` is empty), preserving exact v1 decode.
+        let deltas = if version == MANIFEST_VERSION_DELTA {
+            let delta_count = r.u32()? as usize;
+            let mut ds = Vec::with_capacity(delta_count.min(4096));
+            for _ in 0..delta_count {
+                let shard = r.u32()?;
+                let puts = r.u64()?;
+                let tombstones = r.u64()?;
+                let crc = r.u32()?;
+                let base_epoch = r.u64()?;
+                let delta_epoch = r.u64()?;
+                let name_len = r.u32()? as usize;
+                let name_bytes = r.take(name_len)?;
+                let file = String::from_utf8(name_bytes.to_vec()).ok()?;
+                ds.push(DeltaManifestEntry {
+                    shard,
+                    file,
+                    puts,
+                    tombstones,
+                    crc,
+                    base_epoch,
+                    delta_epoch,
+                });
+            }
+            ds
+        } else {
+            Vec::new()
+        };
         if !r.is_done() {
             return None; // trailing slop in the body is malformed
         }
@@ -261,6 +376,7 @@ impl Manifest {
             save_id,
             save_unix_secs,
             entries,
+            deltas,
         })
     }
 }
@@ -271,10 +387,11 @@ impl Manifest {
 ///
 /// - `Ok(())` when `buf` is NOT a well-formed manifest (too short / wrong magic / a broken trailing
 ///   CRC -- all "start empty" degradations, unchanged from [`Manifest::decode`] returning `None`), OR
-///   it IS a well-formed manifest recording the version this binary reads ([`FORMAT_VERSION`]).
+///   it IS a well-formed manifest recording a version this binary reads
+///   ([`MANIFEST_VERSION_BASE`] or [`MANIFEST_VERSION_DELTA`]).
 /// - `Err(`[`SnapshotLoadError::UnknownVersion`]`)` when `buf` IS a well-formed manifest (magic +
-///   trailing CRC valid) whose recorded format version differs from [`FORMAT_VERSION`]: a dump this
-///   binary must not silently discard.
+///   trailing CRC valid) whose recorded version is NEWER than any this binary reads (above
+///   [`MANIFEST_VERSION_DELTA`]): a dump this binary must not silently discard.
 ///
 /// The trailing CRC is validated FIRST so a torn manifest (whose version bytes are untrustworthy) is
 /// treated as no-snapshot, never mis-classified as a version error. TOTAL: never panics.
@@ -298,12 +415,12 @@ pub fn classify_manifest_version(buf: &[u8]) -> Result<(), SnapshotLoadError> {
         return Ok(());
     };
     let version = u32::from_le_bytes(ver_arr);
-    if version == FORMAT_VERSION {
-        return Ok(()); // a version this binary reads; the normal decode path handles it.
+    if version == MANIFEST_VERSION_BASE || version == MANIFEST_VERSION_DELTA {
+        return Ok(()); // a version this binary reads (base v1 or delta v2); the decode path handles it.
     }
     Err(SnapshotLoadError::UnknownVersion {
         found: version,
-        supported: FORMAT_VERSION,
+        supported: MANIFEST_VERSION_DELTA,
     })
 }
 
@@ -489,7 +606,7 @@ mod tests {
     #[test]
     fn manifest_round_trips() {
         let m = Manifest {
-            version: FORMAT_VERSION,
+            version: MANIFEST_VERSION_BASE,
             shards: 3,
             save_id: 42,
             save_unix_secs: 1_700_000_000,
@@ -513,6 +630,7 @@ mod tests {
                     crc: 0xDEAD_BEEF,
                 },
             ],
+            deltas: Vec::new(),
         };
         let bytes = m.encode();
         let decoded = Manifest::decode(&bytes).expect("a well-formed manifest decodes");
@@ -523,7 +641,7 @@ mod tests {
     #[test]
     fn manifest_decode_rejects_torn_and_foreign() {
         let m = Manifest {
-            version: FORMAT_VERSION,
+            version: MANIFEST_VERSION_BASE,
             shards: 1,
             save_id: 1,
             save_unix_secs: 1,
@@ -533,6 +651,7 @@ mod tests {
                 keys: 1,
                 crc: 9,
             }],
+            deltas: Vec::new(),
         };
         let good = m.encode();
 
@@ -558,11 +677,12 @@ mod tests {
 
     #[test]
     fn classify_manifest_version_flags_only_a_well_formed_unknown_version() {
-        // A manifest at a NEWER format version (FORMAT_VERSION + 1) is a downgrade / rollback: it is
+        // A manifest at a version NEWER than any this binary reads (MANIFEST_VERSION_DELTA + 1 -- v2
+        // is a supported delta manifest now, so the unknown bar moved up) is a downgrade / rollback:
         // well-formed (magic + trailing CRC valid) but unreadable, so it CLASSIFIES as UnknownVersion
         // rather than the silent no-snapshot `None` the old decode returned (#530).
         let newer = Manifest {
-            version: FORMAT_VERSION + 1,
+            version: MANIFEST_VERSION_DELTA + 1,
             shards: 1,
             save_id: 7,
             save_unix_secs: 1,
@@ -572,19 +692,20 @@ mod tests {
                 keys: 3,
                 crc: 0xABCD,
             }],
+            deltas: Vec::new(),
         };
         assert_eq!(
             classify_manifest_version(&newer.encode()),
             Err(SnapshotLoadError::UnknownVersion {
-                found: FORMAT_VERSION + 1,
-                supported: FORMAT_VERSION,
+                found: MANIFEST_VERSION_DELTA + 1,
+                supported: MANIFEST_VERSION_DELTA,
             }),
             "a well-formed newer-version manifest is a classified error, not silent empty"
         );
 
-        // The CURRENT version is loadable -> Ok (the normal decode path handles it).
+        // The CURRENT base version is loadable -> Ok (the normal decode path handles it).
         let current = Manifest {
-            version: FORMAT_VERSION,
+            version: MANIFEST_VERSION_BASE,
             ..newer.clone()
         };
         assert_eq!(classify_manifest_version(&current.encode()), Ok(()));
@@ -598,6 +719,130 @@ mod tests {
         // Foreign / too-short / empty buffers are likewise Ok (start empty, unchanged).
         assert_eq!(classify_manifest_version(b""), Ok(()));
         assert_eq!(classify_manifest_version(b"IC"), Ok(()));
+    }
+
+    #[test]
+    fn manifest_v2_delta_chain_round_trips() {
+        let m = Manifest {
+            version: MANIFEST_VERSION_DELTA,
+            shards: 2,
+            save_id: 9,
+            save_unix_secs: 1_700_000_100,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 3,
+                crc: 0x11,
+            }],
+            deltas: vec![
+                DeltaManifestEntry {
+                    shard: 0,
+                    file: "dump-shard-0-delta-1.icsd".to_string(),
+                    puts: 5,
+                    tombstones: 2,
+                    crc: 0xAABB,
+                    base_epoch: 9,
+                    delta_epoch: 10,
+                },
+                DeltaManifestEntry {
+                    shard: 1,
+                    file: "dump-shard-1-delta-1.icsd".to_string(),
+                    puts: 0,
+                    tombstones: 4,
+                    crc: 0xCCDD,
+                    base_epoch: 9,
+                    delta_epoch: 11,
+                },
+            ],
+        };
+        let bytes = m.encode();
+        // The wire version is the delta version, and this binary classifies it as loadable.
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            MANIFEST_VERSION_DELTA
+        );
+        assert_eq!(classify_manifest_version(&bytes), Ok(()));
+        let decoded = Manifest::decode(&bytes).expect("a v2 delta manifest decodes");
+        assert_eq!(decoded, m);
+        assert_eq!(decoded.deltas.len(), 2);
+    }
+
+    #[test]
+    fn base_only_manifest_stays_v1_and_omits_the_delta_section() {
+        // A base-only manifest encodes at MANIFEST_VERSION_BASE with NO delta bytes, so an older
+        // binary loads it unchanged (byte-compatible with a pre-delta manifest).
+        let base = Manifest {
+            version: MANIFEST_VERSION_BASE,
+            shards: 1,
+            save_id: 1,
+            save_unix_secs: 1,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 4,
+                crc: 7,
+            }],
+            deltas: Vec::new(),
+        };
+        let bytes = base.encode();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            MANIFEST_VERSION_BASE
+        );
+        let decoded = Manifest::decode(&bytes).expect("base-only decodes");
+        assert!(decoded.deltas.is_empty());
+        assert_eq!(decoded, base);
+        // The same manifest promoted to carry a delta is STRICTLY LONGER: the section exists only
+        // when deltas do.
+        let mut with_delta = base.clone();
+        with_delta.version = MANIFEST_VERSION_DELTA;
+        with_delta.deltas.push(DeltaManifestEntry {
+            shard: 0,
+            file: "d.icsd".to_string(),
+            puts: 1,
+            tombstones: 0,
+            crc: 1,
+            base_epoch: 1,
+            delta_epoch: 2,
+        });
+        assert!(
+            with_delta.encode().len() > bytes.len(),
+            "the delta section adds bytes only when present"
+        );
+    }
+
+    #[test]
+    fn v2_manifest_decode_rejects_torn_delta_section() {
+        let m = Manifest {
+            version: MANIFEST_VERSION_DELTA,
+            shards: 1,
+            save_id: 1,
+            save_unix_secs: 1,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 1,
+                crc: 3,
+            }],
+            deltas: vec![DeltaManifestEntry {
+                shard: 0,
+                file: "d.icsd".to_string(),
+                puts: 1,
+                tombstones: 0,
+                crc: 5,
+                base_epoch: 1,
+                delta_epoch: 2,
+            }],
+        };
+        let good = m.encode();
+        assert!(Manifest::decode(&good).is_some());
+        // Truncating into the delta section -> None (no panic).
+        assert!(Manifest::decode(&good[..good.len() - 8]).is_none());
+        // A flipped byte anywhere in the body breaks the trailing CRC -> None.
+        let mut torn = good.clone();
+        let mid = torn.len() / 2;
+        torn[mid] ^= 0xFF;
+        assert!(Manifest::decode(&torn).is_none());
     }
 
     #[test]
