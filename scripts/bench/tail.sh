@@ -31,6 +31,15 @@
 #
 # To turn a dimension OFF for an ablation, override it: `EVICT=0 scripts/bench/tail.sh` measures
 # the snapshot tail WITHOUT eviction; `SNAPSHOT=0 scripts/bench/tail.sh` is a plain eviction run.
+#
+# #676 DELTA-SNAPSHOT A/B (the during-save p99.9 payoff): re-run with the delta knob flipped and
+# compare the p99.9 UNDER the concurrent save:
+#   SNAPSHOT_DELTAS=0 scripts/bench/tail.sh --out-dir /tmp/base    # base every save (291ms floor)
+#   SNAPSHOT_DELTAS=1 scripts/bench/tail.sh --out-dir /tmp/delta   # deltas after the first base
+# A short SNAPSHOT_INTERVAL_SECS + a moderate write ratio is the regime deltas win (small dirty
+# fraction -> re-read a slice, not the keyspace); as writes approach the keyspace the delta degrades
+# to a base (compaction). Needs REAL hardware (the floor is a memory-bandwidth effect); see
+# docs/bench/TAIL_LATENCY.md.
 
 set -euo pipefail
 

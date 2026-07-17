@@ -868,6 +868,15 @@ measure_server() {
     if [[ "${SNAPSHOT}" == "1" && -n "${SNAP_DIR}" ]]; then
       ic_env+=("IRONCACHE_DATA_DIR=${SNAP_DIR}")
       echo "[h2h] ${name}: SNAPSHOT persistence ON (IRONCACHE_DATA_DIR=${SNAP_DIR}; periodic save off, only the BGSAVE loop persists)."
+      # INCREMENTAL DELTA SNAPSHOTS (#676): the A/B knob for the during-save p99.9 payoff. When
+      # SNAPSHOT_DELTAS=1, IronCache writes a DELTA of only the keys mutated since the last save
+      # (re-reading FEWER bytes on the persist thread) after the first base, so the during-save tail
+      # should drop in proportion to the dirty fraction. Only meaningful under SNAPSHOT (there is no
+      # save otherwise); default off = the base-every-save behavior (the 291ms read-bandwidth floor).
+      if [[ "${SNAPSHOT_DELTAS:-0}" == "1" ]]; then
+        ic_env+=("IRONCACHE_SNAPSHOT_DELTAS=true")
+        echo "[h2h] ${name}: #676 incremental delta snapshots ON (IRONCACHE_SNAPSHOT_DELTAS=true; the during-save p99.9 A/B)."
+      fi
     fi
     # DEDICATED PERSIST CORE (#589): if PERSIST_CORE is set, pin IronCache's off-datapath persist
     # thread to it via IRONCACHE_PERSIST_CPU so its encode stops stealing a serving core during a save.
