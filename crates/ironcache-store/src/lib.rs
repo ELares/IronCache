@@ -3154,6 +3154,12 @@ pub struct FrozenSlot {
     /// An `Arc` clone of one of the store's slot tables, frozen at [`ShardStore::begin_save`].
     /// Solely read (never `&mut`) by the persist thread until it is dropped.
     table: Arc<HashTable<Entry>>,
+    /// A copy of the store's hasher (captured at freeze), so [`Self::find`] probes this frozen table
+    /// with the SAME hash the datapath used to insert the entry. `DefaultHashBuilder` is `Clone` over
+    /// its seed (a random per-instance seed plus the process-global one), so a copy PRESERVES the seed
+    /// and hashes byte-identically to the original -- the store already relies on this when it clones
+    /// the hasher on a table grow. Enables #676's O(1) per-dirty-key lookup.
+    hasher: DefaultHashBuilder,
 }
 
 // SAFETY: see the `FrozenSlot` type doc. A `FrozenSlot` is created ONLY for a slot that is
@@ -3177,6 +3183,18 @@ impl FrozenSlot {
     /// [`Entry::is_expired`] and encodes each live entry with [`Entry::to_kvobj`].
     pub fn entries(&self) -> impl Iterator<Item = &Entry> + '_ {
         self.table.iter()
+    }
+
+    /// Look up `key` in this frozen slot, O(1) (#676 delta build): a dirty key PRESENT here becomes a
+    /// delta PUT (encode this entry), an ABSENT one a TOMBSTONE. Probes with the store's own hasher
+    /// (captured at freeze), so the hash matches how the datapath inserted the entry. This is the
+    /// per-dirty-key lookup that lets a delta touch ONLY the dirty keys instead of re-reading the
+    /// whole keyspace (the point of #676). The caller applies the lazy-expiry skip via
+    /// [`Entry::is_expired`] (a present-but-expired key is logically absent -> a TOMBSTONE).
+    #[must_use]
+    pub fn find(&self, key: &[u8]) -> Option<&Entry> {
+        let hash = self.hasher.hash_one(key);
+        self.table.find(hash, |e| e.key() == key)
     }
 }
 
@@ -3228,6 +3246,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 frozen.push(FrozenSlot {
                     db,
                     table: Arc::clone(slot),
+                    hasher: self.hasher.clone(),
                 });
             }
         }
@@ -4549,6 +4568,49 @@ mod dirty_tracking_tests {
         store.upsert(0, b"second", NewValue::Bytes(b"y"), ExpireWrite::Clear, NOW);
         let taken = sorted(store.take_dirty_keys().unwrap());
         assert_eq!(taken, vec![(0, b"second".to_vec())]);
+    }
+
+    #[test]
+    fn frozen_slot_find_locates_present_and_misses_absent() {
+        // The #676 delta build resolves each dirty key against the frozen snapshot: present -> PUT,
+        // absent -> TOMBSTONE. FrozenSlot::find is that O(1) lookup.
+        let mut store = ShardStore::new(2);
+        store.upsert(
+            0,
+            b"present",
+            NewValue::Bytes(b"v1"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        store.upsert(
+            1,
+            b"other-db",
+            NewValue::Bytes(b"v2"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        store.upsert(0, b"gone", NewValue::Bytes(b"v3"), ExpireWrite::Clear, NOW);
+        assert!(store.delete(0, b"gone", NOW)); // deleted BEFORE the freeze -> absent in the snapshot
+
+        let frozen = store.begin_save();
+        // A key lives in exactly one frozen slot; search across them.
+        let find = |key: &[u8]| frozen.iter().find_map(|s| s.find(key));
+        assert!(
+            find(b"present").is_some(),
+            "a resident key is found (a delta PUT)"
+        );
+        assert_eq!(find(b"present").unwrap().key(), b"present");
+        assert!(find(b"other-db").is_some(), "a key in another db is found");
+        assert!(
+            find(b"gone").is_none(),
+            "a key deleted before the freeze is absent (a delta TOMBSTONE)"
+        );
+        assert!(
+            find(b"never-written").is_none(),
+            "a never-written key is absent"
+        );
+        drop(frozen);
+        store.end_save();
     }
 
     #[test]

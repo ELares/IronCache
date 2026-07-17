@@ -202,6 +202,51 @@ pub fn dump_frozen_slots(frozen: &[FrozenSlot], shard: u32, now: UnixMillis) -> 
     builder.finish(shard)
 }
 
+/// Build a DELTA file from the frozen snapshot + the keys DIRTIED since the base (#676 Phase 1b): for
+/// each dirty `(db, key)`, look it up in the frozen slots via [`FrozenSlot::find`] -- a PRESENT and
+/// live key becomes a delta PUT (its frozen entry re-encoded, byte-identical to the base record for
+/// that key), an ABSENT or EXPIRED one a TOMBSTONE (warm-start must remove it so it does not
+/// resurrect from the base). It touches ONLY the dirty keys, never the whole keyspace -- that is the
+/// point of #676 (the persist-thread READ shrinks to the dirty fraction, the lever that moves the
+/// during-snapshot p99.9 bandwidth floor).
+///
+/// The keys are sorted for a DETERMINISTIC on-disk record order (ADR-0003; the taken dirty set is
+/// unordered). `base_epoch` / `delta_epoch` are stamped into the delta header (the manifest chain
+/// records the same, so the loader binds the delta to its base + orders the chain).
+///
+/// PERF NOTE: the lookup filters the flat frozen slice by `db` then probes each of that db's frozen
+/// slots, so it is O(non-empty-slots-per-db) hash-probes per dirty key (most are immediate misses).
+/// For a small dirty set this is cheap and runs OFF the serving core (the persist thread); a
+/// slot-routed O(1)-per-key variant is a follow-up gated on the c7g tail measurement (measure-first).
+#[must_use]
+pub fn build_delta_from_frozen(
+    frozen: &[FrozenSlot],
+    dirty: &[(u32, Box<[u8]>)],
+    shard: u32,
+    base_epoch: u64,
+    delta_epoch: u64,
+    now: UnixMillis,
+) -> delta::DeltaDump {
+    // Deterministic record order: sort the unordered dirty set by (db, key).
+    let mut sorted: Vec<&(u32, Box<[u8]>)> = dirty.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut builder = delta::DeltaBuilder::new();
+    for (db, key) in sorted {
+        let found = frozen
+            .iter()
+            .filter(|s| s.db() == *db)
+            .find_map(|s| s.find(key));
+        match found {
+            // Present + live at the freeze -> a PUT carrying the frozen entry (the state as of the cut).
+            Some(entry) if !entry.is_expired(now) => builder.push_put(*db, entry),
+            // Absent, or present-but-expired (logically dead) -> a TOMBSTONE.
+            _ => builder.push_tombstone(*db, key),
+        }
+    }
+    builder.finish(shard, base_epoch, delta_epoch)
+}
+
 /// INCREMENTAL builder for a shard [`ShardDump`], so the caller can drive
 /// [`ShardStore::snapshot_chunk`](ironcache_store::ShardStore::snapshot_chunk) itself and RELEASE
 /// the store borrow (and, on the serve path, `yield` the shard) BETWEEN chunks (#571). It is the
@@ -884,6 +929,64 @@ mod tests {
         assert_eq!(loaded, 0, "a torn file is rejected (load as empty)");
         assert!(dst.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_delta_puts_present_and_tombstones_absent_or_expired() {
+        // #676 delta build: resolve the dirty keys against the frozen snapshot into PUT/TOMBSTONE.
+        let now = UnixMillis(10);
+        let mut store: TestStore = ShardStore::new(1);
+        // BASE (tracking OFF): keys that exist before the epoch cut.
+        store.insert_object(0, KvObj::from_bytes(b"keep", b"base", None));
+        store.insert_object(0, KvObj::from_bytes(b"del", b"base", None));
+
+        // EPOCH CUT: track every write from here.
+        store.enable_dirty_tracking();
+        store.insert_object(0, KvObj::from_bytes(b"keep", b"updated", None)); // overwrite -> PUT
+        store.insert_object(0, KvObj::from_bytes(b"new", b"fresh", None)); // create -> PUT
+        store.insert_object(0, KvObj::from_bytes(b"gone-ttl", b"v", Some(UnixMillis(5)))); // expired at now=10
+        assert!(store.delete(0, b"del", now)); // delete -> TOMBSTONE
+
+        let dirty: Vec<(u32, Box<[u8]>)> = store
+            .take_dirty_keys()
+            .expect("tracking on")
+            .into_iter()
+            .collect();
+        let frozen = store.begin_save();
+        let dump = build_delta_from_frozen(&frozen, &dirty, 0, 1, 2, now);
+        assert_eq!(
+            dump.puts, 2,
+            "keep (overwrite) + new (create) are live PUTs"
+        );
+        assert_eq!(
+            dump.tombstones, 2,
+            "del (deleted) + gone-ttl (expired) are TOMBSTONEs"
+        );
+
+        // Fold the delta and verify the net per-(db,key) effect + the header epochs.
+        let (base_epoch, delta_epoch, body) =
+            delta::split_delta_header(&dump.bytes, 0).expect("valid delta header");
+        assert_eq!((base_epoch, delta_epoch), (1, 2));
+        let net = delta::fold_deltas([body]);
+        assert!(matches!(
+            net.get(&(0, b"keep".to_vec())),
+            Some(delta::DeltaEffect::Put(_))
+        ));
+        assert!(matches!(
+            net.get(&(0, b"new".to_vec())),
+            Some(delta::DeltaEffect::Put(_))
+        ));
+        assert_eq!(
+            net.get(&(0, b"del".to_vec())),
+            Some(&delta::DeltaEffect::Tombstone)
+        );
+        assert_eq!(
+            net.get(&(0, b"gone-ttl".to_vec())),
+            Some(&delta::DeltaEffect::Tombstone)
+        );
+        assert_eq!(net.len(), 4);
+        drop(frozen);
+        store.end_save();
     }
 
     #[test]
