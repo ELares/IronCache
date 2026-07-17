@@ -383,6 +383,39 @@ pub fn write_shard_dump(
     })
 }
 
+/// WRITE one shard's DELTA file ATOMICALLY to `<dir>/dump-shard-<shard>-delta-<delta_epoch>.icsd`
+/// (tmp -> fsync -> rename) and return the [`DeltaManifestEntry`] the caller appends to the manifest
+/// chain (#676). The delta `bytes` already carry the self-describing header (shard, base_epoch,
+/// delta_epoch); `base_epoch` / `delta_epoch` are passed here only to populate the manifest entry.
+/// The per-shard delta writes happen BEFORE the manifest is committed LAST, so a crash between them
+/// leaves the prior committed snapshot intact (a leftover delta the not-yet-written manifest does not
+/// reference is ignored on load), exactly like [`write_shard_dump`].
+///
+/// # Errors
+///
+/// Returns any underlying [`io::Error`] from the atomic file write; the caller treats it as a failed
+/// save (the prior committed snapshot stays current).
+pub fn write_delta_file(
+    dump: &delta::DeltaDump,
+    shard: u32,
+    base_epoch: u64,
+    delta_epoch: u64,
+    dir: &Path,
+) -> io::Result<format::DeltaManifestEntry> {
+    let file = format::delta_file_name(shard, delta_epoch);
+    let path = dir.join(&file);
+    format::write_file_atomic(&path, &dump.bytes)?;
+    Ok(format::DeltaManifestEntry {
+        shard,
+        file,
+        puts: dump.puts,
+        tombstones: dump.tombstones,
+        crc: dump.crc,
+        base_epoch,
+        delta_epoch,
+    })
+}
+
 /// COMMIT a save: write the manifest ATOMICALLY (tmp -> fsync -> rename) as the LAST step, after
 /// every shard file is durably on disk. The manifest is the single point that makes the new
 /// per-shard files the committed snapshot; a crash before this leaves the prior manifest (and
@@ -1525,6 +1558,41 @@ mod tests {
         assert_eq!(m2.version, format::MANIFEST_VERSION_DELTA);
         assert_eq!(read_manifest(&dir).expect("v2 reads back"), m2);
         assert_eq!(m2.deltas.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_delta_file_names_correctly_and_round_trips() {
+        let dir = temp_dir("write-delta");
+        let now = UnixMillis(0);
+        // A store + a tracked write -> a real delta.
+        let mut store: TestStore = ShardStore::new(1);
+        store.insert_object(0, KvObj::from_bytes(b"base", b"v", None));
+        store.enable_dirty_tracking();
+        store.insert_object(0, KvObj::from_bytes(b"new", b"fresh", None));
+        let dirty: Vec<(u32, Box<[u8]>)> = store.take_dirty_keys().unwrap().into_iter().collect();
+        let frozen = store.begin_save();
+        let dump = build_delta_from_frozen(&frozen, &dirty, 0, 5, 2, now);
+        drop(frozen);
+        store.end_save();
+
+        // Write it -> a DeltaManifestEntry, named per the convention.
+        let entry = write_delta_file(&dump, 0, 5, 2, &dir).expect("write delta file");
+        assert_eq!(entry.file, "dump-shard-0-delta-2.icsd");
+        assert_eq!(
+            (entry.shard, entry.base_epoch, entry.delta_epoch),
+            (0, 5, 2)
+        );
+        assert_eq!(entry.puts, dump.puts);
+        assert_eq!(entry.crc, dump.crc);
+
+        // The written file validates against the entry (magic/version/shard + body CRC) and folds.
+        let body = read_validated_delta_file(&dir, &entry).expect("delta file validates on read");
+        let net = delta::fold_deltas([body.as_slice()]);
+        assert!(matches!(
+            net.get(&(0, b"new".to_vec())),
+            Some(delta::DeltaEffect::Put(_))
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 

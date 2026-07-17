@@ -97,6 +97,14 @@ pub fn shard_file_name(shard: u32) -> String {
     format!("dump-shard-{shard}.icss")
 }
 
+/// The per-shard DELTA file name for `shard` at chain position `delta_epoch` (#676): distinct from a
+/// base file (`dump-shard-<n>.icss`) by the `-delta-<epoch>.icsd` suffix (and the `ICSD` magic
+/// inside). Each delta round writes one such file per shard; the manifest names them in the chain.
+#[must_use]
+pub fn delta_file_name(shard: u32, delta_epoch: u64) -> String {
+    format!("dump-shard-{shard}-delta-{delta_epoch}.icsd")
+}
+
 /// The full path to the manifest within `dir`.
 #[must_use]
 pub fn manifest_path(dir: &Path) -> PathBuf {
