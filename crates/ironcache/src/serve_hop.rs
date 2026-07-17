@@ -16,7 +16,7 @@ use crate::serve::{
 };
 use ironcache_env::{Clock, SystemEnv};
 use ironcache_server::dispatch::ServerContext;
-use ironcache_server::{ConnState, ProtoVersion, Request};
+use ironcache_server::{ConnState, ProtoVersion, Request, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -73,6 +73,52 @@ enum ShardResult {
     Gone,
 }
 
+/// Encode ONE resolved hop's reply into `out` and run its per-command hooks (commandstats, hotkeys,
+/// client-tracking, caching, slowlog) exactly as the inline path does. Shared by BOTH drain paths --
+/// the `pending.len() == 1` fast path and the coalesced multi-hop demux -- so a deferred hop is
+/// observably identical however it was routed; only the reply is assembled here, still in order.
+/// `value` is the owner's reply (`None` = owner gone/errored -> encoded as the shard-unavailable
+/// error, exactly as the un-coalesced path did).
+#[allow(clippy::too_many_arguments)]
+fn encode_and_run_hooks(
+    d: &DeferredHop,
+    value: Option<Value>,
+    out: &mut Vec<u8>,
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    env: &Rc<RefCell<SystemEnv>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+) {
+    let out_before = out.len();
+    coordinator::encode_hop_reply(value, out, d.proto);
+    let cmd_elapsed_us = u64::try_from(
+        env.borrow()
+            .now()
+            .saturating_duration_since(d.cmd_start)
+            .as_micros(),
+    )
+    .unwrap_or(u64::MAX);
+    record_command_stats(state_rc, &d.request, out_before, out, cmd_elapsed_us);
+    if ctx.hotkeys.is_active() {
+        let reply_bytes = u64::try_from(out.len().saturating_sub(out_before)).unwrap_or(u64::MAX);
+        record_hotkeys(ctx, env, &d.request, cmd_elapsed_us, reply_bytes);
+    }
+    apply_client_tracking(
+        conn,
+        push_tx,
+        shed_flag,
+        &d.request,
+        d.was_tracking,
+        d.was_bcast,
+    );
+    consume_caching_flag(conn, &d.request);
+    if d.slow_threshold >= 0 {
+        record_slow_command(ctx, env, conn, &d.request, d.cmd_start, d.slow_threshold);
+    }
+}
+
 /// Drain a run of [`DeferredHop`]s (in FIFO order) into `out`: for each, await + encode its reply,
 /// then run its per-command hooks (commandstats, hotkeys, client-tracking, caching, slowlog) exactly
 /// as the inline path does -- so a deferred remote command is observably identical to a
@@ -102,6 +148,29 @@ pub(crate) async fn drain_deferred_hops(
         pending.iter().all(|d| d.db == db),
         "a deferred cross-shard run must share one db (SELECT/RESET are barriers)"
     );
+
+    // FAST PATH (#674 follow-up): a LONE deferred hop has no sibling to coalesce with -- e.g. a
+    // shallow / pipe-1 cross-shard workload defers one hop, then immediately drains it at end-of-batch
+    // with nothing to overlap. Skip the by_shard/results HashMaps + slots Vec entirely and do the
+    // plain single dispatch + encode: alloc-identical to the pre-#674 path, so coalescing adds ZERO
+    // overhead to the low-hop case it can never help. The demux below is byte-for-byte equivalent for
+    // one hop, so this is a pure allocation shortcut, not a behavior change.
+    if pending.len() == 1 {
+        let d = pending.pop().expect("len checked == 1");
+        let value = match coordinator::dispatch_via_send_owned(
+            inbox,
+            d.target,
+            d.request.clone(),
+            db,
+        )
+        .await
+        {
+            Some(rx) => rx.await.ok().map(|r| r.value),
+            None => None,
+        };
+        encode_and_run_hooks(&d, value, out, ctx, conn, env, state_rc, push_tx, shed_flag);
+        return;
+    }
 
     // 1) GROUP each parked hop's request into its owning shard's bucket, recording per hop the
     //    `(target, index-within-that-bucket)` so the reply can be demuxed back to wire order.
@@ -157,32 +226,6 @@ pub(crate) async fn drain_deferred_hops(
             Some(ShardResult::Single(o)) => o.take().map(|r| r.value),
             Some(ShardResult::Gone) | None => None,
         };
-        let out_before = out.len();
-        coordinator::encode_hop_reply(value, out, d.proto);
-        let cmd_elapsed_us = u64::try_from(
-            env.borrow()
-                .now()
-                .saturating_duration_since(d.cmd_start)
-                .as_micros(),
-        )
-        .unwrap_or(u64::MAX);
-        record_command_stats(state_rc, &d.request, out_before, out, cmd_elapsed_us);
-        if ctx.hotkeys.is_active() {
-            let reply_bytes =
-                u64::try_from(out.len().saturating_sub(out_before)).unwrap_or(u64::MAX);
-            record_hotkeys(ctx, env, &d.request, cmd_elapsed_us, reply_bytes);
-        }
-        apply_client_tracking(
-            conn,
-            push_tx,
-            shed_flag,
-            &d.request,
-            d.was_tracking,
-            d.was_bcast,
-        );
-        consume_caching_flag(conn, &d.request);
-        if d.slow_threshold >= 0 {
-            record_slow_command(ctx, env, conn, &d.request, d.cmd_start, d.slow_threshold);
-        }
+        encode_and_run_hooks(&d, value, out, ctx, conn, env, state_rc, push_tx, shed_flag);
     }
 }
