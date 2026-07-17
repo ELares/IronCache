@@ -83,6 +83,7 @@
 // No unsafe anywhere: this crate is pure file I/O + the reused safe codec/store APIs.
 #![forbid(unsafe_code)]
 
+pub mod delta;
 pub mod format;
 
 pub use format::{
