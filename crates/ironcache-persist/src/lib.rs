@@ -87,8 +87,8 @@ pub mod delta;
 pub mod format;
 
 pub use format::{
-    Manifest, ShardManifestEntry, SnapshotLoadError, crc32, manifest_path, shard_file_name,
-    shard_path,
+    DeltaManifestEntry, MANIFEST_VERSION_BASE, MANIFEST_VERSION_DELTA, Manifest,
+    ShardManifestEntry, SnapshotLoadError, crc32, manifest_path, shard_file_name, shard_path,
 };
 
 use std::io;
@@ -357,11 +357,14 @@ pub fn write_manifest(
     entries.sort_by_key(|e| e.shard);
     #[allow(clippy::cast_possible_truncation)]
     let manifest = Manifest {
-        version: format::FORMAT_VERSION,
+        version: format::MANIFEST_VERSION_BASE,
         shards: entries.len() as u32,
         save_id,
         save_unix_secs,
         entries,
+        // Base-only save: no delta chain yet (the save-path delta build is a later slice), so the
+        // manifest encodes byte-identically to a pre-delta v1 manifest.
+        deltas: Vec::new(),
     };
     let path = format::manifest_path(dir);
     format::write_file_atomic(&path, &manifest.encode())?;
@@ -1062,10 +1065,12 @@ mod tests {
     #[test]
     fn newer_version_snapshot_fails_loud_not_silent_empty() {
         let dir = temp_dir("version-mismatch");
-        // Write a committed manifest at FORMAT_VERSION + 1, encoded exactly as a real save would (so
-        // magic + trailing CRC are VALID -- this is a well-formed dump this binary just cannot read).
+        // Write a committed manifest at a version NEWER than any this binary reads
+        // (MANIFEST_VERSION_DELTA + 1 -- v2 is now a supported delta manifest, so the "unknown" bar
+        // moved up one), encoded exactly as a real save would (magic + trailing CRC VALID -- a
+        // well-formed dump this binary just cannot read).
         let manifest = Manifest {
-            version: format::FORMAT_VERSION + 1,
+            version: format::MANIFEST_VERSION_DELTA + 1,
             shards: 1,
             save_id: 1,
             save_unix_secs: 1_700_000_000,
@@ -1075,6 +1080,7 @@ mod tests {
                 keys: 5,
                 crc: 0x1234_5678,
             }],
+            deltas: Vec::new(),
         };
         format::write_file_atomic(&format::manifest_path(&dir), &manifest.encode())
             .expect("write the newer-version manifest");
@@ -1093,8 +1099,8 @@ mod tests {
         assert_eq!(
             result,
             Err(SnapshotLoadError::UnknownVersion {
-                found: format::FORMAT_VERSION + 1,
-                supported: format::FORMAT_VERSION,
+                found: format::MANIFEST_VERSION_DELTA + 1,
+                supported: format::MANIFEST_VERSION_DELTA,
             }),
             "a newer-version dump is a classified error, not silent empty"
         );
@@ -1125,7 +1131,7 @@ mod tests {
 
         // A committed manifest at the CURRENT version -> Ok (the per-shard load handles it normally).
         let manifest = Manifest {
-            version: format::FORMAT_VERSION,
+            version: format::MANIFEST_VERSION_BASE,
             shards: 1,
             save_id: 1,
             save_unix_secs: 1,
@@ -1135,6 +1141,7 @@ mod tests {
                 keys: 1,
                 crc: 0,
             }],
+            deltas: Vec::new(),
         };
         format::write_file_atomic(&format::manifest_path(&dir), &manifest.encode())
             .expect("write a current-version manifest");
