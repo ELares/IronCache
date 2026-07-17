@@ -94,7 +94,7 @@ pub use format::{
 use std::io;
 use std::path::Path;
 
-use ironcache_storage::{AccountingHook, EvictionHook, UnixMillis};
+use ironcache_storage::{AccountingHook, EvictionHook, Store, UnixMillis};
 use ironcache_store::{Entry, FrozenSlot, ShardStore, SnapshotCursor, SnapshotEntry};
 
 /// The number of keys [`dump_shard_keyspace`] EXAMINES per
@@ -568,6 +568,57 @@ pub fn load_shard_resharded<E: EvictionHook, A: AccountingHook, R: Fn(&[u8], usi
             route(key, shard_count) == this_shard
         });
     }
+    // v2 DELTA CHAIN (#676): apply the deltas ON TOP of the base, re-sharded by the SAME route.
+    // Distinct save-time shards cover disjoint keysets, so folding all the good bodies together is
+    // safe; the load-time reshard filter then keeps only the keys THIS shard now owns. Walk the chain
+    // per save-time shard, TRUNCATING a shard to its good CONTIGUOUS PREFIX on the first bad link
+    // (never fold a suffix across a hole -- the reviewer-flagged invariant). Two hardenings so a buggy
+    // future save-path fails safe rather than silently corrupting a warm-start:
+    //   * `truncated` holds EVERY truncated shard (not just one), so an interleaved / out-of-order
+    //     manifest cannot un-truncate an earlier shard by clobbering a single slot.
+    //   * a shard's links must have STRICTLY INCREASING delta_epoch; a non-increase (a reorder or a
+    //     repeat) truncates the shard there. (Detecting a missing MIDDLE delta additionally needs the
+    //     save-path to emit dense per-shard epochs -- a producer contract; this catches reorder/dup.)
+    if !manifest.deltas.is_empty() {
+        let mut delta_bodies: Vec<Vec<u8>> = Vec::new();
+        let mut truncated: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut last_epoch: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for d in &manifest.deltas {
+            if truncated.contains(&d.shard) {
+                continue; // the rest of a shard's chain after its first bad link.
+            }
+            // base_epoch binds a delta to its base generation (== this manifest's save_id); a mismatch
+            // means the delta applies onto a DIFFERENT base.
+            if d.base_epoch != manifest.save_id {
+                truncated.insert(d.shard);
+                continue;
+            }
+            // delta_epoch must strictly increase within a shard's chain (else a reorder / a repeat).
+            if last_epoch
+                .get(&d.shard)
+                .is_some_and(|&prev| d.delta_epoch <= prev)
+            {
+                truncated.insert(d.shard);
+                continue;
+            }
+            match read_validated_delta_file(dir, d) {
+                Some(body) => {
+                    last_epoch.insert(d.shard, d.delta_epoch);
+                    delta_bodies.push(body);
+                }
+                None => {
+                    truncated.insert(d.shard);
+                }
+            }
+        }
+        if !delta_bodies.is_empty() {
+            let refs: Vec<&[u8]> = delta_bodies.iter().map(Vec::as_slice).collect();
+            let net = apply_delta_chain(store, &refs, now, |key| {
+                route(key, shard_count) == this_shard
+            });
+            total = total.saturating_add_signed(net);
+        }
+    }
     total
 }
 
@@ -629,6 +680,80 @@ fn load_records_into<E: EvictionHook, A: AccountingHook, K: Fn(&[u8]) -> bool>(
         loaded += 1;
     }
     loaded
+}
+
+/// Read + validate one delta file referenced by a v2 manifest entry (#676 loader): the delta header
+/// must match (magic / delta-version / shard) and the body CRC must match `entry.crc`, else `None`
+/// (a torn / missing / foreign delta -- the caller truncates THAT shard's chain to its good prefix).
+/// Returns the OWNED record body (the bytes after the delta header), mirroring
+/// [`read_validated_shard_file`] for base files.
+fn read_validated_delta_file(dir: &Path, entry: &format::DeltaManifestEntry) -> Option<Vec<u8>> {
+    let path = dir.join(&entry.file);
+    let bytes = format::read_file(&path)?; // a referenced-but-missing delta: apply nothing.
+    let (_base_epoch, _delta_epoch, body) = delta::split_delta_header(&bytes, entry.shard)?;
+    if format::crc32(body) != entry.crc {
+        return None; // a torn delta: never corrupt-apply.
+    }
+    Some(bytes[delta::DELTA_HEADER_LEN..].to_vec())
+}
+
+/// Apply a delta CHAIN onto an already-base-loaded store (#676 loader replay): fold the chain into
+/// the net per-`(db, key)` effect (later-wins, tombstone-removes) and apply each effect this shard
+/// OWNS -- a `Put` decodes + inserts (OVERWRITING the base value), a `Tombstone` deletes the base's
+/// key. The deltas are re-sharded by the SAME `keep` filter the base load used, so an N->M shard
+/// change routes delta keys exactly like base keys (the loader contract). An already-expired `Put` is
+/// dropped, matching the base load. Returns the NET key change (+new keys, -removed keys) for the
+/// load count.
+///
+/// `delta_bodies` are the chain's record bodies in manifest (apply) order, oldest first, ALREADY
+/// truncated by the caller to a CONTIGUOUS good PREFIX per shard (a torn / missing / base-mismatched
+/// link and everything after it in that shard's chain is dropped, so the fold never crosses a hole).
+fn apply_delta_chain<E: EvictionHook, A: AccountingHook, K: Fn(&[u8]) -> bool>(
+    store: &mut ShardStore<E, A>,
+    delta_bodies: &[&[u8]],
+    now: UnixMillis,
+    keep: K,
+) -> i64 {
+    let databases = store.databases() as u32;
+    let mut net: i64 = 0;
+    for ((db, key), effect) in delta::fold_deltas(delta_bodies.iter().copied()) {
+        if db >= databases {
+            continue; // a record for a db this store does not have (a reconfiguration): skip.
+        }
+        if !keep(&key) {
+            continue; // a key this shard does not own under the current shard count: skip (reshard).
+        }
+        match effect {
+            delta::DeltaEffect::Put(blob) => {
+                let Some(kv) = ironcache_repl::decode_kvobj(&blob) else {
+                    continue; // a malformed value (cannot happen once the CRC matched): skip.
+                };
+                if let Some(UnixMillis(deadline)) = kv.expire_at {
+                    if now.0 > deadline {
+                        // An already-expired PUT: the key is logically DEAD. Do NOT merely skip -- if
+                        // a value for this key survived in the base, skipping would RESURRECT the
+                        // stale base value. DELETE it, so the result matches a full base of the
+                        // post-delta state (which drops the expired record, leaving the key absent).
+                        if store.delete(db, &key, now) {
+                            net -= 1;
+                        }
+                        continue;
+                    }
+                }
+                let existed = store.contains_live(db, &key, now);
+                store.insert_object(db, kv);
+                if !existed {
+                    net += 1; // a brand-new key (an overwrite of a base key does not change the count).
+                }
+            }
+            delta::DeltaEffect::Tombstone => {
+                if store.delete(db, &key, now) {
+                    net -= 1; // removed a base key.
+                }
+            }
+        }
+    }
+    net
 }
 
 #[cfg(test)]
@@ -987,6 +1112,240 @@ mod tests {
         assert_eq!(net.len(), 4);
         drop(frozen);
         store.end_save();
+    }
+
+    #[test]
+    fn apply_delta_chain_overwrites_inserts_removes_and_reshards() {
+        let now = UnixMillis(0);
+        let mut store: TestStore = ShardStore::new(1);
+        // A "base": keep + del + foreign (foreign will be filtered out by the reshard `keep`).
+        store.insert_object(0, KvObj::from_bytes(b"keep", b"base", None));
+        store.insert_object(0, KvObj::from_bytes(b"del", b"base", None));
+        store.insert_object(0, KvObj::from_bytes(b"foreign", b"base", None));
+
+        // A delta body: overwrite keep, create new, tombstone del, and a PUT for foreign (which the
+        // reshard filter drops, so foreign keeps its base value).
+        let enc = |k: &[u8], v: &[u8]| ironcache_repl::encode_kvobj(&KvObj::from_bytes(k, v, None));
+        let mut body = Vec::new();
+        delta::put_put_record(&mut body, 0, b"keep", &enc(b"keep", b"updated"));
+        delta::put_put_record(&mut body, 0, b"new", &enc(b"new", b"fresh"));
+        delta::put_tombstone_record(&mut body, 0, b"del");
+        delta::put_put_record(
+            &mut body,
+            0,
+            b"foreign",
+            &enc(b"foreign", b"should-be-skipped"),
+        );
+
+        // Reshard filter: this shard owns everything EXCEPT "foreign".
+        let net = apply_delta_chain(&mut store, &[body.as_slice()], now, |k| k != b"foreign");
+        // new (+1) + del removed (-1) + keep overwrite (0) + foreign skipped (0) = 0.
+        assert_eq!(net, 0);
+        assert!(
+            store.contains_live(0, b"keep", now),
+            "overwritten, still present"
+        );
+        assert!(
+            store.contains_live(0, b"new", now),
+            "delta PUT inserted a new key"
+        );
+        assert!(
+            !store.contains_live(0, b"del", now),
+            "delta TOMBSTONE removed it"
+        );
+        assert!(
+            store.contains_live(0, b"foreign", now),
+            "the un-owned delta PUT was reshard-filtered; the base value survives"
+        );
+    }
+
+    #[test]
+    fn v2_snapshot_base_plus_delta_loads_into_a_fresh_store() {
+        // END TO END: build a base snapshot, then a delta from tracked writes, write a v2 manifest,
+        // and load it all into a FRESH store -- the final state must be base-with-the-delta-applied.
+        const SAVE_ID: u64 = 7; // the base generation; the delta's base_epoch must match it.
+        let dir = temp_dir("v2-delta-load");
+        let now = UnixMillis(0);
+
+        // BASE at t0: {keep=base, del=base}.
+        let mut src: TestStore = ShardStore::new(1);
+        src.insert_object(0, KvObj::from_bytes(b"keep", b"base", None));
+        src.insert_object(0, KvObj::from_bytes(b"del", b"base", None));
+        let base_frozen = src.begin_save();
+        let base_dump = dump_frozen_slots(&base_frozen, 0, now);
+        let base_entry = write_shard_dump(&base_dump, 0, &dir).expect("write base file");
+        drop(base_frozen);
+        src.end_save();
+
+        // WRITES at t1 (tracked): overwrite keep, create new, delete del.
+        src.enable_dirty_tracking();
+        src.insert_object(0, KvObj::from_bytes(b"keep", b"updated", None));
+        src.insert_object(0, KvObj::from_bytes(b"new", b"fresh", None));
+        assert!(src.delete(0, b"del", now));
+        let dirty: Vec<(u32, Box<[u8]>)> = src
+            .take_dirty_keys()
+            .expect("tracking on")
+            .into_iter()
+            .collect();
+
+        // DELTA at t2: build it from the frozen post-write snapshot, base_epoch == the manifest save_id.
+        let delta_frozen = src.begin_save();
+        let delta_dump = build_delta_from_frozen(&delta_frozen, &dirty, 0, SAVE_ID, 1, now);
+        drop(delta_frozen);
+        src.end_save();
+        let delta_file = "dump-shard-0-delta-1.icsd".to_string();
+        format::write_file_atomic(&dir.join(&delta_file), &delta_dump.bytes).expect("write delta");
+
+        // v2 MANIFEST tying the base + the delta chain together.
+        let manifest = format::Manifest {
+            version: format::MANIFEST_VERSION_DELTA,
+            shards: 1,
+            save_id: SAVE_ID,
+            save_unix_secs: 1,
+            entries: vec![base_entry],
+            deltas: vec![format::DeltaManifestEntry {
+                shard: 0,
+                file: delta_file,
+                puts: delta_dump.puts,
+                tombstones: delta_dump.tombstones,
+                crc: delta_dump.crc,
+                base_epoch: SAVE_ID,
+                delta_epoch: 1,
+            }],
+        };
+        format::write_file_atomic(&format::manifest_path(&dir), &manifest.encode())
+            .expect("write v2 manifest");
+
+        // LOAD into a fresh single-shard store (route always 0).
+        let mut dst: TestStore = ShardStore::new(1);
+        let loaded = load_shard_resharded(&mut dst, &dir, 0, 1, now, |_k, _n| 0);
+        assert_eq!(loaded, 2, "base 2 + delta (new +1, del -1) = 2 live keys");
+        assert!(dst.contains_live(0, b"keep", now));
+        assert!(dst.contains_live(0, b"new", now));
+        assert!(
+            !dst.contains_live(0, b"del", now),
+            "the tombstone removed del"
+        );
+
+        // VALUE check: re-dump the loaded store; keep must carry the UPDATED value, no stale base.
+        let check_frozen = dst.begin_save();
+        let bytes = dump_frozen_slots(&check_frozen, 0, now).bytes;
+        assert!(
+            bytes.windows(7).any(|w| w == b"updated"),
+            "keep was overwritten to the delta value"
+        );
+        assert!(bytes.windows(5).any(|w| w == b"fresh"), "new is present");
+        assert!(
+            !bytes.windows(4).any(|w| w == b"base"),
+            "no stale base value survived the delta"
+        );
+        drop(check_frozen);
+        dst.end_save();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_delta_chain_expired_put_deletes_the_base_key_no_resurrection() {
+        // A delta PUT that is ALREADY EXPIRED at warm-start must DELETE the (base-resident) key, not
+        // just skip -- else the stale base value would resurrect (reviewer-caught divergence from a
+        // full base of the post-delta state, which drops the expired record).
+        let now = UnixMillis(10);
+        let mut store: TestStore = ShardStore::new(1);
+        store.insert_object(0, KvObj::from_bytes(b"k", b"v1", None)); // base value, no TTL
+        assert!(store.contains_live(0, b"k", now));
+
+        let mut body = Vec::new();
+        let expired =
+            ironcache_repl::encode_kvobj(&KvObj::from_bytes(b"k", b"v2", Some(UnixMillis(5))));
+        delta::put_put_record(&mut body, 0, b"k", &expired); // PUT k=v2 with deadline 5 < now 10
+        let net = apply_delta_chain(&mut store, &[body.as_slice()], now, |_| true);
+
+        assert_eq!(net, -1, "the expired PUT removed the base key");
+        assert!(
+            !store.contains_live(0, b"k", now),
+            "no resurrection: the stale base value must not survive an expired delta PUT"
+        );
+    }
+
+    #[test]
+    fn loader_truncates_a_shard_chain_at_a_torn_delta() {
+        // A torn MIDDLE delta (a manifest CRC that does not match its file) truncates the shard's
+        // chain to the good prefix: the delta BEFORE the tear applies, the tear + everything after it
+        // is dropped (never fold across a hole).
+        const SID: u64 = 3;
+        let dir = temp_dir("delta-truncate");
+        let now = UnixMillis(0);
+        let mut src: TestStore = ShardStore::new(1);
+        src.insert_object(0, KvObj::from_bytes(b"a", b"base", None));
+        src.insert_object(0, KvObj::from_bytes(b"b", b"base", None));
+        let bf = src.begin_save();
+        let base_entry = write_shard_dump(&dump_frozen_slots(&bf, 0, now), 0, &dir).unwrap();
+        drop(bf);
+        src.end_save();
+
+        // Two delta files for shard 0: d1 (epoch 1) PUT a=d1; d2 (epoch 2) PUT b=d2. Write both files
+        // correctly, but give d2's MANIFEST entry a WRONG crc so the loader sees d2 as torn.
+        let enc = |k: &[u8], v: &[u8]| ironcache_repl::encode_kvobj(&KvObj::from_bytes(k, v, None));
+        let write_delta = |name: &str, epoch: u64, recs: &[u8]| -> u32 {
+            let mut file = Vec::new();
+            delta::put_delta_header(&mut file, 0, SID, epoch);
+            file.extend_from_slice(recs);
+            format::write_file_atomic(&dir.join(name), &file).unwrap();
+            format::crc32(recs)
+        };
+        let mut r1 = Vec::new();
+        delta::put_put_record(&mut r1, 0, b"a", &enc(b"a", b"d1"));
+        let crc1 = write_delta("d1.icsd", 1, &r1);
+        let mut r2 = Vec::new();
+        delta::put_put_record(&mut r2, 0, b"b", &enc(b"b", b"d2"));
+        write_delta("d2.icsd", 2, &r2); // file is valid, but the manifest crc below is WRONG.
+
+        let manifest = format::Manifest {
+            version: format::MANIFEST_VERSION_DELTA,
+            shards: 1,
+            save_id: SID,
+            save_unix_secs: 1,
+            entries: vec![base_entry],
+            deltas: vec![
+                format::DeltaManifestEntry {
+                    shard: 0,
+                    file: "d1.icsd".to_string(),
+                    puts: 1,
+                    tombstones: 0,
+                    crc: crc1,
+                    base_epoch: SID,
+                    delta_epoch: 1,
+                },
+                format::DeltaManifestEntry {
+                    shard: 0,
+                    file: "d2.icsd".to_string(),
+                    puts: 1,
+                    tombstones: 0,
+                    crc: 0xDEAD_BEEF, // WRONG crc -> the loader treats d2 as torn.
+                    base_epoch: SID,
+                    delta_epoch: 2,
+                },
+            ],
+        };
+        format::write_file_atomic(&format::manifest_path(&dir), &manifest.encode()).unwrap();
+
+        let mut dst: TestStore = ShardStore::new(1);
+        let loaded = load_shard_resharded(&mut dst, &dir, 0, 1, now, |_k, _n| 0);
+        assert_eq!(
+            loaded, 2,
+            "base a+b = 2; d1 overwrote a (0), d2 truncated (0)"
+        );
+        let bytes = dump_frozen_slots(&dst.begin_save(), 0, now).bytes;
+        assert!(
+            bytes.windows(2).any(|w| w == b"d1"),
+            "d1 (before the tear) applied: a=d1"
+        );
+        assert!(
+            !bytes.windows(2).any(|w| w == b"d2"),
+            "d2 (the torn link) was NOT applied: b stays base"
+        );
+        dst.end_save();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
