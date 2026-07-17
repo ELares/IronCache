@@ -632,6 +632,13 @@ pub struct Config {
     /// Meaningful only when [`Self::save_interval_secs`] is non-zero. TOML (`save_min_changes = 1`)
     /// + the `IRONCACHE_SAVE_MIN_CHANGES` env var.
     pub save_min_changes: u64,
+    /// INCREMENTAL DELTA SNAPSHOTS (#676, the during-snapshot p99.9 tail lever). When `true`, each
+    /// shard tracks the keys mutated since its last save (a per-shard dirty set) and a save writes a
+    /// small DELTA (only those keys) instead of re-reading the whole keyspace, shrinking the
+    /// persist-thread READ that sets the during-snapshot tail. `false` (the DEFAULT) leaves the
+    /// full-base save behavior byte-unchanged and adds NO per-write tracking cost. TOML
+    /// (`snapshot_deltas = true`) + the `IRONCACHE_SNAPSHOT_DELTAS` env var.
+    pub snapshot_deltas: bool,
     /// The DEDICATED PERSIST CORE knob (#589, the durable-snapshot tail residual lever). Selects which
     /// CPU core(s) the off-datapath `ic-persist-<shard>` thread (#588 per-slot Arc-COW) pins to, so its
     /// encode+fsync stops competing for a pinned datapath serving core during a save. Values (parsed
@@ -848,6 +855,9 @@ impl Default for Config {
             // when a data_dir is set). A non-zero interval + a data_dir enables the cadence.
             save_interval_secs: 0,
             save_min_changes: 0,
+            // Incremental delta snapshots (#676) are OFF by default: the full-base save is
+            // byte-unchanged and no per-write dirty tracking runs until an operator opts in.
+            snapshot_deltas: false,
             // The dedicated persist core (#589) is OFF by default: the empty value means no CPU pin,
             // so the `ic-persist` thread floats exactly as it does today (byte-unchanged, the safe
             // default per the tunability tenet). An operator opts into `auto` or an explicit core.
@@ -1715,6 +1725,9 @@ pub struct ConfigOverlay {
     /// (`save_min_changes = 1`) + the `IRONCACHE_SAVE_MIN_CHANGES` env var. `None` leaves the lower
     /// layer (default `0`).
     pub save_min_changes: Option<u64>,
+    /// Incremental delta snapshots (#676). TOML (`snapshot_deltas = true`) + the
+    /// `IRONCACHE_SNAPSHOT_DELTAS` env var. `None` leaves the lower layer (default `false`).
+    pub snapshot_deltas: Option<bool>,
     /// The dedicated persist core (#589): which CPU core(s) the `ic-persist` thread pins to. TOML
     /// (`persist_cpu = "8"`) + the `IRONCACHE_PERSIST_CPU` env var + the `--persist-cpu` CLI flag. A
     /// string (`off`/`auto`/a cpu list); `None` leaves the lower layer (default `""` = no pin).
@@ -1816,6 +1829,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "runtime",
     "save_interval_secs",
     "save_min_changes",
+    "snapshot_deltas",
     "persist_cpu",
     "notify_keyspace_events",
     "cluster_tls",
@@ -2262,6 +2276,13 @@ impl ConfigOverlay {
                     reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
                 })?);
         }
+        // INCREMENTAL DELTA SNAPSHOTS (#676) is a boolean. An unrecognized token hard-fails boot.
+        if let Ok(v) = env_var("IRONCACHE_SNAPSHOT_DELTAS") {
+            o.snapshot_deltas = Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "snapshot-deltas",
+                reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
+            })?);
+        }
         // PERSISTENCE save-policy knobs (#58, single scalars, env-encodable for per-pod injection).
         // Both are meaningful only when a data_dir is set; a malformed value hard-fails boot rather
         // than silently picking a default (mirrors the other numeric knobs above).
@@ -2465,6 +2486,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.save_min_changes {
             cfg.save_min_changes = v;
+        }
+        if let Some(v) = self.snapshot_deltas {
+            cfg.snapshot_deltas = v;
         }
         if let Some(ref v) = self.persist_cpu {
             // Raw string folds through; validity is checked in Config::validate on the resolved value.
@@ -4050,6 +4074,19 @@ mod tests {
         let empty = ConfigOverlay::from_toml_str("").unwrap();
         assert_eq!(empty.cluster_raft_joining, None);
         assert!(!Config::resolve(&[empty]).unwrap().cluster_raft_joining);
+    }
+
+    #[test]
+    fn snapshot_deltas_is_settable_from_toml_and_defaults_off() {
+        // TOML sets it; it threads through to the resolved Config (#676).
+        let overlay =
+            ConfigOverlay::from_toml_str("snapshot_deltas = true\n").expect("key is known");
+        assert_eq!(overlay.snapshot_deltas, Some(true));
+        assert!(Config::resolve(&[overlay]).unwrap().snapshot_deltas);
+        // Absent -> None -> the DEFAULT (off): the full-base save behavior is unchanged.
+        let empty = ConfigOverlay::from_toml_str("").unwrap();
+        assert_eq!(empty.snapshot_deltas, None);
+        assert!(!Config::resolve(&[empty]).unwrap().snapshot_deltas);
     }
 
     #[test]

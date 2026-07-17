@@ -1564,9 +1564,38 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
 
     // FREEZE (#576): Arc-clone every non-empty slot table (O(slots), no O(N-keys) copy) and set the
     // store's `saving` flag, so the datapath COWs a frozen slot on its first write and skips the shared
-    // freq bump for the save window. A SHORT `borrow_mut`, dropped at the end of this statement -- no
+    // freq bump for the save window. A SHORT `borrow_mut`, dropped at the end of this block -- no
     // store borrow is held across the await below.
-    let frozen: Vec<ironcache_store::FrozenSlot> = store_rc.borrow_mut().begin_save();
+    //
+    // #676 EPOCH CUT: when incremental delta snapshots are configured, take the dirty set AT the
+    // freeze instant, in the SAME borrow -- ensure per-shard dirty tracking is armed, then drain the
+    // keys mutated since the last save (they are all captured in THIS base). This slice discards the
+    // set (the base save is byte-unchanged) but logs the real-workload dirty fraction; the delta build
+    // consumes the set in the next slice. When the flag is off (the default) this is skipped entirely.
+    let (frozen, dirty_at_cut, live_keys) = {
+        let mut store = store_rc.borrow_mut();
+        let frozen: Vec<ironcache_store::FrozenSlot> = store.begin_save();
+        let dirty = if ctx.boot.snapshot_deltas {
+            store.enable_dirty_tracking();
+            store.take_dirty_keys()
+        } else {
+            None
+        };
+        // The live key count, only when metering (the fraction's denominator).
+        let live = dirty.as_ref().map(|_| store.len() as u64);
+        (frozen, dirty, live)
+    };
+    if let (Some(dirty), Some(live)) = (&dirty_at_cut, live_keys) {
+        // Real-server #676 telemetry (INFO, so an operator who opted into snapshot_deltas actually
+        // sees it): distinct keys changed since the last save (the delta's size) vs the live count --
+        // the dirty FRACTION that the go/no-go turned on. Once per save per shard, opt-in only.
+        tracing::info!(
+            shard = shard_index,
+            dirty_keys = dirty.len(),
+            live_keys = live,
+            "#676 snapshot epoch cut"
+        );
+    }
 
     // The oneshot carries the persist thread's file-write result back to this shard task via a
     // cross-thread wake (does NOT block the executor).
