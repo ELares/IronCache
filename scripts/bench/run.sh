@@ -73,6 +73,18 @@ HOST="127.0.0.1"                         # loopback, always (BENCHMARK.md isolat
 # are accepted). We default generous so the standard keyspace never evicts mid-run.
 MAXMEMORY="${MAXMEMORY:-1gb}"
 
+# Runtime backend + build features (the io_uring datapath bench support).
+# RUNTIME is passed to the server as `--runtime` (tokio | io_uring | io_uring_raw); empty
+# omits the flag, so the binary's default (tokio) is used. FEATURES is passed to
+# `cargo build` as `--features` so a ring backend is actually COMPILED into the server.
+# Two footguns this run must avoid (both cause a SILENT tokio fallback, which would
+# mislabel the numbers): a ring RUNTIME with no matching FEATURE, and TLS being on (the
+# ring datapath is plaintext-only). We warn on the first and rely on the boot-banner
+# confirmation printed to server.log for both. Example turnkey ring run:
+#   RUNTIME=io_uring_raw FEATURES=io_uring_raw PIPELINE=32 READ_RATIO=0.0 scripts/bench/run.sh
+RUNTIME="${RUNTIME:-}"
+FEATURES="${FEATURES:-}"
+
 # ---------------------------------------------------------------------------
 # Flag parsing: --out-dir DIR, --smoke. Anything else is an error.
 # ---------------------------------------------------------------------------
@@ -119,12 +131,28 @@ fi
 # ---------------------------------------------------------------------------
 # Build the release binaries (ironcache, memmodel, loadgen). The first build is slow.
 # ---------------------------------------------------------------------------
-echo "[bench] building release binaries (cargo build --release -p ironcache -p ironcache-bench)..."
-cargo build --release -p ironcache -p ironcache-bench
+# A ring RUNTIME needs its feature compiled in, else the server silently boots tokio.
+if [[ "${RUNTIME}" == io_uring* && "${FEATURES}" != *io_uring* ]]; then
+  echo "[bench] WARNING: RUNTIME=${RUNTIME} but FEATURES='${FEATURES}' has no io_uring feature." >&2
+  echo "[bench]          the server will SILENTLY fall back to tokio. Set FEATURES=${RUNTIME} and" >&2
+  echo "[bench]          confirm the boot banner in server.log ('runtime = \"${RUNTIME}\"')." >&2
+fi
+# loadgen is feature-independent; the server takes the optional --features so a ring
+# backend is compiled in. Split into two builds so a single `-p ironcache --features X`
+# is unambiguous (a workspace multi-package --features can reject a package-specific flag).
+FEATURE_ARGS=()
+[[ -n "${FEATURES}" ]] && FEATURE_ARGS=(--features "${FEATURES}")
+echo "[bench] building release binaries (server${FEATURES:+ --features ${FEATURES}} + loadgen)..."
+cargo build --release -p ironcache-bench
+cargo build --release -p ironcache ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
-IRONCACHE_BIN="${REPO_ROOT}/target/release/ironcache"
-MEMMODEL_BIN="${REPO_ROOT}/target/release/memmodel"
-LOADGEN_BIN="${REPO_ROOT}/target/release/loadgen"
+# Honor CARGO_TARGET_DIR (the containerized dev-loop and some CI/operator setups redirect
+# the build output there); fall back to the in-tree target dir. Cargo wrote the binaries to
+# whichever this is, so the existence check below must look in the same place.
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+IRONCACHE_BIN="${TARGET_DIR}/release/ironcache"
+MEMMODEL_BIN="${TARGET_DIR}/release/memmodel"
+LOADGEN_BIN="${TARGET_DIR}/release/loadgen"
 for b in "${IRONCACHE_BIN}" "${MEMMODEL_BIN}" "${LOADGEN_BIN}"; do
   [[ -x "${b}" ]] || { echo "error: expected binary missing after build: ${b}" >&2; exit 1; }
 done
@@ -271,9 +299,13 @@ echo "[bench] starting server on ${HOST}:${PORT} (shards=${SHARDS}, maxmemory=${
 # (unpinned) and to its elements otherwise. This is the portable way to expand a
 # possibly-empty array under `set -u` (Apple's stock bash 3.2 errors on a bare
 # `"${arr[@]}"` when the array is empty).
+# `--runtime` is a global flag (consumed before the `server` subcommand, like --port).
+# Empty RUNTIME expands to nothing (default tokio). Array form is set -u + bash 3.2 safe.
+RUNTIME_ARGS=()
+[[ -n "${RUNTIME}" ]] && RUNTIME_ARGS=(--runtime "${RUNTIME}")
 IRONCACHE_MAXMEMORY="${MAXMEMORY}" \
   ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${IRONCACHE_BIN}" \
-  --port "${PORT}" --shards "${SHARDS}" server \
+  --port "${PORT}" --shards "${SHARDS}" ${RUNTIME_ARGS[@]+"${RUNTIME_ARGS[@]}"} server \
   >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
@@ -396,7 +428,9 @@ cat >"${MANIFEST}" <<EOF
   "server": {
     "port": ${PORT},
     "shards": ${SHARDS},
-    "maxmemory": "${MAXMEMORY}"
+    "maxmemory": "${MAXMEMORY}",
+    "runtime": "${RUNTIME:-tokio}",
+    "features": "${FEATURES}"
   },
   "knobs": {
     "seed": ${SEED},
