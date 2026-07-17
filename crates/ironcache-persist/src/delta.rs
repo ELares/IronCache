@@ -257,6 +257,15 @@ impl DeltaBuilder {
     pub fn push_put(&mut self, db: u32, entry: &Entry) {
         self.scratch.clear();
         ironcache_repl::encode_entry_into(&mut self.scratch, entry);
+        // Producer invariant (the loader contract, invariant #1 above): the EXPLICIT record key MUST
+        // equal the key embedded in the encoded blob -- both are `entry.key()` here, so this holds by
+        // construction, but a fail-loud debug check guards against a future encoder change that
+        // desynced them, since the loader re-shards by the explicit key WITHOUT decoding the blob.
+        debug_assert_eq!(
+            ironcache_repl::decode_kvobj(&self.scratch).map(|kv| kv.key.to_vec()),
+            Some(entry.key().to_vec()),
+            "delta PUT explicit key must equal the encoded blob's key"
+        );
         put_put_record(&mut self.body, db, entry.key(), &self.scratch);
         self.puts += 1;
     }
