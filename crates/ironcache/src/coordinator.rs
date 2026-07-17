@@ -1675,7 +1675,7 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     // cancelled task never reaches here -- the flag then safely stays set on an exiting process).
     store_rc.borrow_mut().end_save();
     match result {
-        Ok(Ok(entry)) => crate::persist::encode_save_reply(&entry),
+        Ok(Ok(entry)) => crate::persist::encode_save_reply(&crate::persist::SaveReply::Base(entry)),
         Ok(Err(e)) => Value::error(ironcache_protocol::ErrorReply::err(format!(
             "save failed: {e}"
         ))),

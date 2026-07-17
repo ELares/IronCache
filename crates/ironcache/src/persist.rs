@@ -338,46 +338,91 @@ impl Drop for SaveGuard {
     }
 }
 
-/// Encode one shard's [`ironcache_persist::ShardManifestEntry`] into the `__ICSAVE` reply Value:
-/// `*3 [:shard :keys :crc]`, so the home core can reconstruct the manifest entry from each shard's
-/// reply (the `crc` is a u32 widened to an i64 RESP integer, lossless). A shard that FAILED to
-/// write its file replies an `Error`, which the home core surfaces as a failed SAVE.
-#[must_use]
-pub fn encode_save_reply(entry: &ironcache_persist::ShardManifestEntry) -> Value {
-    Value::Array(Some(vec![
-        Value::Integer(i64::from(entry.shard)),
-        #[allow(clippy::cast_possible_wrap)]
-        Value::Integer(entry.keys as i64),
-        Value::Integer(i64::from(entry.crc)),
-    ]))
+/// One shard's `__ICSAVE` reply, decoded (#676): either a BASE file (a full dump this shard wrote) or
+/// a DELTA file (only the keys mutated since the base). The home core collects these into the
+/// committed manifest -- base entries into `entries`, delta entries into the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveReply {
+    /// A base file: `dump-shard-<shard>.icss`.
+    Base(ironcache_persist::ShardManifestEntry),
+    /// A delta file appended to the shard's chain: `dump-shard-<shard>-delta-<delta_epoch>.icsd`.
+    Delta(ironcache_persist::DeltaManifestEntry),
 }
 
-/// Decode one shard's `__ICSAVE` reply Value back into a [`ironcache_persist::ShardManifestEntry`]
-/// (the inverse of [`encode_save_reply`]), or `None` if the reply is not the `*3 [:shard :keys
-/// :crc]` shape (a shard error / a shard-unavailable reply / a malformed reply). The `file` name is
-/// recomputed from the shard index (the shard wrote `dump-shard-<shard>.icss`).
+/// Encode one shard's save result into the `__ICSAVE` reply Value, TAGGED so the home core knows
+/// whether the shard wrote a base or a delta (#676). Base: `*4 [:0 :shard :keys :crc]`. Delta: `*7
+/// [:1 :shard :puts :tombstones :crc :base_epoch :delta_epoch]`. Every field is a u32/u64 widened to
+/// an i64 RESP integer (lossless for realistic key counts / epochs). A shard that FAILED to write its
+/// file replies an `Error` instead, which the home core surfaces as a failed SAVE.
 #[must_use]
-pub fn decode_save_reply(value: &Value) -> Option<ironcache_persist::ShardManifestEntry> {
+#[allow(clippy::cast_possible_wrap)]
+pub fn encode_save_reply(reply: &SaveReply) -> Value {
+    match reply {
+        SaveReply::Base(e) => Value::Array(Some(vec![
+            Value::Integer(0), // tag: base
+            Value::Integer(i64::from(e.shard)),
+            Value::Integer(e.keys as i64),
+            Value::Integer(i64::from(e.crc)),
+        ])),
+        SaveReply::Delta(d) => Value::Array(Some(vec![
+            Value::Integer(1), // tag: delta
+            Value::Integer(i64::from(d.shard)),
+            Value::Integer(d.puts as i64),
+            Value::Integer(d.tombstones as i64),
+            Value::Integer(i64::from(d.crc)),
+            Value::Integer(d.base_epoch as i64),
+            Value::Integer(d.delta_epoch as i64),
+        ])),
+    }
+}
+
+/// Decode one shard's `__ICSAVE` reply Value back into a [`SaveReply`] (the inverse of
+/// [`encode_save_reply`]), or `None` if the reply is not a recognized tagged shape (a shard error /
+/// shard-unavailable / malformed reply). The `file` name is recomputed from the shard index (+
+/// `delta_epoch` for a delta), matching what the shard wrote.
+#[must_use]
+pub fn decode_save_reply(value: &Value) -> Option<SaveReply> {
     let Value::Array(Some(items)) = value else {
         return None;
     };
-    let [
-        Value::Integer(shard),
-        Value::Integer(keys),
-        Value::Integer(crc),
-    ] = items.as_slice()
-    else {
-        return None;
-    };
-    let shard = u32::try_from(*shard).ok()?;
-    let keys = u64::try_from(*keys).ok()?;
-    let crc = u32::try_from(*crc).ok()?;
-    Some(ironcache_persist::ShardManifestEntry {
-        shard,
-        file: ironcache_persist::shard_file_name(shard),
-        keys,
-        crc,
-    })
+    match items.as_slice() {
+        [
+            Value::Integer(0),
+            Value::Integer(shard),
+            Value::Integer(keys),
+            Value::Integer(crc),
+        ] => {
+            let shard = u32::try_from(*shard).ok()?;
+            Some(SaveReply::Base(ironcache_persist::ShardManifestEntry {
+                shard,
+                file: ironcache_persist::shard_file_name(shard),
+                keys: u64::try_from(*keys).ok()?,
+                crc: u32::try_from(*crc).ok()?,
+            }))
+        }
+        [
+            Value::Integer(1),
+            Value::Integer(shard),
+            Value::Integer(puts),
+            Value::Integer(tombstones),
+            Value::Integer(crc),
+            Value::Integer(base_epoch),
+            Value::Integer(delta_epoch),
+        ] => {
+            let shard = u32::try_from(*shard).ok()?;
+            let delta_epoch = u64::try_from(*delta_epoch).ok()?;
+            Some(SaveReply::Delta(ironcache_persist::DeltaManifestEntry {
+                shard,
+                file: ironcache_persist::delta_file_name(shard, delta_epoch),
+                puts: u64::try_from(*puts).ok()?,
+                tombstones: u64::try_from(*tombstones).ok()?,
+                crc: u32::try_from(*crc).ok()?,
+                base_epoch: u64::try_from(*base_epoch).ok()?,
+                delta_epoch,
+            }))
+        }
+        _ => None,
+    }
 }
 
 /// Build the `__ICSAVE <save_unix_secs> <shard_index> <dir>` request for one shard.
@@ -488,21 +533,33 @@ async fn save_all_to_dir(
     // Collect the per-shard manifest entries; surface the FIRST shard error as a failed save (a
     // partial set of files without a committed manifest is harmless -- the prior manifest stays
     // committed, and load ignores files the manifest does not vouch for).
-    let mut entries = Vec::with_capacity(replies.len());
+    let mut base_entries = Vec::with_capacity(replies.len());
+    let mut delta_entries: Vec<ironcache_persist::DeltaManifestEntry> = Vec::new();
     for (shard, reply) in replies {
-        let Some(entry) = decode_save_reply(&reply.value) else {
-            let detail = match &reply.value {
-                Value::Error(e) => e.message().to_owned(),
-                _ => "unexpected reply".to_owned(),
-            };
-            return Err(format!("shard {shard} save failed: {detail}"));
-        };
-        entries.push(entry);
+        match decode_save_reply(&reply.value) {
+            Some(SaveReply::Base(e)) => base_entries.push(e),
+            Some(SaveReply::Delta(d)) => delta_entries.push(d),
+            None => {
+                let detail = match &reply.value {
+                    Value::Error(e) => e.message().to_owned(),
+                    _ => "unexpected reply".to_owned(),
+                };
+                return Err(format!("shard {shard} save failed: {detail}"));
+            }
+        }
     }
 
-    // COMMIT: write the manifest LAST (the atomic commit point).
+    // COMMIT: write the manifest LAST (the atomic commit point). Deltas are empty until the
+    // orchestration decides + threads a delta save (a later slice), so this is a base-only v1
+    // manifest today (write_manifest_v2 with no deltas is byte-identical to write_manifest).
     let save_id = persist.next_save_id();
-    match ironcache_persist::write_manifest(dir, save_id, save_unix_secs, entries) {
+    match ironcache_persist::write_manifest_v2(
+        dir,
+        save_id,
+        save_unix_secs,
+        base_entries,
+        delta_entries,
+    ) {
         Ok(_) => {
             if durable {
                 persist.record_committed(save_unix_secs);
@@ -728,6 +785,40 @@ mod tests {
     use super::*;
     use std::rc::Rc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn save_reply_base_and_delta_round_trip() {
+        // A base reply encodes + decodes back to the same ShardManifestEntry (file recomputed).
+        let base = SaveReply::Base(ironcache_persist::ShardManifestEntry {
+            shard: 2,
+            file: ironcache_persist::shard_file_name(2),
+            keys: 100,
+            crc: 0xDEAD,
+        });
+        assert_eq!(decode_save_reply(&encode_save_reply(&base)), Some(base));
+        // A delta reply encodes + decodes back to the same DeltaManifestEntry (file recomputed from
+        // shard + delta_epoch).
+        let delta = SaveReply::Delta(ironcache_persist::DeltaManifestEntry {
+            shard: 2,
+            file: ironcache_persist::delta_file_name(2, 3),
+            puts: 5,
+            tombstones: 2,
+            crc: 0xBEEF,
+            base_epoch: 9,
+            delta_epoch: 3,
+        });
+        assert_eq!(decode_save_reply(&encode_save_reply(&delta)), Some(delta));
+        // A shard error / an untagged / a wrong-arity reply -> None (a failed save).
+        assert!(decode_save_reply(&Value::Integer(1)).is_none());
+        assert!(
+            decode_save_reply(&Value::Array(Some(vec![
+                Value::Integer(9),
+                Value::Integer(0)
+            ])))
+            .is_none(),
+            "an unknown tag decodes to None"
+        );
+    }
 
     /// A bare `PersistState` for latch tests (no real data dir / save fan-out needed).
     fn latch_state() -> Arc<PersistState> {
