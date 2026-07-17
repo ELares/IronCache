@@ -235,6 +235,7 @@ pub(crate) fn spawn_on_shard(
     bind: std::net::IpAddr,
     client_port: u16,
     shard_index: usize,
+    persist: Option<std::sync::Arc<crate::persist::PersistState>>,
 ) {
     if PRIMARY_STARTED.with(std::cell::Cell::get) {
         return; // already wired on this shard (idempotent).
@@ -370,6 +371,9 @@ pub(crate) fn spawn_on_shard(
     let replica_store = Rc::clone(&store_rc);
     let replica_status = std::sync::Arc::clone(&status);
     let replica_security = security.clone();
+    // #676: the node-level persistence state, so a FULL-SYNC store swap (which replaces the live
+    // keyspace outside the tracked write funnel) can force the next durable save to re-base.
+    let replica_persist = persist;
     rt.spawn_on_shard(async move {
         run_replica_control(
             TokioRuntime::new(),
@@ -383,6 +387,7 @@ pub(crate) fn spawn_on_shard(
             self_node_id,
             failover,
             replica_security,
+            replica_persist,
         )
         .await;
     });
@@ -951,6 +956,7 @@ async fn run_replica_control(
     self_node_id: String,
     failover: FailoverParams,
     replica_security: Option<ClusterSecurity>,
+    persist: Option<std::sync::Arc<crate::persist::PersistState>>,
 ) {
     // HA-8: how long the master link has been CONTINUOUSLY down (None == the link is up / never
     // attached). Reset to the current env time on the FIRST down observation after a healthy
@@ -1034,6 +1040,7 @@ async fn run_replica_control(
                         replica_security.as_ref(),
                         &self_node_id,
                         resume,
+                        persist.as_ref(),
                     )
                     .await;
                     // The attach returned: the link is down (drop / gap / dial fail). BEFORE we
@@ -1283,6 +1290,7 @@ async fn attach_once(
     security: Option<&ClusterSecurity>,
     self_announce_id: &str,
     resume: ResumeState,
+    persist: Option<&std::sync::Arc<crate::persist::PersistState>>,
 ) -> ResumeState {
     let resume_from = resume.offset;
     // Dial the owner's repl endpoint. A failed dial returns the unchanged resume state; the caller
@@ -1367,6 +1375,14 @@ async fn attach_once(
         // in ONE statement; reads immediately hit the synced data, the OLD store drops. This is the
         // only place the live store is replaced, ONLY after a COMPLETE sync.
         *store_rc.borrow_mut() = loaded.store; // <-- the atomic store swap.
+        // #676: the swap REPLACED the whole live keyspace with a fresh store (dirty tracking OFF)
+        // OUTSIDE the tracked write funnel, so the per-shard dirty set no longer relates to the
+        // durable base. Force the next durable save to re-BASE, else a delta would encode an empty
+        // set against a stale base and a warm-start would resurrect the pre-sync keyspace. Harmless
+        // when persistence / deltas are off (`needs_base` is only read when `snapshot_deltas` is on).
+        if let Some(persist) = persist {
+            persist.force_needs_base();
+        }
         // CARRY-FORWARD 2: the replica store is now passive (the reaper-stop flag + the store-level
         // lazy-expiry-passive flag), so a READONLY read never self-removes a key the primary holds.
         store_rc.borrow_mut().set_passive(true);

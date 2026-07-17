@@ -296,6 +296,67 @@ pub fn run_persist_server_for_test(
     run_server(&config).expect("test persist server failed to bind")
 }
 
+/// Boot a real persistence-enabled server (#58) with INCREMENTAL DELTA SNAPSHOTS turned on (#676):
+/// `snapshot_deltas = true`, so after the first (base) save, subsequent `SAVE`/`BGSAVE`s write a
+/// delta of only the keys mutated since the last save (up to the compaction cap, then a fresh base).
+/// The periodic save policy is OFF (only explicit saves persist), so a test drives the base/delta
+/// cadence itself.
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_persist_server_with_deltas_for_test(
+    port: u16,
+    shards: usize,
+    data_dir: PathBuf,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        data_dir: Some(data_dir),
+        snapshot_deltas: true,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test persist+deltas config must validate");
+    run_server(&config).expect("test persist+deltas server failed to bind")
+}
+
+/// Boot a real persistence-enabled server with BOTH incremental delta snapshots (#676) AND an
+/// upgrade-handoff tmpfs base (#390), so a test can prove that an ephemeral `SAVE HANDOFF` (which
+/// drains the per-shard dirty set without advancing the durable base) forces the next durable save to
+/// RE-BASE -- otherwise a delta would skip the drained writes and a warm-start would lose them.
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_persist_server_with_deltas_and_handoff_for_test(
+    port: u16,
+    shards: usize,
+    data_dir: PathBuf,
+    upgrade_handoff_dir: Option<PathBuf>,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        data_dir: Some(data_dir),
+        upgrade_handoff_dir,
+        snapshot_deltas: true,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test persist+deltas+handoff config must validate");
+    run_server(&config).expect("test persist+deltas+handoff server failed to bind")
+}
+
 /// Boot a real persistence-enabled server (#58) with an explicit upgrade-handoff tmpfs base (#390),
 /// so a test can drive `SAVE HANDOFF` and assert the handoff is staged on tmpfs (or falls back to
 /// `data_dir`) and reloaded on the next boot. `upgrade_handoff_dir` is the base staged under

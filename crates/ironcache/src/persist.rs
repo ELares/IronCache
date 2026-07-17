@@ -155,6 +155,14 @@ pub struct PersistState {
     /// success; SAVE waits via the coordinator anyway, but the latch keeps the manifest write
     /// single-writer). Relaxed CAS; node-level cold state.
     pub saving: std::sync::atomic::AtomicBool,
+    /// Force the NEXT durable save to be a BASE, not a delta (#676). Set TRUE at boot -- per-shard
+    /// dirty tracking is not armed until the FIRST save's epoch cut, so writes between boot/load and
+    /// that first save are UNTRACKED and MUST be captured by a full base -- and set TRUE again after
+    /// any EPHEMERAL handoff save (which drains the per-shard dirty set without advancing the durable
+    /// base, so a subsequent delta's "since" point would otherwise skip the drained writes). Cleared
+    /// once a durable BASE save re-establishes the base as the dirty "since" point. Irrelevant (never
+    /// read) when `snapshot_deltas` is off. Relaxed; node-level cold state.
+    pub needs_base: std::sync::atomic::AtomicBool,
 }
 
 impl PersistState {
@@ -179,6 +187,9 @@ impl PersistState {
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: std::sync::atomic::AtomicBool::new(false),
+            // A base is OWED at boot: dirty tracking arms only at the first save's epoch cut, so the
+            // first durable save must be a full base to capture the pre-tracking writes (#676).
+            needs_base: std::sync::atomic::AtomicBool::new(true),
         }))
     }
 
@@ -265,6 +276,37 @@ impl PersistState {
         self.save_id.fetch_add(1, Ordering::Relaxed);
         self.stats.reset_dirty();
         self.stats.set_last_bgsave_ok(true);
+    }
+
+    /// Record a COMMITTED durable DELTA save (#676): stamp the last-save time, reset the dirty
+    /// counter, and mark the outcome OK -- but do NOT bump `save_id`, because a delta STAYS on its
+    /// base generation (the invariant a delta's `base_epoch` equals the manifest `save_id`, which the
+    /// loader checks). `save_id` advances only when a fresh BASE is written ([`Self::record_committed`]
+    /// / compaction). Like a base save, a committed delta IS a save for `LASTSAVE` + resets the
+    /// changes-since-last-save counter (the delta persisted those changes).
+    pub fn record_committed_delta(&self, save_unix_secs: u64) {
+        self.stats.set_last_save_unix_secs(save_unix_secs);
+        self.stats.reset_dirty();
+        self.stats.set_last_bgsave_ok(true);
+    }
+
+    /// Whether the next durable save must be a full BASE (see [`Self::needs_base`]). Relaxed read.
+    #[must_use]
+    pub fn needs_base(&self) -> bool {
+        self.needs_base.load(Ordering::Relaxed)
+    }
+
+    /// Clear the base-owed flag: a durable BASE save committed, so it is now the dirty "since" point
+    /// and subsequent durable saves MAY be deltas (#676). Relaxed.
+    pub fn clear_needs_base(&self) {
+        self.needs_base.store(false, Ordering::Relaxed);
+    }
+
+    /// Force the next durable save to be a full BASE (#676): called after an ephemeral handoff save
+    /// that drained the per-shard dirty set without advancing the durable base, so no write is
+    /// skipped by a delta whose "since" point moved past it. Relaxed.
+    pub fn force_needs_base(&self) {
+        self.needs_base.store(true, Ordering::Relaxed);
     }
 
     /// Record a FAILED save (#549): mark the last-save outcome as `err` so INFO
@@ -425,16 +467,31 @@ pub fn decode_save_reply(value: &Value) -> Option<SaveReply> {
     }
 }
 
-/// Build the `__ICSAVE <save_unix_secs> <shard_index> <dir>` request for one shard.
-fn icsave_request(save_unix_secs: u64, shard: usize, dir: &std::path::Path) -> Request {
-    Request {
-        args: vec![
-            bytes::Bytes::from_static(ICSAVE),
-            bytes::Bytes::from(save_unix_secs.to_string()),
-            bytes::Bytes::from(shard.to_string()),
-            bytes::Bytes::copy_from_slice(dir.to_string_lossy().as_bytes()),
-        ],
+/// Build the `__ICSAVE <save_unix_secs> <shard_index> <dir> [base_epoch delta_epoch]` request for
+/// one shard (#676). A BASE save emits the 4-arg form (byte-identical to the pre-delta request, so
+/// the default path is unchanged); a DELTA save APPENDS `base_epoch` + `delta_epoch` (arg[4]/arg[5]),
+/// whose PRESENCE is how [`crate::coordinator::save_shard_local`] recognizes a delta save.
+fn icsave_request(
+    save_unix_secs: u64,
+    shard: usize,
+    dir: &std::path::Path,
+    mode: ironcache_persist::SaveMode,
+) -> Request {
+    let mut args = vec![
+        bytes::Bytes::from_static(ICSAVE),
+        bytes::Bytes::from(save_unix_secs.to_string()),
+        bytes::Bytes::from(shard.to_string()),
+        bytes::Bytes::copy_from_slice(dir.to_string_lossy().as_bytes()),
+    ];
+    if let ironcache_persist::SaveMode::Delta {
+        base_epoch,
+        delta_epoch,
+    } = mode
+    {
+        args.push(bytes::Bytes::from(base_epoch.to_string()));
+        args.push(bytes::Bytes::from(delta_epoch.to_string()));
     }
+    Request { args }
 }
 
 /// PERFORM a full cross-shard SAVE (#58): fan an `__ICSAVE` out to EVERY shard (each dumps its OWN
@@ -504,6 +561,66 @@ async fn save_all_attempt(
 /// stamps `LASTSAVE` for the upgrade confirmation but leaves the durable dirty/health accounting
 /// untouched, since the tmpfs write is not durable).
 ///
+/// Assemble the committed manifest contents for the decided [`ironcache_persist::SaveMode`] (#676):
+/// the base-generation `save_id`, the final base entries, and the final delta chain. PURE (no I/O),
+/// so the base/delta bookkeeping + the fail-loud chain-integrity guard are unit-testable.
+///
+/// - BASE: `save_id` is a FRESH generation (`next_save_id`); the manifest is the shards' base entries
+///   with an empty chain. A stray delta reply under a base mode is a bug (`Err`).
+/// - DELTA: `save_id` STAYS the base generation (`base_epoch`); CARRY FORWARD the prior base entries
+///   (their files are untouched on disk) + the prior delta chain, then append THIS round's deltas. A
+///   stray base reply, a missing prior manifest, or ANY delta whose `base_epoch` != the base
+///   generation is a fail-loud `Err` -- the last would make the loader's `base_epoch == save_id`
+///   check silently DROP the whole chain (data loss), so we refuse to commit it and leave the prior
+///   snapshot current.
+fn assemble_commit(
+    mode: ironcache_persist::SaveMode,
+    next_save_id: u64,
+    prior: Option<&ironcache_persist::Manifest>,
+    base_entries: Vec<ironcache_persist::ShardManifestEntry>,
+    delta_entries: Vec<ironcache_persist::DeltaManifestEntry>,
+) -> Result<
+    (
+        u64,
+        Vec<ironcache_persist::ShardManifestEntry>,
+        Vec<ironcache_persist::DeltaManifestEntry>,
+    ),
+    String,
+> {
+    match mode {
+        ironcache_persist::SaveMode::Base => {
+            if !delta_entries.is_empty() {
+                return Err(format!(
+                    "base save received {} unexpected delta replies",
+                    delta_entries.len()
+                ));
+            }
+            Ok((next_save_id, base_entries, Vec::new()))
+        }
+        ironcache_persist::SaveMode::Delta { base_epoch, .. } => {
+            if !base_entries.is_empty() {
+                return Err(format!(
+                    "delta save received {} unexpected base replies",
+                    base_entries.len()
+                ));
+            }
+            let Some(prior) = prior else {
+                return Err("delta save decided with no prior manifest".to_owned());
+            };
+            let mut all_deltas = prior.deltas.clone();
+            all_deltas.extend(delta_entries);
+            if let Some(bad) = all_deltas.iter().find(|d| d.base_epoch != base_epoch) {
+                return Err(format!(
+                    "delta base_epoch {} != base generation {base_epoch}; refusing a manifest that \
+                     would silently truncate the delta chain on load",
+                    bad.base_epoch
+                ));
+            }
+            Ok((base_epoch, prior.entries.clone(), all_deltas))
+        }
+    }
+}
+
 /// SERIALIZED: the caller must hold the save latch. No `RefCell` borrow is held across any await.
 #[allow(clippy::too_many_arguments)]
 async fn save_all_to_dir(
@@ -521,18 +638,49 @@ async fn save_all_to_dir(
     if let Err(e) = std::fs::create_dir_all(dir) {
         return Err(format!("cannot create snapshot dir {}: {e}", dir.display()));
     }
-    // One `__ICSAVE` sub-request per shard, each carrying its own shard index for its file name.
+    // #676: decide whether THIS whole-snapshot save is a BASE or a DELTA, purely from the PRIOR
+    // committed manifest. Deltas apply ONLY to DURABLE saves (an ephemeral handoff is always a
+    // self-contained base -- simpler + faster for the receiver to reload), ONLY when `snapshot_deltas`
+    // is configured, and NEVER when a base is owed (`needs_base`: post-boot/handoff, before dirty
+    // tracking is re-armed with the base as the "since" point). `decide_snapshot_mode` additionally
+    // forces a base on the first save (no prior) and on compaction (the chain reached the cap).
+    let prior = if durable {
+        ironcache_persist::read_manifest(dir)
+    } else {
+        None
+    };
+    let deltas_enabled = durable && ctx.boot.snapshot_deltas && !persist.needs_base();
+    let mode = ironcache_persist::decide_snapshot_mode(
+        prior.as_ref(),
+        deltas_enabled,
+        ironcache_persist::MAX_DELTAS_PER_BASE,
+    );
+
+    // One `__ICSAVE` sub-request per shard, each carrying its own shard index + the whole-save mode
+    // (a delta appends base_epoch/delta_epoch so every shard appends the SAME chain position).
     let subreqs: Vec<(usize, Request)> = (0..n_shards)
-        .map(|shard| (shard, icsave_request(save_unix_secs, shard, dir)))
+        .map(|shard| (shard, icsave_request(save_unix_secs, shard, dir, mode)))
         .collect();
     // Fan out via the SAVE-specific fan-out (#571): the home shard's own dump runs INLINE on the
     // YIELDING `run_local_save` (awaits between snapshot chunks), which a synchronous `fan_out_split`
     // local closure cannot express; every other shard dumps off its drain loop (also yielding).
     let replies = coordinator::fan_out_save(ctx, inbox, home, db, subreqs).await;
 
-    // Collect the per-shard manifest entries; surface the FIRST shard error as a failed save (a
-    // partial set of files without a committed manifest is harmless -- the prior manifest stays
-    // committed, and load ignores files the manifest does not vouch for).
+    // The epoch cut in EVERY shard's `__ICSAVE` DRAINED its per-shard dirty set (unconditionally when
+    // `snapshot_deltas` is on), advancing the delta "since" point PAST the drained writes. A base is
+    // now OWED until THIS save DURABLY commits: if it fails, tears mid-fan-out, or is only an ephemeral
+    // handoff, the drained writes live in NO durable snapshot, so the next durable save MUST re-base to
+    // recapture them (else a later delta silently drops them and a warm-start resurrects stale state).
+    // Set the flag FAIL-SAFE here (the drain already happened); ONLY a committed durable save clears it
+    // (below). This covers every error return, a failed/aborted handoff, and a partial fan-out failure.
+    if ctx.boot.snapshot_deltas {
+        persist.force_needs_base();
+    }
+
+    // Collect the per-shard replies; surface the FIRST shard error as a failed save (a partial set of
+    // files without a committed manifest is harmless -- the prior manifest stays committed, and load
+    // ignores files the manifest does not vouch for). Under a BASE mode every shard replies Base;
+    // under a DELTA mode every shard replies Delta.
     let mut base_entries = Vec::with_capacity(replies.len());
     let mut delta_entries: Vec<ironcache_persist::DeltaManifestEntry> = Vec::new();
     for (shard, reply) in replies {
@@ -549,21 +697,40 @@ async fn save_all_to_dir(
         }
     }
 
-    // COMMIT: write the manifest LAST (the atomic commit point). Deltas are empty until the
-    // orchestration decides + threads a delta save (a later slice), so this is a base-only v1
-    // manifest today (write_manifest_v2 with no deltas is byte-identical to write_manifest).
-    let save_id = persist.next_save_id();
+    // Assemble the committed manifest contents (base-generation id + final base entries + final delta
+    // chain) for the decided mode, with the fail-loud chain-integrity guard (pure; see below).
+    let (save_id, base_final, delta_final) = assemble_commit(
+        mode,
+        persist.next_save_id(),
+        prior.as_ref(),
+        base_entries,
+        delta_entries,
+    )?;
+
+    // COMMIT: write the manifest LAST (the atomic commit point).
     match ironcache_persist::write_manifest_v2(
         dir,
         save_id,
         save_unix_secs,
-        base_entries,
-        delta_entries,
+        base_final,
+        delta_final,
     ) {
         Ok(_) => {
             if durable {
-                persist.record_committed(save_unix_secs);
+                match mode {
+                    // A durable base bumps the base generation; a durable delta stays on its base
+                    // generation (no save_id bump).
+                    ironcache_persist::SaveMode::Base => persist.record_committed(save_unix_secs),
+                    ironcache_persist::SaveMode::Delta { .. } => {
+                        persist.record_committed_delta(save_unix_secs);
+                    }
+                }
+                // A committed DURABLE save (base OR delta) durably persists everything up to the drain,
+                // so it becomes the valid "since" point -> clear the base-owed flag (deltas may resume).
+                persist.clear_needs_base();
             } else {
+                // A handoff commits only to tmpfs (the durable base is NOT advanced), so `needs_base`
+                // stays forced (set after the fan-out): the next durable save re-bases.
                 persist.record_handoff_committed(save_unix_secs);
             }
             Ok(())
@@ -820,6 +987,143 @@ mod tests {
         );
     }
 
+    fn base_entry(shard: u32) -> ironcache_persist::ShardManifestEntry {
+        ironcache_persist::ShardManifestEntry {
+            shard,
+            file: ironcache_persist::shard_file_name(shard),
+            keys: 10,
+            crc: 1,
+        }
+    }
+
+    fn delta_entry(
+        shard: u32,
+        base_epoch: u64,
+        delta_epoch: u64,
+    ) -> ironcache_persist::DeltaManifestEntry {
+        ironcache_persist::DeltaManifestEntry {
+            shard,
+            file: ironcache_persist::delta_file_name(shard, delta_epoch),
+            puts: 1,
+            tombstones: 0,
+            crc: 1,
+            base_epoch,
+            delta_epoch,
+        }
+    }
+
+    #[test]
+    fn assemble_commit_base_uses_fresh_id_and_empty_chain() {
+        let (save_id, base, deltas) = assemble_commit(
+            ironcache_persist::SaveMode::Base,
+            7,
+            None,
+            vec![base_entry(0), base_entry(1)],
+            Vec::new(),
+        )
+        .expect("base commit");
+        assert_eq!(save_id, 7, "a base takes a fresh generation id");
+        assert_eq!(base.len(), 2);
+        assert!(deltas.is_empty(), "a base has an empty chain");
+    }
+
+    #[test]
+    fn assemble_commit_delta_carries_forward_prior_base_and_chain() {
+        // A prior base generation 3 with one delta already on it.
+        let prior = ironcache_persist::Manifest {
+            version: ironcache_persist::MANIFEST_VERSION_DELTA,
+            shards: 2,
+            save_id: 3,
+            save_unix_secs: 100,
+            entries: vec![base_entry(0), base_entry(1)],
+            deltas: vec![delta_entry(0, 3, 1), delta_entry(1, 3, 1)],
+        };
+        // This round appends delta_epoch 2 for each shard (the shards reply Delta -> no base entries).
+        let (save_id, base, deltas) = assemble_commit(
+            ironcache_persist::SaveMode::Delta {
+                base_epoch: 3,
+                delta_epoch: 2,
+            },
+            99, // next_save_id is IGNORED for a delta (stays on base_epoch)
+            Some(&prior),
+            Vec::new(),
+            vec![delta_entry(0, 3, 2), delta_entry(1, 3, 2)],
+        )
+        .expect("delta commit");
+        assert_eq!(save_id, 3, "a delta STAYS on its base generation");
+        assert_eq!(base.len(), 2, "the prior base entries are carried forward");
+        assert_eq!(deltas.len(), 4, "prior chain (2) + this round (2)");
+    }
+
+    #[test]
+    fn assemble_commit_delta_guards_reject_corruption() {
+        let prior = ironcache_persist::Manifest {
+            version: ironcache_persist::MANIFEST_VERSION_BASE,
+            shards: 1,
+            save_id: 5,
+            save_unix_secs: 100,
+            entries: vec![base_entry(0)],
+            deltas: Vec::new(),
+        };
+        // A delta reply carrying a base reply is a bug.
+        assert!(
+            assemble_commit(
+                ironcache_persist::SaveMode::Delta {
+                    base_epoch: 5,
+                    delta_epoch: 1
+                },
+                6,
+                Some(&prior),
+                vec![base_entry(0)],
+                Vec::new(),
+            )
+            .is_err(),
+            "a base reply under a delta mode is rejected"
+        );
+        // A delta whose base_epoch != the base generation would be silently dropped by the loader.
+        assert!(
+            assemble_commit(
+                ironcache_persist::SaveMode::Delta {
+                    base_epoch: 5,
+                    delta_epoch: 1
+                },
+                6,
+                Some(&prior),
+                Vec::new(),
+                vec![delta_entry(0, 999, 1)],
+            )
+            .is_err(),
+            "a mismatched base_epoch fails loud instead of truncating the chain"
+        );
+        // A delta with no prior manifest is impossible-by-decision, rejected defensively.
+        assert!(
+            assemble_commit(
+                ironcache_persist::SaveMode::Delta {
+                    base_epoch: 5,
+                    delta_epoch: 1
+                },
+                6,
+                None,
+                Vec::new(),
+                vec![delta_entry(0, 5, 1)],
+            )
+            .is_err(),
+            "a delta with no prior manifest is rejected"
+        );
+        // A base mode that somehow got delta replies is a bug.
+        assert!(
+            assemble_commit(
+                ironcache_persist::SaveMode::Base,
+                6,
+                None,
+                Vec::new(),
+                vec![delta_entry(0, 5, 1)],
+            )
+            .is_err(),
+            "a delta reply under a base mode is rejected"
+        );
+    }
+
     /// A bare `PersistState` for latch tests (no real data dir / save fan-out needed).
     fn latch_state() -> Arc<PersistState> {
         Arc::new(PersistState {
@@ -831,6 +1135,7 @@ mod tests {
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: AtomicBool::new(false),
+            needs_base: AtomicBool::new(true),
         })
     }
 
@@ -853,6 +1158,7 @@ mod tests {
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: AtomicBool::new(false),
+            needs_base: AtomicBool::new(true),
         });
         // No manifest yet -> the seed leaves LASTSAVE at 0 (the pre-snapshot posture).
         p.seed_last_save_from_manifest();
