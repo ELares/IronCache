@@ -872,6 +872,7 @@ fn a_failed_save_flips_rdb_last_bgsave_status_to_err() {
         stats: Arc::new(ironcache_observe::PersistRuntime::new()),
         save_id: AtomicU64::new(0),
         saving: AtomicBool::new(false),
+        needs_base: AtomicBool::new(true),
     });
     // Before any save the status is ok (Redis parity).
     assert!(persist.stats.last_bgsave_ok(), "default status is ok");

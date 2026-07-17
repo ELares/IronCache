@@ -2896,6 +2896,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                     let bytes = obj.accounted_bytes();
                     self.account_sub(bytes);
                     self.eviction.on_remove(db, &key, bytes);
+                    // DIRTY-track the removal (#676), independent of the write-observer skip above:
+                    // dirty tracking is a LOCAL persistence concern (an incremental delta must
+                    // TOMBSTONE this purge, exactly like `observe_remove`, so a warm-start does not
+                    // RESURRECT the purged slot-import keys from the base), whereas the observer skip
+                    // is a REPLICATION concern (a downstream replica never had these keys). Own
+                    // fast-path gate inside, so this is free when tracking is off (the default).
+                    self.touch_dirty(db, &key);
                     removed += 1;
                 }
             }
@@ -4556,6 +4563,28 @@ mod dirty_tracking_tests {
         // take() reset the window: it is now empty, still active.
         assert_eq!(store.dirty_key_count(), Some(0));
         assert!(store.dirty_tracking_active());
+    }
+
+    #[test]
+    fn remove_keys_where_dirties_purged_keys() {
+        // #676: an aborted-slot-import purge (`remove_keys_where`) removes keys via a direct table
+        // path that BYPASSES the write observer, but it MUST still DIRTY the removals so an
+        // incremental delta TOMBSTONEs them -- otherwise a warm-start resurrects the purged keys
+        // from the base. Regression for that resurrection gap.
+        let mut store = ShardStore::new(2);
+        store.upsert(0, b"keep", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        store.upsert(0, b"drop1", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        store.upsert(0, b"drop2", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        // Arm tracking AFTER the load (mirrors the save epoch-cut arming), then purge two keys.
+        store.enable_dirty_tracking();
+        let removed = store.remove_keys_where(|k| k.starts_with(b"drop"));
+        assert_eq!(removed, 2, "both drop* keys purged");
+        let taken = sorted(store.take_dirty_keys().expect("tracking on"));
+        assert_eq!(
+            taken,
+            vec![(0, b"drop1".to_vec()), (0, b"drop2".to_vec())],
+            "the purge dirties exactly the removed keys (so a delta tombstones them)"
+        );
     }
 
     #[test]

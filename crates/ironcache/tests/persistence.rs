@@ -7,7 +7,10 @@
 //! cross-shard `__ICSAVE` fan-out (each shard dumps its own partition via the forkless
 //! `snapshot_chunk`) -> the atomic manifest commit -> load-on-boot in each shard's drain loop.
 
-use ironcache::test_support::{run_persist_server_for_test, run_persist_server_with_auth_for_test};
+use ironcache::test_support::{
+    run_persist_server_for_test, run_persist_server_with_auth_for_test,
+    run_persist_server_with_deltas_for_test,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -969,5 +972,139 @@ async fn config_save_appendonly_and_info_sections_over_the_wire() {
 
     drop(c);
     server.shutdown_and_join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Count the committed delta files (`dump-shard-<n>-delta-<epoch>.icsd`) present in `dir`.
+fn count_delta_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".icsd"))
+        .count()
+}
+
+/// #676 INCREMENTAL DELTA SNAPSHOTS end to end: with `snapshot_deltas` on, the first save is a full
+/// BASE and subsequent saves write DELTAS of only the mutated keys; a restart reconstructs the
+/// keyspace by folding the delta chain onto the base (later PUTs win, TOMBSTONEs remove, untouched
+/// base keys survive). Also proves the post-boot RE-BASE (a fresh process owes a base before it may
+/// delta again, so no write since load is skipped) and a delta appended onto that re-based generation.
+#[tokio::test(flavor = "current_thread")]
+async fn delta_snapshots_base_then_delta_reload_merges_chain() {
+    let dir = temp_data_dir("delta-chain");
+    let port = free_port();
+
+    // -- Boot 1: base save, then two delta saves. --
+    {
+        let server = run_persist_server_with_deltas_for_test(port, 3, dir.clone());
+        let mut c = connect_retry(port).await;
+        // Ten keys at generation 0, then a BASE save (the first save is always a base).
+        for i in 0..10 {
+            set(&mut c, &format!("k{i}"), &format!("v{i}-g0")).await;
+        }
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n");
+        assert!(
+            dir.join("dump.manifest").exists(),
+            "base manifest committed"
+        );
+        assert_eq!(
+            count_delta_files(&dir),
+            0,
+            "the first save is a base -> no delta files yet"
+        );
+        let ls_base = cmd1(&mut c, "LASTSAVE").await;
+
+        // Round A: overwrite k0, DELETE k1 (a tombstone), add a brand-new k10. SAVE -> delta 1.
+        set(&mut c, "k0", "v0-g1").await;
+        assert_eq!(cmd(&mut c, &["DEL", "k1"]).await, b":1\r\n");
+        set(&mut c, "k10", "v10-new").await;
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n");
+        assert!(
+            count_delta_files(&dir) >= 1,
+            "a delta save wrote at least one .icsd delta file: found {}",
+            count_delta_files(&dir)
+        );
+        let ls_delta = cmd1(&mut c, "LASTSAVE").await;
+        assert!(
+            ls_delta.starts_with(b":") && ls_delta != b":0\r\n",
+            "LASTSAVE stamped on the delta save too: {ls_delta:?} (base was {ls_base:?})"
+        );
+
+        // Round B: overwrite k2 and k0 again (k0's latest value must win on reload). SAVE -> delta 2.
+        set(&mut c, "k2", "v2-g2").await;
+        set(&mut c, "k0", "v0-g2").await;
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // -- Boot 2: reload folds base + delta 1 + delta 2 into the merged keyspace. --
+    {
+        let server = run_persist_server_with_deltas_for_test(port, 3, dir.clone());
+        let mut c = connect_retry(port).await;
+        // k0: last write (v0-g2) wins across the chain.
+        assert_eq!(get_raw(&mut c, "k0").await, bulk("v0-g2"), "k0 latest wins");
+        // k1: tombstoned in delta 1 -> gone.
+        assert_eq!(get_raw(&mut c, "k1").await, b"$-1\r\n", "k1 tombstoned");
+        // k2: overwritten in delta 2.
+        assert_eq!(get_raw(&mut c, "k2").await, bulk("v2-g2"), "k2 delta value");
+        // k3..k9: untouched -> survive from the base.
+        for i in 3..10 {
+            assert_eq!(
+                get_raw(&mut c, &format!("k{i}")).await,
+                bulk(&format!("v{i}-g0")),
+                "k{i} survives from the base"
+            );
+        }
+        // k10: created only in delta 1.
+        assert_eq!(
+            get_raw(&mut c, "k10").await,
+            bulk("v10-new"),
+            "k10 from delta"
+        );
+        // 10 base keys - k1 deleted + k10 added = 10.
+        assert_eq!(cmd1(&mut c, "DBSIZE").await, b":10\r\n", "merged key count");
+
+        // The FIRST save after a fresh boot must RE-BASE (dirty tracking was not armed for writes
+        // since load), so add a key and SAVE: this is a base, re-establishing the generation.
+        set(&mut c, "k11", "v11-new").await;
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n");
+        // Round C: a delta ON the re-based generation (overwrite k3). SAVE -> delta.
+        set(&mut c, "k3", "v3-g3").await;
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // -- Boot 3: the re-based base + its delta reload correctly. --
+    {
+        let server = run_persist_server_with_deltas_for_test(port, 3, dir.clone());
+        let mut c = connect_retry(port).await;
+        assert_eq!(
+            get_raw(&mut c, "k0").await,
+            bulk("v0-g2"),
+            "k0 survives re-base"
+        );
+        assert_eq!(get_raw(&mut c, "k1").await, b"$-1\r\n", "k1 stays deleted");
+        assert_eq!(
+            get_raw(&mut c, "k3").await,
+            bulk("v3-g3"),
+            "k3 round-C delta"
+        );
+        assert_eq!(
+            get_raw(&mut c, "k11").await,
+            bulk("v11-new"),
+            "k11 in re-base"
+        );
+        assert_eq!(
+            cmd1(&mut c, "DBSIZE").await,
+            b":11\r\n",
+            "count after re-base + delta"
+        );
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
     std::fs::remove_dir_all(&dir).ok();
 }

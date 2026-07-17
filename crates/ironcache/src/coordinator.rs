@@ -358,7 +358,14 @@ pub async fn run_drain_loop(
             crate::serve::scan_reserved_bits(ctx.shards),
         );
         let (bind, port) = (ctx.boot.bind, ctx.info.tcp_port);
-        crate::replica_attach::spawn_on_shard(&ctx, store_rc, bind, port, shard_index);
+        crate::replica_attach::spawn_on_shard(
+            &ctx,
+            store_rc,
+            bind,
+            port,
+            shard_index,
+            persist.clone(),
+        );
     }
     // TURNKEY cluster formation (PROD-turnkey): on SHARD 0 only (one driver per node, mirroring the
     // periodic-save host) in raft-mode WITH a static topology, spawn the bootstrap driver. Once this
@@ -1532,14 +1539,26 @@ const _: fn() = || {
 /// serving-side copy loop for it to throttle, so it no longer paces the datapath -- consistent with the
 /// #576 finding that throttling only STRETCHED (never bounded) the during-save tail. It is not read
 /// here.
-async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
-    // Parse `__ICSAVE <save_unix_secs> <shard_index> <dir>`.
+/// The parsed `__ICSAVE` request (#676): the shard index, the target snapshot dir, and the DELTA mode
+/// (`Some((base_epoch, delta_epoch))` for a delta save, `None` for a base save).
+type IcsaveParsed = (u32, std::path::PathBuf, Option<(u64, u64)>);
+
+/// Parse `__ICSAVE <save_unix_secs> <shard_index> <dir> [base_epoch delta_epoch]` (#676) into the
+/// shard index, the target dir, and the DELTA mode (the trailing epochs; their PRESENCE marks a delta
+/// save, both-or-neither). Returns a malformed-request error `Value` on any bad shape. The save
+/// timestamp arg is validated but unused here (`now` comes from the shard Env clock, ADR-0003).
+fn parse_icsave(request: &Request) -> Result<IcsaveParsed, Value> {
+    let malformed = |m: &str| {
+        Err(Value::error(ironcache_protocol::ErrorReply::err(
+            m.to_owned(),
+        )))
+    };
     let (Some(secs_arg), Some(shard_arg), Some(dir_arg)) = (
         request.args.get(1),
         request.args.get(2),
         request.args.get(3),
     ) else {
-        return Value::error(ironcache_protocol::ErrorReply::err("malformed __ICSAVE"));
+        return malformed("malformed __ICSAVE");
     };
     let parse_u64 = |b: &bytes::Bytes| {
         std::str::from_utf8(b)
@@ -1547,11 +1566,65 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
             .and_then(|s| s.parse::<u64>().ok())
     };
     let (Some(_save_secs), Some(shard_index)) = (parse_u64(secs_arg), parse_u64(shard_arg)) else {
-        return Value::error(ironcache_protocol::ErrorReply::err("malformed __ICSAVE"));
+        return malformed("malformed __ICSAVE");
     };
     #[allow(clippy::cast_possible_truncation)]
     let shard_index = shard_index as u32;
     let dir = std::path::PathBuf::from(String::from_utf8_lossy(dir_arg).into_owned());
+    // A DELTA save appends `base_epoch` (arg[4]) + `delta_epoch` (arg[5]); their ABSENCE is a BASE
+    // save (the default / pre-delta shape). Both-or-neither: a lone/unparseable epoch is malformed.
+    let delta_mode = match (request.args.get(4), request.args.get(5)) {
+        (Some(be), Some(de)) => {
+            let (Some(base_epoch), Some(delta_epoch)) = (parse_u64(be), parse_u64(de)) else {
+                return malformed("malformed __ICSAVE delta epochs");
+            };
+            Some((base_epoch, delta_epoch))
+        }
+        (None, None) => None,
+        _ => return malformed("malformed __ICSAVE delta args"),
+    };
+    Ok((shard_index, dir, delta_mode))
+}
+
+/// Encode + atomically write ONE shard's save file for the decided mode (#676): the whole frozen
+/// keyspace as a BASE `dump-shard-<n>.icss`, or ONLY the drained dirty keys (each a PUT of the frozen
+/// value or a TOMBSTONE) as a DELTA `dump-shard-<n>-delta-<epoch>.icsd`. Returns the manifest reply the
+/// home core collects. Runs ON the persist thread (the caller wraps it in `catch_unwind`); touches
+/// only the frozen `Arc`s + the filesystem.
+fn encode_shard_save(
+    delta_mode: Option<(u64, u64)>,
+    frozen: &[ironcache_store::FrozenSlot],
+    dirty_for_delta: &[(u32, Box<[u8]>)],
+    shard_index: u32,
+    now: UnixMillis,
+    dir: &std::path::Path,
+) -> std::io::Result<crate::persist::SaveReply> {
+    match delta_mode {
+        None => {
+            let dump = ironcache_persist::dump_frozen_slots(frozen, shard_index, now);
+            ironcache_persist::write_shard_dump(&dump, shard_index, dir)
+                .map(crate::persist::SaveReply::Base)
+        }
+        Some((base_epoch, delta_epoch)) => {
+            let dump = ironcache_persist::build_delta_from_frozen(
+                frozen,
+                dirty_for_delta,
+                shard_index,
+                base_epoch,
+                delta_epoch,
+                now,
+            );
+            ironcache_persist::write_delta_file(&dump, shard_index, base_epoch, delta_epoch, dir)
+                .map(crate::persist::SaveReply::Delta)
+        }
+    }
+}
+
+async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
+    let (shard_index, dir, delta_mode) = match parse_icsave(request) {
+        Ok(parsed) => parsed,
+        Err(e) => return e,
+    };
 
     let env = shard_env();
     let store_rc = shard_store(
@@ -1569,9 +1642,10 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     //
     // #676 EPOCH CUT: when incremental delta snapshots are configured, take the dirty set AT the
     // freeze instant, in the SAME borrow -- ensure per-shard dirty tracking is armed, then drain the
-    // keys mutated since the last save (they are all captured in THIS base). This slice discards the
-    // set (the base save is byte-unchanged) but logs the real-workload dirty fraction; the delta build
-    // consumes the set in the next slice. When the flag is off (the default) this is skipped entirely.
+    // keys mutated since the last save. On a DELTA save this drained set IS the delta's key list
+    // (encoded below); on a BASE save it is discarded (the base re-reads the whole frozen store), but
+    // draining STILL resets the "since" point so the NEXT delta captures only writes after this cut.
+    // When the flag is off (the default) this is skipped entirely and the save is a plain base.
     let (frozen, dirty_at_cut, live_keys) = {
         let mut store = store_rc.borrow_mut();
         let frozen: Vec<ironcache_store::FrozenSlot> = store.begin_save();
@@ -1597,10 +1671,26 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
         );
     }
 
-    // The oneshot carries the persist thread's file-write result back to this shard task via a
-    // cross-thread wake (does NOT block the executor).
-    let (done_tx, done_rx) =
-        oneshot::channel::<std::io::Result<ironcache_persist::ShardManifestEntry>>();
+    // For a DELTA save, the drained dirty set IS the delta's key list -- move it (owned) to the
+    // persist thread. A delta requested with NO dirty set (tracking was never armed) would silently
+    // encode an EMPTY delta and drop those writes on reload; fail the save loudly instead. On a base
+    // save the set (if any) is simply dropped here.
+    let dirty_for_delta: Vec<(u32, Box<[u8]>)> = if delta_mode.is_some() {
+        let Some(dirty) = dirty_at_cut else {
+            store_rc.borrow_mut().end_save();
+            return Value::error(ironcache_protocol::ErrorReply::err(
+                "delta __ICSAVE with no armed dirty set",
+            ));
+        };
+        dirty.into_iter().collect()
+    } else {
+        drop(dirty_at_cut);
+        Vec::new()
+    };
+
+    // The oneshot carries the persist thread's save result (a BASE or DELTA manifest entry) back to
+    // this shard task via a cross-thread wake (does NOT block the executor).
+    let (done_tx, done_rx) = oneshot::channel::<std::io::Result<crate::persist::SaveReply>>();
     let dir_for_thread = dir.clone();
     // The `persist-cpu` knob (#589): which core(s) to pin THIS persist thread to. Cloned into the
     // closure so the pin is applied ON the persist thread (affinity is per-thread). Empty = the
@@ -1627,8 +1717,14 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
             // (immutable for the save) + the filesystem, so a mid-encode unwind leaves no shared state
             // observably broken (the frozen slots are dropped below regardless).
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let dump = ironcache_persist::dump_frozen_slots(&frozen, shard_index, now);
-                ironcache_persist::write_shard_dump(&dump, shard_index, &dir_for_thread)
+                encode_shard_save(
+                    delta_mode,
+                    &frozen,
+                    &dirty_for_delta,
+                    shard_index,
+                    now,
+                    &dir_for_thread,
+                )
             })) {
                 Ok(r) => r,
                 Err(panic) => {
@@ -1675,7 +1771,7 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     // cancelled task never reaches here -- the flag then safely stays set on an exiting process).
     store_rc.borrow_mut().end_save();
     match result {
-        Ok(Ok(entry)) => crate::persist::encode_save_reply(&crate::persist::SaveReply::Base(entry)),
+        Ok(Ok(reply)) => crate::persist::encode_save_reply(&reply),
         Ok(Err(e)) => Value::error(ironcache_protocol::ErrorReply::err(format!(
             "save failed: {e}"
         ))),

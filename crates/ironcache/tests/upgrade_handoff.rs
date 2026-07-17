@@ -16,7 +16,9 @@
 //! chosen dir -> the manifest commit -> load-on-boot resolving the handoff vs the durable snapshot
 //! -> the post-load tmpfs cleanup.
 
-use ironcache::test_support::run_persist_server_with_handoff_for_test;
+use ironcache::test_support::{
+    run_persist_server_with_deltas_and_handoff_for_test, run_persist_server_with_handoff_for_test,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -386,6 +388,89 @@ async fn crash_mid_upgrade_recovers_from_the_durable_data_dir() {
             b":15\r\n",
             "only the durable A-keys recovered"
         );
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    std::fs::remove_dir_all(&base).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #676 regression: an ephemeral `SAVE HANDOFF` (tmpfs, durable=false) DRAINS every shard's dirty set
+/// WITHOUT advancing the durable base, so the next durable save MUST re-base -- otherwise a delta
+/// would skip the drained writes and a warm-start would silently lose them. Proves a key mutated
+/// BEFORE the handoff (and drained by it) still reloads from the durable snapshot after a later save.
+/// Skips cleanly where tmpfs is unavailable (non-Linux / no `/dev/shm`).
+#[tokio::test(flavor = "current_thread")]
+async fn handoff_drain_forces_rebase_so_a_later_delta_never_drops_writes() {
+    let Some(base) = unique_tmpfs_base("delta-rebase") else {
+        eprintln!("skipping: tmpfs (/dev/shm) unavailable on this host");
+        return;
+    };
+    std::fs::remove_dir_all(&base).ok();
+    let dir = temp_data_dir("delta-rebase");
+    let port = free_port();
+
+    {
+        let server = run_persist_server_with_deltas_and_handoff_for_test(
+            port,
+            3,
+            dir.clone(),
+            Some(base.clone()),
+        );
+        let mut c = connect_retry(port).await;
+        // Durable BASE {a,b}, then a durable DELTA adding c (needs_base is now false -> deltas armed).
+        set(&mut c, "a", "1").await;
+        set(&mut c, "b", "1").await;
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n", "durable base");
+        set(&mut c, "c", "1").await;
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n", "durable delta");
+        // Mutate d, then SAVE HANDOFF -> tmpfs: DRAINS the dirty set (incl. d) WITHOUT advancing the
+        // durable base. The fix forces needs_base here.
+        set(&mut c, "d", "1").await;
+        assert_eq!(
+            cmd(&mut c, &["SAVE", "HANDOFF"]).await,
+            b"+OK\r\n",
+            "handoff commits (tmpfs)"
+        );
+        // Confirm we exercised the EPHEMERAL tmpfs (durable=false) path -- the handoff manifest is on
+        // tmpfs, so the durable base was NOT advanced (else the test would pass for the wrong reason).
+        assert!(
+            has_manifest(&staging(&base)),
+            "the handoff staged on tmpfs (durable=false path), not the data_dir fallback"
+        );
+        // Mutate e, then a durable SAVE. WITHOUT the fix this is a delta of {e} only, DROPPING the
+        // handoff-drained d; WITH the fix needs_base forces a BASE capturing {a,b,c,d,e}.
+        set(&mut c, "e", "1").await;
+        assert_eq!(
+            cmd1(&mut c, "SAVE").await,
+            b"+OK\r\n",
+            "durable save after handoff"
+        );
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // Remove the tmpfs handoff so the restart loads from the DURABLE data_dir (not the older handoff).
+    std::fs::remove_dir_all(&base).ok();
+
+    // Restart on the durable data_dir: EVERY key -- crucially the handoff-drained `d` -- must reload.
+    {
+        let server = run_persist_server_with_deltas_and_handoff_for_test(
+            port,
+            3,
+            dir.clone(),
+            Some(base.clone()),
+        );
+        let mut c = connect_retry(port).await;
+        for k in ["a", "b", "c", "d", "e"] {
+            assert_eq!(
+                get_raw(&mut c, k).await,
+                bulk("1"),
+                "{k} survived the handoff drain + forced re-base"
+            );
+        }
+        assert_eq!(cmd1(&mut c, "DBSIZE").await, b":5\r\n", "no key lost");
         drop(c);
         server.shutdown_and_join().unwrap();
     }
