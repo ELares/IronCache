@@ -88,7 +88,8 @@ pub mod format;
 
 pub use format::{
     DeltaManifestEntry, MANIFEST_VERSION_BASE, MANIFEST_VERSION_DELTA, Manifest,
-    ShardManifestEntry, SnapshotLoadError, crc32, manifest_path, shard_file_name, shard_path,
+    ShardManifestEntry, SnapshotLoadError, crc32, delta_file_name, manifest_path, shard_file_name,
+    shard_path,
 };
 
 use std::io;
