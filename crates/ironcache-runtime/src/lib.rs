@@ -321,33 +321,37 @@ pub trait BatchedRecvSend: Runtime<Buf = Vec<u8>, Error = std::io::Error> {
     /// and every non-zero-copy reply) lives in `out`; only the value bytes are by-pointer.
     /// RETURNS `out` for reuse. Empty `inserts` is exactly a `send_batch(out)` (byte-identical).
     ///
-    /// # Precondition (the pinned-region contract)
+    /// # The pin lifetime (why this is sound + a safe fn)
     ///
-    /// Each `ZcInsert`'s `(ptr, len)` MUST stay valid + immutable until this send's CQE is reaped,
-    /// INCLUDING if the returned future is dropped in flight (the op owns `out` + the iovec array, but
-    /// NOT the pinned regions). Violating it lets the kernel `writev` (or the fallback's
-    /// `from_raw_parts`) read freed memory. `inserts` must be sorted by `at` ascending with each
-    /// `at <= out.len()`.
+    /// Each `ZcInsert`'s `(ptr, len)` must stay valid + immutable until this send's CQE. The `pins`
+    /// are OPAQUE owned handles (each a store `ZcPin` = a clone of the value's slot `Arc`) that KEEP
+    /// those regions alive: this op OWNS `out` + the iovec array + `pins` for the whole write (and, if
+    /// the returned future is dropped in flight, they move into the op's cancel-safe owned slot until
+    /// the CQE). So a concurrent mutation of a pinned key COWs the LIVE slot (the store's #576
+    /// `Arc::make_mut`) while the pin's frozen `Arc` here keeps the ORIGINAL bytes -- the kernel never
+    /// reads freed memory, WITHOUT any fence. Each `ZcInsert.ptr` must point into a region a `pins`
+    /// entry keeps alive; `inserts` must be sorted by `at` ascending with each `at <= out.len()`.
     ///
-    /// This is a SAFE fn carrying a caller precondition (rather than an `unsafe fn`) BECAUSE its only
-    /// caller -- the serve loop in the `#![forbid(unsafe_code)]` `ironcache` crate -- cannot write an
-    /// `unsafe` block, and the pins cannot be a lifetime-bound `&[u8]` (they must outlive the `.await`,
-    /// which a store borrow held across the await would forbid). The obligation is instead upheld
-    /// STRUCTURALLY by the store's in-flight fence: it reaps this send before freeing any pinned value
-    /// (every value-pointee free site drains it), and the connection-close path drains before drop.
-    /// That whole-system invariant is verified by the #515 UAF stress test.
+    /// This is a safe fn: memory safety follows from the op owning `pins` for the whole send (an
+    /// unenforceable-by-types but structurally-guaranteed correspondence between each `ptr` and a held
+    /// pin, which [`store::pin_value_frozen`] establishes by returning both together). It is a safe fn
+    /// rather than `unsafe` because its only caller is the `#![forbid(unsafe_code)]` `ironcache` serve
+    /// loop, which cannot write an `unsafe` block.
     ///
     /// The io_uring backend overrides this with a real vectored `writev`; the DEFAULT materializes the
     /// splice into one contiguous buffer + [`Self::send_batch`] (correct + byte-identical, but copies
-    /// the values -- the fallback for a backend without a vectored op).
+    /// the values -- the fallback for a backend without a vectored op). `pins` are held until the copy
+    /// + send complete.
     fn send_zc(
         &self,
         stream: &mut Self::Stream,
         out: Vec<u8>,
         inserts: Vec<ZcInsert>,
+        pins: Vec<Box<dyn core::any::Any>>,
     ) -> impl Future<Output = std::io::Result<Vec<u8>>> {
         async move {
             if inserts.is_empty() {
+                drop(pins); // no pinned regions referenced.
                 return self.send_batch(stream, out).await;
             }
             // Fallback: materialize the spliced sequence into one buffer (copies the pinned values),

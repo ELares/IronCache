@@ -1423,14 +1423,16 @@ fn build_writev_iovecs(bufs: &[Vec<u8>], skip: usize) -> Vec<libc::iovec> {
     iovecs
 }
 
-/// The owned resource for an in-flight zero-copy SPLICE `writev` (#515): the iovec ARRAY plus the
-/// `out` scratch buffer some iovecs point into. Held by the `OpFuture` until the CQE (moved into
-/// [`Lifecycle::Ignored`] on drop-in-flight), so `out` + the array outlive the op. The value-pointer
-/// iovecs reference caller-PINNED store memory this struct does NOT own -- the caller's fence keeps
-/// those valid until the CQE (`send_zc`'s safety contract), so a dropped op is sound for what it owns.
+/// The owned resource for an in-flight zero-copy SPLICE `writev` (#515): the iovec ARRAY, the `out`
+/// scratch buffer some iovecs point into, AND the `pins` (opaque store `ZcPin`s = frozen slot `Arc`s)
+/// that keep the value-pointer iovecs' regions alive. Held by the `OpFuture` until the CQE (moved into
+/// [`Lifecycle::Ignored`] on drop-in-flight), so ALL THREE outlive the op -- so even a cancelled send
+/// reads valid memory (the frozen `Arc`s in `pins` keep the value bytes alive past any concurrent COW
+/// until the CQE), and the whole struct is cancel-safe for everything the send references.
 struct OwnedZcWritev {
     iovecs: Vec<libc::iovec>,
     out: Vec<u8>,
+    pins: Vec<Box<dyn core::any::Any>>,
 }
 
 /// Build the iovec array for the UNWRITTEN suffix `[skip, total)` of the logical splice
@@ -1561,25 +1563,28 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
     /// with the pinned `inserts` (see [`crate::BatchedRecvSend::send_zc`]) as ONE vectored write, with
     /// the value bytes written straight from store memory (no copy into `out`). Write-ALL: resubmit
     /// from the running offset across short writevs + the `UIO_MAXIOV` cap. The op owns `out` + the
-    /// iovec array (cancel-safe); the pinned value regions are the caller's contract (kept valid until
-    /// the CQE by the store fence). Empty `inserts` is exactly [`Self::send`] (byte-identical). The
-    /// pinned-region precondition (each `ZcInsert`'s `(ptr, len)` valid until the CQE, incl. on cancel)
-    /// is the caller's, upheld structurally by the store fence -- see
-    /// [`crate::BatchedRecvSend::send_zc`] for why this is a safe fn with a precondition, not `unsafe`.
+    /// iovec array + `pins` (the opaque frozen-slot handles keeping the value-pointer regions alive),
+    /// so it is FULLY cancel-safe: a dropped-in-flight send keeps all three until the CQE, and the
+    /// frozen `Arc`s in `pins` keep the value bytes valid past any concurrent COW. Empty `inserts` is
+    /// exactly [`Self::send`] (byte-identical).
     async fn send_zc(
         &self,
         stream: &mut RawUringTcpStream,
         out: Vec<u8>,
         inserts: Vec<crate::ZcInsert>,
+        pins: Vec<Box<dyn core::any::Any>>,
     ) -> io::Result<Vec<u8>> {
         if inserts.is_empty() {
+            drop(pins); // no pinned regions referenced.
             return self.send(stream, out).await;
         }
         let total: usize = out.len() + inserts.iter().map(|i| i.len).sum::<usize>();
         if total == 0 {
+            drop(pins);
             return Ok(out);
         }
         let mut out = out;
+        let mut pins = pins;
         let mut written = 0usize;
         while written < total {
             let iovecs = build_zc_iovecs(&out, &inserts, written);
@@ -1587,13 +1592,14 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
                 !iovecs.is_empty(),
                 "written < total implies a non-empty unwritten suffix"
             );
-            let owned = OwnedZcWritev { iovecs, out };
+            let owned = OwnedZcWritev { iovecs, out, pins };
             let iov_ptr = owned.iovecs.as_ptr();
             #[allow(clippy::cast_possible_truncation)] // capped at WRITEV_IOV_MAX (1024).
             let iov_len = owned.iovecs.len() as u32;
             let sqe = opcode::Writev::new(types::Fd(stream.fd), iov_ptr, iov_len).build();
             let (res, owned) = OpFuture::submit(sqe, owned).await;
             out = owned.out;
+            pins = owned.pins; // hand the pins back to keep them alive across the next resubmit.
             let n = res?;
             if n == 0 {
                 return Err(io::Error::from(io::ErrorKind::WriteZero));
@@ -1602,6 +1608,7 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
             let n = n as usize;
             written += n;
         }
+        drop(pins); // the whole splice is on the wire; release the frozen slots.
         Ok(out)
     }
 }
@@ -2011,7 +2018,10 @@ mod tests {
             let expected = b"$5\r\nhello\r\n$10\r\nworldworld\r\n";
 
             // Precondition: v1/v2 (the pinned regions) outlive the whole send below.
-            let returned = rt.send_zc(&mut server, out, inserts).await.unwrap();
+            let returned = rt
+                .send_zc(&mut server, out, inserts, Vec::new())
+                .await
+                .unwrap();
             assert_eq!(
                 returned, b"$5\r\n\r\n$10\r\n\r\n",
                 "out (framing only) handed back for reuse"
@@ -2027,6 +2037,43 @@ mod tests {
         });
     }
 
+    /// #515 P4: `send_zc` OWNS the `pins` for the whole send. The value here lives ONLY inside its
+    /// pin (a `Box<dyn Any>`) moved into the send -- the test keeps no other reference -- so the write
+    /// delivering the correct bytes proves the send held the pin (its sole owner) until the CQE. This
+    /// is the cancel-safe lifetime the store `ZcPin` (a frozen slot `Arc`) relies on.
+    #[test]
+    fn send_zc_owns_the_pins_that_back_the_value() {
+        use crate::{BatchedRecvSend, ZcInsert};
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let (mut server, mut client) = socket_pair();
+
+            let value: Vec<u8> = b"a-large-pinned-value".to_vec();
+            let ptr = value.as_ptr();
+            let len = value.len();
+            // Move `value` into the pin; the test now holds NO other reference to it.
+            let pin: Box<dyn core::any::Any> = Box::new(value);
+            let mut out = Vec::new();
+            out.extend_from_slice(b"$20\r\n");
+            let at = out.len();
+            out.extend_from_slice(b"\r\n");
+            let inserts = vec![ZcInsert { at, ptr, len }];
+            let expected = b"$20\r\na-large-pinned-value\r\n";
+
+            let _ = rt
+                .send_zc(&mut server, out, inserts, vec![pin])
+                .await
+                .unwrap();
+
+            let mut got = vec![0u8; expected.len()];
+            client.read_exact(&mut got).unwrap();
+            assert_eq!(
+                got, expected,
+                "the send held the pin (the value's only owner) for the whole write"
+            );
+        });
+    }
+
     /// #515 send_zc: empty `inserts` is byte-identical to a plain `send` of `out`; and a large spliced
     /// payload writes ALL bytes in order across short writevs (concurrent reader drains).
     #[test]
@@ -2037,7 +2084,7 @@ mod tests {
             let (mut server, mut client) = socket_pair();
             // Empty inserts -> plain send of `out`.
             let out = rt
-                .send_zc(&mut server, b"+PONG\r\n".to_vec(), Vec::new())
+                .send_zc(&mut server, b"+PONG\r\n".to_vec(), Vec::new(), Vec::new())
                 .await
                 .unwrap();
             assert_eq!(out, b"+PONG\r\n");
@@ -2069,7 +2116,10 @@ mod tests {
                 buf
             });
             // Precondition: `value` (the pinned region) outlives the send below.
-            let _ = rt.send_zc(&mut server, out2, inserts).await.unwrap();
+            let _ = rt
+                .send_zc(&mut server, out2, inserts, Vec::new())
+                .await
+                .unwrap();
             let seen = reader.join().unwrap();
             assert_eq!(seen.len(), total);
             assert_eq!(
