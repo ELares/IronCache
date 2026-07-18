@@ -2686,6 +2686,11 @@ async fn serve_connection_generic<R>(
     // flush is `send_zc(out, [])`, exactly a `send_batch(out)` (byte-identical). Always drained (taken)
     // at every flush, so it carries no state across the outer loop. P4's `get_home_by_ref` pushes here.
     let mut zc_inserts: Vec<ironcache_runtime::ZcInsert> = Vec::new();
+    // The zero-copy PINS (#515 P4): the frozen-slot handles (store `ZcPin`s, type-erased) that keep
+    // each `zc_inserts` region alive until the send's CQE -- the io_uring send OWNS them, so even a
+    // cancelled send reads valid memory. Drained (taken) with `zc_inserts` at every flush; EMPTY in
+    // P4b (nothing pins yet), so the flush is byte-identical. P4c's `get_home_by_ref` pushes here.
+    let mut zc_pins: Vec<Box<dyn core::any::Any>> = Vec::new();
     // CROSS-SHARD HOP OVERLAP (#8 / #514): the run of DEFERRED remote hops awaiting assembly, mirrored
     // from the tokio serve loop. Parked as they are decoded and drained (in order) at the next barrier /
     // error / end of batch, so a run of pipelined remote-key ops overlaps the owner's work instead of
@@ -2878,6 +2883,7 @@ async fn serve_connection_generic<R>(
                                 &mut stream,
                                 std::mem::take(&mut out),
                                 std::mem::take(&mut zc_inserts),
+                                std::mem::take(&mut zc_pins),
                             )
                             .await
                             .is_ok();
@@ -2927,6 +2933,7 @@ async fn serve_connection_generic<R>(
                             &mut stream,
                             std::mem::take(&mut out),
                             std::mem::take(&mut zc_inserts),
+                            std::mem::take(&mut zc_pins),
                         )
                         .await
                         .is_ok();
@@ -2982,6 +2989,7 @@ async fn serve_connection_generic<R>(
                     &mut stream,
                     std::mem::take(&mut out),
                     std::mem::take(&mut zc_inserts),
+                    std::mem::take(&mut zc_pins),
                 )
                 .await;
             match flush_result {
