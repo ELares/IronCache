@@ -291,6 +291,43 @@ impl std::fmt::Debug for ZcDrainCallback {
     }
 }
 
+/// A ZERO-COPY value PIN (#515 P4): a raw `(ptr, len)` into a live String value's inline blob PLUS a
+/// clone of the value's slot `Arc` (see [`ShardStore::pin_value_frozen`]). The held `Arc` keeps the
+/// ORIGINAL slot entries (incl. the pinned value's pointee) alive past any concurrent COW, so the
+/// `(ptr, len)` is a stable, immutable region an io_uring send can write straight from with no copy.
+/// The io_uring send OWNS the `ZcPin` (type-erased) until its CQE; dropping it releases the frozen
+/// slot. The pointer is only valid while the `ZcPin` lives -- read it solely as an in-flight send
+/// iovec, never after the pin drops.
+#[derive(Debug)]
+pub struct ZcPin {
+    /// The cloned slot `Arc` keeping the ORIGINAL entries + pointees alive. NEVER mutated through this
+    /// clone (a write to the slot forks the LIVE arc via `Arc::make_mut`, #576), so the pinned bytes
+    /// are frozen for the pin's lifetime.
+    _slot: Arc<HashTable<Entry>>,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl ZcPin {
+    /// The pinned value's start pointer (into the frozen slot entry's inline blob).
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// The pinned value's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the pinned value is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 #[derive(Debug)]
 pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = CountingAccounting> {
     /// Per-database, per-SLOT SwissTables (#570), each storing a single-allocation
@@ -1406,6 +1443,38 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         }
         let bytes = obj.str_value_bytes();
         Some((bytes.as_ptr(), bytes.len()))
+    }
+
+    /// PIN `key`'s STRING value for a zero-copy send with a SLOT-`Arc`-BACKED lifetime guarantee
+    /// (#515 P4) -- the pin the serve loop actually uses. Like [`Self::pin_value`], but returns a
+    /// [`ZcPin`] that HOLDS a clone of the value's slot `Arc`. Holding the clone bumps the slot's
+    /// strong count, so any subsequent OR concurrent write to that slot COWs it (`Arc::make_mut`
+    /// deep-clones into a fresh table and re-points the LIVE arc, leaving THIS clone sole-owning the
+    /// ORIGINAL entries + their value pointees -- the exact #576 mechanism). So the returned
+    /// `(ptr, len)` stays valid + immutable for as long as the `ZcPin` is held (the io_uring send owns
+    /// it until its CQE), with NO fence and NO copy -- a mutation of the pinned key just forks the live
+    /// slot. `None` for an absent / logically-expired / non-String key.
+    #[must_use]
+    pub fn pin_value_frozen(&self, db: u32, key: &[u8], now: UnixMillis) -> Option<ZcPin> {
+        let db_idx = self.db_index(db);
+        let slot = slot_index(key, self.slots);
+        // Clone the slot `Arc` FIRST (strong_count -> >1), so from here a write to this slot COWs.
+        let slot_clone = Arc::clone(self.dbs.get(db_idx)?.get(slot)?);
+        let h = self.key_hash(key);
+        let obj = slot_clone.find(h, |e| e.key() == key)?;
+        if obj.data_type() != DataType::String || obj.is_expired(now) {
+            return None;
+        }
+        let bytes = obj.str_value_bytes();
+        // Capture the raw (ptr, len) into the frozen entry's blob, then move the `Arc` into the pin.
+        // The `Arc`'s pointee (the table + its entries + their pointees) is address-stable across the
+        // move, so `ptr` stays valid; the frozen table is never mutated (writes fork the LIVE arc).
+        let (ptr, len) = (bytes.as_ptr(), bytes.len());
+        Some(ZcPin {
+            _slot: slot_clone,
+            ptr,
+            len,
+        })
     }
 
     /// Build the read-borrow view for an entry. Memory Round 3: an int-encoded value
@@ -4980,5 +5049,63 @@ mod zc_fence_tests {
             store.pin_value(0, b"ttl", UnixMillis(20)).is_none(),
             "logically expired -> not pinnable"
         );
+    }
+
+    /// #515 P4: `pin_value_frozen` holds a clone of the value's slot `Arc`, so a subsequent OVERWRITE
+    /// or DELETE of the pinned key COWs the live slot (#576 `Arc::make_mut`) and the pin's frozen clone
+    /// keeps the ORIGINAL value bytes valid + unchanged -- the whole-system invariant the zero-copy GET
+    /// send rests on (the send owns the pin until its CQE, so no concurrent mutation can free the bytes
+    /// the kernel is reading).
+    #[test]
+    fn pin_value_frozen_survives_overwrite_and_delete_of_the_live_key() {
+        let mut store = ShardStore::new(4);
+        store.upsert(
+            0,
+            b"k",
+            NewValue::Bytes(b"the-original-large-value"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        let pin = store
+            .pin_value_frozen(0, b"k", NOW)
+            .expect("a live string pins");
+        assert_eq!(pin.len(), b"the-original-large-value".len());
+        assert!(!pin.is_empty());
+        // SAFETY: `pin` holds the frozen slot Arc, so `[ptr, ptr+len)` is a valid, immutable region for
+        // as long as `pin` lives -- exactly the send's precondition.
+        let read = |p: &ZcPin| unsafe { std::slice::from_raw_parts(p.as_ptr(), p.len()) };
+        assert_eq!(read(&pin), b"the-original-large-value");
+
+        // OVERWRITE k: put_object -> slot_table_mut -> Arc::make_mut sees strong_count 2 (the pin) and
+        // COWs, forking the live slot; the pin's clone keeps k's ORIGINAL entry + pointee.
+        store.upsert(
+            0,
+            b"k",
+            NewValue::Bytes(b"a-completely-different-new-value"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        assert_eq!(
+            read(&pin),
+            b"the-original-large-value",
+            "the pin froze the pre-overwrite value across the COW"
+        );
+        let live = store.read(0, b"k", NOW).map(|v| v.as_bytes().to_vec());
+        assert_eq!(
+            live.as_deref(),
+            Some(&b"a-completely-different-new-value"[..]),
+            "the LIVE key has the new value, independent of the frozen pin"
+        );
+
+        // DELETE the live key: the pin's frozen value is still valid.
+        assert!(store.delete(0, b"k", NOW));
+        assert_eq!(
+            read(&pin),
+            b"the-original-large-value",
+            "the pin survives a delete of the live key"
+        );
+        assert!(store.read(0, b"k", NOW).is_none(), "the live key is gone");
+
+        drop(pin); // releases the frozen slot Arc.
     }
 }
