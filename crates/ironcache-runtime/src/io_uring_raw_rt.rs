@@ -1562,13 +1562,11 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
     /// the value bytes written straight from store memory (no copy into `out`). Write-ALL: resubmit
     /// from the running offset across short writevs + the `UIO_MAXIOV` cap. The op owns `out` + the
     /// iovec array (cancel-safe); the pinned value regions are the caller's contract (kept valid until
-    /// the CQE by the store fence). Empty `inserts` is exactly [`Self::send`] (byte-identical).
-    ///
-    /// # Safety
-    ///
-    /// Each `ZcInsert`'s `(ptr, len)` must stay valid + immutable until this send's CQE is reaped,
-    /// including if the returned future is dropped in flight (see [`crate::BatchedRecvSend::send_zc`]).
-    async unsafe fn send_zc(
+    /// the CQE by the store fence). Empty `inserts` is exactly [`Self::send`] (byte-identical). The
+    /// pinned-region precondition (each `ZcInsert`'s `(ptr, len)` valid until the CQE, incl. on cancel)
+    /// is the caller's, upheld structurally by the store fence -- see
+    /// [`crate::BatchedRecvSend::send_zc`] for why this is a safe fn with a precondition, not `unsafe`.
+    async fn send_zc(
         &self,
         stream: &mut RawUringTcpStream,
         out: Vec<u8>,
@@ -2012,10 +2010,8 @@ mod tests {
             ];
             let expected = b"$5\r\nhello\r\n$10\r\nworldworld\r\n";
 
-            // SAFETY: v1/v2 (the pinned regions) outlive the whole send below.
-            let returned = unsafe { rt.send_zc(&mut server, out, inserts) }
-                .await
-                .unwrap();
+            // Precondition: v1/v2 (the pinned regions) outlive the whole send below.
+            let returned = rt.send_zc(&mut server, out, inserts).await.unwrap();
             assert_eq!(
                 returned, b"$5\r\n\r\n$10\r\n\r\n",
                 "out (framing only) handed back for reuse"
@@ -2039,8 +2035,9 @@ mod tests {
         raw_uring_start(async {
             let rt = RawIoUringRuntime::new();
             let (mut server, mut client) = socket_pair();
-            // Empty inserts -> plain send of `out`. SAFETY: no pinned regions (empty inserts).
-            let out = unsafe { rt.send_zc(&mut server, b"+PONG\r\n".to_vec(), Vec::new()) }
+            // Empty inserts -> plain send of `out`.
+            let out = rt
+                .send_zc(&mut server, b"+PONG\r\n".to_vec(), Vec::new())
                 .await
                 .unwrap();
             assert_eq!(out, b"+PONG\r\n");
@@ -2071,10 +2068,8 @@ mod tests {
                 client.read_exact(&mut buf).unwrap();
                 buf
             });
-            // SAFETY: `value` (the pinned region) outlives the send below.
-            let _ = unsafe { rt.send_zc(&mut server, out2, inserts) }
-                .await
-                .unwrap();
+            // Precondition: `value` (the pinned region) outlives the send below.
+            let _ = rt.send_zc(&mut server, out2, inserts).await.unwrap();
             let seen = reader.join().unwrap();
             assert_eq!(seen.len(), total);
             assert_eq!(

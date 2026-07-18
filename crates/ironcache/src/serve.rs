@@ -2680,6 +2680,12 @@ async fn serve_connection_generic<R>(
     };
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // ZERO-COPY GET splice list (#515 P3b, INERT until P4): the ordered `ZcInsert`s (a pinned stored
+    // value + its offset in `out`) to interleave into `out` at flush, so a large present value is
+    // written store->socket with no copy into `out`. EMPTY in P3b -- nothing pushes yet -- so every
+    // flush is `send_zc(out, [])`, exactly a `send_batch(out)` (byte-identical). Always drained (taken)
+    // at every flush, so it carries no state across the outer loop. P4's `get_home_by_ref` pushes here.
+    let mut zc_inserts: Vec<ironcache_runtime::ZcInsert> = Vec::new();
     // CROSS-SHARD HOP OVERLAP (#8 / #514): the run of DEFERRED remote hops awaiting assembly, mirrored
     // from the tokio serve loop. Parked as they are decoded and drained (in order) at the next barrier /
     // error / end of batch, so a run of pipelined remote-key ops overlaps the owner's work instead of
@@ -2864,7 +2870,18 @@ async fn serve_connection_generic<R>(
                     }
                     if close {
                         let sent = out.len();
-                        if rt.send(&mut stream, std::mem::take(&mut out)).await.is_ok() {
+                        // #515: `zc_inserts` is EMPTY in P3b (nothing pins), so `send_zc` carries no
+                        // pinned regions -- exactly a `send_batch(out)`. P4's real pins are kept valid
+                        // until the CQE by the store's in-flight fence (send_zc's precondition).
+                        let flushed_ok = rt
+                            .send_zc(
+                                &mut stream,
+                                std::mem::take(&mut out),
+                                std::mem::take(&mut zc_inserts),
+                            )
+                            .await
+                            .is_ok();
+                        if flushed_ok {
                             // #527: net output for the io_uring QUIT reply.
                             state_rc.borrow().counters.on_net_output(sent as u64);
                         }
@@ -2902,7 +2919,18 @@ async fn serve_connection_generic<R>(
                     }
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
                     let sent = out.len();
-                    if rt.send(&mut stream, std::mem::take(&mut out)).await.is_ok() {
+                    // #515: `zc_inserts` is EMPTY in P3b (nothing pins), so `send_zc` carries no pinned
+                    // regions -- exactly a `send_batch(out)`. P4's real pins are kept valid until the
+                    // CQE by the store's in-flight fence (send_zc's precondition).
+                    let flushed_ok = rt
+                        .send_zc(
+                            &mut stream,
+                            std::mem::take(&mut out),
+                            std::mem::take(&mut zc_inserts),
+                        )
+                        .await
+                        .is_ok();
+                    if flushed_ok {
                         // #527: net output for the io_uring protocol-error reply before close.
                         state_rc.borrow().counters.on_net_output(sent as u64);
                     }
@@ -2946,7 +2974,17 @@ async fn serve_connection_generic<R>(
             // OneShotFixed WRITE tier (#284): stage the reply through this shard's REGISTERED
             // fixed buffer when one is free and the reply fits, else the owned send. Byte-identical
             // output; hands the buffer back for reuse exactly like the owned `rt.send` did.
-            match rt.send_batch(&mut stream, std::mem::take(&mut out)).await {
+            // #515: `zc_inserts` is EMPTY in P3b (no caller pins yet), so `send_zc` carries no pinned
+            // regions -- exactly a `send_batch(out)`. When P4 pushes real pins, the store's in-flight
+            // fence upholds the pinned-region-outlives-CQE precondition of `send_zc`.
+            let flush_result = rt
+                .send_zc(
+                    &mut stream,
+                    std::mem::take(&mut out),
+                    std::mem::take(&mut zc_inserts),
+                )
+                .await;
+            match flush_result {
                 Ok(returned) => {
                     out = returned;
                     // #527: net output for the io_uring batch flush (one relaxed atomic add).
