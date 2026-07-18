@@ -3699,6 +3699,66 @@ mod tests {
     }
 
     #[test]
+    fn pinned_value_range_is_disjoint_from_the_freq_flags_byte() {
+        // #515 ZERO-COPY GET soundness invariant. `pin_value_frozen` hands the kernel the VALUE byte
+        // range (`str_value_bytes`) to splice, and holds a frozen slot `Arc` so no WRITE can mutate
+        // those bytes under the in-flight send. But a CONCURRENT read of the still-shared (pre-COW)
+        // entry may interior-mutably bump the S3-FIFO freq bits in the FLAGS byte (`blob[2]`) via
+        // `bump_freq_shared`. That is sound ONLY because the flags byte is STRICTLY DISJOINT from the
+        // pinned value range: the freq write and the kernel's value read touch different bytes. This
+        // test locks that layout invariant, so a future change that widens the value range to cover
+        // the flags byte (or moves the freq bits into the value span) fails loudly here rather than
+        // introducing a live torn-read / data race on the zero-copy path.
+        let value = vec![b'V'; 4096];
+        let e = Entry::str_from_bytes(b"some-key", &value, Some(UnixMillis(999)));
+
+        let blob = e.str_blob().expect("a Str entry has a str blob");
+        let blob_base = blob.as_ptr() as usize;
+        let val = e.str_value_bytes();
+        let val_start = val.as_ptr() as usize;
+        let val_end = val_start + val.len();
+        // The flags byte the freq bump patches lives at blob offset 2.
+        let flags_addr = blob_base + 2;
+
+        assert_eq!(val, &value[..], "sanity: the value reads back");
+        assert!(
+            flags_addr < val_start,
+            "flags byte (offset 2) must lie BEFORE the pinned value range \
+             (flags @ {flags_addr:#x}, value starts @ {val_start:#x})"
+        );
+        // The single freq-flags byte [flags_addr, flags_addr+1) is fully outside the pinned value
+        // range [val_start, val_end): either it ends at/before the range start (flags_addr < val_start,
+        // the actual layout) or begins at/after the range end.
+        assert!(
+            flags_addr < val_start || val_end <= flags_addr,
+            "the freq flags byte must not overlap the pinned value range"
+        );
+
+        // A freq bump must NOT move or realloc the value (the pin captured its ptr) and must NOT
+        // change any value byte -- it patches only the disjoint flags byte.
+        let before_ptr = val_start;
+        for _ in 0..3 {
+            e.bump_freq_shared();
+        }
+        let after = e.str_value_bytes();
+        assert_eq!(
+            after.as_ptr() as usize,
+            before_ptr,
+            "the value pointer the pin captured must be stable across a freq bump (no realloc/move)"
+        );
+        assert_eq!(
+            after,
+            &value[..],
+            "the value bytes are untouched by the freq bump"
+        );
+        assert_eq!(
+            e.freq(),
+            3,
+            "the freq bump did land (in the disjoint flags byte)"
+        );
+    }
+
+    #[test]
     fn bump_freq_shared_is_byte_identical_to_bump_freq_over_a_full_sweep() {
         // Drive both bump variants through the same access sequence and assert the freq
         // agrees at every step: the shared read-path bump must select the SAME S3-FIFO

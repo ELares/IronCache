@@ -2691,6 +2691,18 @@ async fn serve_connection_generic<R>(
     // cancelled send reads valid memory. Drained (taken) with `zc_inserts` at every flush; EMPTY in
     // P4b (nothing pins yet), so the flush is byte-identical. P4c's `get_home_by_ref` pushes here.
     let mut zc_pins: Vec<Box<dyn core::any::Any>> = Vec::new();
+    // #515 P4c: INSTALL this shard thread's zero-copy GET sink (once per thread -- idempotent), so
+    // `get_home_by_ref` splices a large String hit's value straight from the store instead of copying
+    // it into `out`. Installed ONLY here (the io_uring serve loop); the tokio loop never installs one,
+    // so `get_home_by_ref` there always copies. Left installed for the thread's life -- every command
+    // drains it back to empty (see `drain_zc_sink` / `ZC_SINK`), so sharing it across the connections
+    // multiplexed on this shard thread is sound.
+    ZC_SINK.with(|c| {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            *g = Some(ZcSink::default());
+        }
+    });
     // CROSS-SHARD HOP OVERLAP (#8 / #514): the run of DEFERRED remote hops awaiting assembly, mirrored
     // from the tokio serve loop. Parked as they are decoded and drained (in order) at the next barrier /
     // error / end of batch, so a run of pipelined remote-key ops overlaps the owner's work instead of
@@ -2794,6 +2806,13 @@ async fn serve_connection_generic<R>(
                         batch.advance(consumed);
                         continue;
                     }
+                    // #515 P4c: DRAIN this command's zero-copy splices (a large home-GET hit may have
+                    // pinned its value + pushed a splice) into the flush lists. This runs with NO
+                    // `.await` since `route_and_dispatch` returned, so the sink holds exactly THIS
+                    // command's splices and no other multiplexed connection can have raced it. Capture
+                    // the pre-drain length so the barrier below can re-base only this command's offsets.
+                    let zc_added_from = zc_inserts.len();
+                    drain_zc_sink(&mut zc_inserts, &mut zc_pins);
                     // BARRIER (any synchronous / control / home / fan-out / blocking command): if a run of
                     // hops is pending, splice their replies into `out` BEFORE this command's already-
                     // encoded output (FIFO), running each hop's deferred hooks in order. `split_off` lifts
@@ -2815,8 +2834,17 @@ async fn serve_connection_generic<R>(
                             &inbox,
                         )
                         .await;
+                        // #515 P4c: the hop replies were spliced BEFORE this command's bytes, shifting
+                        // this command's region forward by exactly the bytes inserted ahead of it. Its
+                        // zero-copy splice offsets (`ZcInsert::at`, absolute into `out`) must move by the
+                        // same delta; offsets from EARLIER commands sit before `out_before` and are
+                        // untouched by the `split_off`, so only `[zc_added_from..]` is re-based.
+                        let zc_shift = out.len() - out_before;
                         out_before = out.len();
                         out.extend_from_slice(&barrier_bytes);
+                        for zi in &mut zc_inserts[zc_added_from..] {
+                            zi.at += zc_shift;
+                        }
                     }
                     // COMMANDSTATS / ERRORSTATS (#413): record this command's elapsed micros +
                     // outcome on the serving shard (ALWAYS, the call/usec/failed tally INFO reads).
@@ -2874,10 +2902,14 @@ async fn serve_connection_generic<R>(
                         encode_into(&mut out, &reply, conn.proto);
                     }
                     if close {
-                        let sent = out.len();
-                        // #515: `zc_inserts` is EMPTY in P3b (nothing pins), so `send_zc` carries no
-                        // pinned regions -- exactly a `send_batch(out)`. P4's real pins are kept valid
-                        // until the CQE by the store's in-flight fence (send_zc's precondition).
+                        // #515: the flush SPLICES the pinned zero-copy value regions (`zc_inserts`)
+                        // into the wire stream straight from the store, so the bytes actually SENT are
+                        // `out` PLUS those pinned regions -- count both for the net-output stat. Empty
+                        // `zc_inserts` (no large GET in this batch) makes the flush byte-identical to a
+                        // plain `send_batch(out)`. The pins (`zc_pins`) are OWNED by `send_zc` until its
+                        // CQE, so the pinned store bytes stay valid for the kernel read even if the send
+                        // is cancelled (the #576-COW keeps the frozen value immutable meanwhile).
+                        let sent = out.len() + zc_inserts.iter().map(|i| i.len).sum::<usize>();
                         let flushed_ok = rt
                             .send_zc(
                                 &mut stream,
@@ -2924,10 +2956,9 @@ async fn serve_connection_generic<R>(
                         .await;
                     }
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
-                    let sent = out.len();
-                    // #515: `zc_inserts` is EMPTY in P3b (nothing pins), so `send_zc` carries no pinned
-                    // regions -- exactly a `send_batch(out)`. P4's real pins are kept valid until the
-                    // CQE by the store's in-flight fence (send_zc's precondition).
+                    // #515: bytes SENT = `out` plus the spliced pinned regions (see the QUIT flush
+                    // above). `zc_pins` is owned by `send_zc` until its CQE.
+                    let sent = out.len() + zc_inserts.iter().map(|i| i.len).sum::<usize>();
                     let flushed_ok = rt
                         .send_zc(
                             &mut stream,
@@ -2977,13 +3008,16 @@ async fn serve_connection_generic<R>(
         }
 
         if !out.is_empty() {
-            let sent = out.len();
             // OneShotFixed WRITE tier (#284): stage the reply through this shard's REGISTERED
             // fixed buffer when one is free and the reply fits, else the owned send. Byte-identical
             // output; hands the buffer back for reuse exactly like the owned `rt.send` did.
-            // #515: `zc_inserts` is EMPTY in P3b (no caller pins yet), so `send_zc` carries no pinned
-            // regions -- exactly a `send_batch(out)`. When P4 pushes real pins, the store's in-flight
-            // fence upholds the pinned-region-outlives-CQE precondition of `send_zc`.
+            // #515: bytes SENT = `out` plus the spliced pinned zero-copy value regions (`zc_inserts`),
+            // which are NOT copied into `out` -- count both for the net-output stat. Empty `zc_inserts`
+            // (no large GET this batch) makes the flush byte-identical to a plain `send_batch(out)`. A
+            // large GET always writes its `$len\r\n..\r\n` framing into `out`, so `out` is non-empty
+            // whenever `zc_inserts` is (this guard never skips a pending splice). The pins (`zc_pins`)
+            // are OWNED by `send_zc` until its CQE.
+            let sent = out.len() + zc_inserts.iter().map(|i| i.len).sum::<usize>();
             let flush_result = rt
                 .send_zc(
                     &mut stream,
@@ -7284,6 +7318,152 @@ fn handle_request(
     conn.should_close
 }
 
+/// #515 ZERO-COPY GET size floor. A present String value at or above this many bytes takes the
+/// zero-copy home-GET path (its bytes are spliced into the socket write straight from the store,
+/// never copied into `out`); a smaller value takes the by-reference COPY path (#511), because for a
+/// small value the fixed zero-copy bookkeeping -- a slot-`Arc` clone (one atomic), a boxed
+/// [`ironcache_store::ZcPin`], and an extra `iovec` in the writev -- costs more than just memcpying
+/// the bytes into `out`. 16 KiB is a conservative break-even: well above where the pin overhead is
+/// amortized, so the elided copy is always a net win, and small/medium values are byte-for-byte the
+/// pre-#515 path. Applies ONLY on the io_uring serve loop (the only loop that installs a
+/// [`struct@ZC_SINK`] and issues the vectored `send_zc`); the tokio loop always copies.
+const ZC_THRESHOLD: usize = 16 * 1024;
+
+/// The per-shard-thread ZERO-COPY GET sink (#515 P4c). See [`ZC_SINK`] / [`push_zc_bulk`].
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+#[derive(Default)]
+struct ZcSink {
+    /// The ordered value SPLICES (offset in `out` + pinned `(ptr, len)`) for this batch's flush.
+    inserts: Vec<ironcache_runtime::ZcInsert>,
+    /// The frozen-slot handles (type-erased [`ironcache_store::ZcPin`]s) backing those splices; the
+    /// io_uring `send_zc` takes ownership of these until its CQE so the bytes outlive the write.
+    pins: Vec<Box<dyn core::any::Any>>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+thread_local! {
+    /// ZERO-COPY GET sink for THIS shard thread (#515 P4c). The io_uring serve loop
+    /// ([`serve_connection_generic`]) installs one (`Some`) on its shard thread; [`get_home_by_ref`]
+    /// pushes a large String hit's frozen-value pin + splice offset here INSTEAD of copying the bytes
+    /// into `out`, and the loop DRAINS it (via [`drain_zc_sink`]) into the flush's `zc_inserts`/
+    /// `zc_pins` immediately after every `route_and_dispatch` returns.
+    ///
+    /// SOUNDNESS of the shared thread-local across the connections multiplexed on this shard thread:
+    /// the ONLY pusher ([`get_home_by_ref`]) is fully SYNCHRONOUS, and `route_and_dispatch`'s
+    /// home-GET path has NO `.await` between that push and the loop's drain (the post-dispatch
+    /// blocking-wake + keyspace-publish are both sync, and a GET wakes/publishes nothing). So the sink
+    /// is always drained back to empty before the loop's next yield -- no other connection can ever
+    /// observe another's pins at an await boundary. The TOKIO serve loop never installs a sink, so
+    /// `get_home_by_ref` there finds `None` and copies via `encode_bulk_ref` (byte-identical to #511).
+    static ZC_SINK: core::cell::RefCell<Option<ZcSink>> = const { core::cell::RefCell::new(None) };
+}
+
+/// Is a zero-copy GET sink installed on THIS thread (i.e. are we on an io_uring serve loop)? A single
+/// thread-local borrow + `is_some`. On a non-io_uring build there is no sink type, so this is a
+/// compile-time `false` and every GET takes the copy path.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+fn zc_sink_active() -> bool {
+    ZC_SINK.with(|c| c.borrow().is_some())
+}
+#[cfg(not(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+)))]
+const fn zc_sink_active() -> bool {
+    false
+}
+
+/// PIN a present large String value for a zero-copy send and frame it into `out` (#515 P4c). Called
+/// ONLY after [`zc_sink_active`] returned true and the by-ref classify saw a String hit at/above
+/// [`ZC_THRESHOLD`], so the sink IS installed and the key IS live (same synchronous `borrow_mut`
+/// scope, no await, no other code interleaves). Frames `$<len>\r\n` then the SPLICE POINT then `\r\n`
+/// -- the value bytes are NOT copied into `out`; the send interleaves them from the pin at that
+/// offset. Returns `true` on success. Returns `false` (leaving `out` UNTOUCHED) only in the
+/// unreachable-in-practice case that the re-probe misses or the sink vanished, so the caller can fall
+/// back to a copy and never desync the reply.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+fn push_zc_bulk(
+    store: &ShardStoreImpl,
+    db: u32,
+    key: &[u8],
+    now: UnixMillis,
+    out: &mut Vec<u8>,
+) -> bool {
+    // Re-probe under the SAME `borrow_mut` to obtain the slot-`Arc`-backed pin. `pin_value_frozen`
+    // holds a clone of the value's slot `Arc`, so any later (or concurrent) write to that key COWs
+    // the live slot and this frozen clone keeps the ORIGINAL bytes valid + immutable until dropped
+    // (the #576 mechanism) -- no fence, no copy. `None` is unreachable here (we just read the key as a
+    // live String in this same scope), so a `None` cleanly declines to the caller's copy fallback.
+    let Some(pin) = store.pin_value_frozen(db, key, now) else {
+        return false;
+    };
+    ZC_SINK.with(|c| {
+        let mut g = c.borrow_mut();
+        let Some(sink) = g.as_mut() else {
+            // Unreachable (the caller checked `zc_sink_active`, and nothing uninstalls the sink);
+            // decline WITHOUT having written the header, so `out` is pristine for the copy fallback.
+            return false;
+        };
+        // Header, then the splice offset (`at` = where the value logically goes: after `out[..at]`,
+        // before the trailing CRLF), then the trailing CRLF. `send_zc` splices the pinned bytes at
+        // `at`, reproducing exactly `encode_bulk_ref`'s `$<len>\r\n<bytes>\r\n` on the wire.
+        ironcache_protocol::encode_bulk_len_prefix(out, pin.len());
+        let at = out.len();
+        sink.inserts.push(ironcache_runtime::ZcInsert {
+            at,
+            ptr: pin.as_ptr(),
+            len: pin.len(),
+        });
+        sink.pins.push(Box::new(pin));
+        out.extend_from_slice(b"\r\n");
+        true
+    })
+}
+#[cfg(not(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+)))]
+fn push_zc_bulk(_: &ShardStoreImpl, _: u32, _: &[u8], _: UnixMillis, _: &mut Vec<u8>) -> bool {
+    // No io_uring send_zc on this target; `zc_sink_active()` is a const `false`, so this is never
+    // reached. Present only so `get_home_by_ref` compiles identically across targets.
+    false
+}
+
+/// DRAIN this shard thread's zero-copy sink into the flush's insert/pin lists (#515 P4c). Called by
+/// the io_uring serve loop immediately after each `route_and_dispatch` returns -- a window with NO
+/// `.await`, so the sink holds exactly THIS command's splices (a home GET may have pushed one) and no
+/// other multiplexed connection can have raced it (see [`ZC_SINK`]). Moves the elements out (leaving
+/// the sink empty for the next command); a no-op fast path when the command pinned nothing.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+fn drain_zc_sink(
+    inserts: &mut Vec<ironcache_runtime::ZcInsert>,
+    pins: &mut Vec<Box<dyn core::any::Any>>,
+) {
+    ZC_SINK.with(|c| {
+        if let Some(sink) = c.borrow_mut().as_mut() {
+            if !sink.inserts.is_empty() {
+                inserts.append(&mut sink.inserts);
+                pins.append(&mut sink.pins);
+            }
+        }
+    });
+}
+
 /// #511 GET-BY-REFERENCE HOME FAST PATH. Answer a plain 2-arg `GET` served on its home shard by
 /// framing the RESP bulk string DIRECTLY from the stored value bytes into `out`, dropping the
 /// `Bytes::copy_from_slice` + `Value::BulkString` allocation `cmd_get` pays (root cause #2 of the
@@ -7335,14 +7515,28 @@ fn get_home_by_ref(
     let lazy_expired;
     {
         let mut store = store_rc.borrow_mut();
-        match store.read(conn.db, key, now) {
+        // Classify the read; for the COPY path frame the reply inline from the borrowed value bytes.
+        // For the #515 ZERO-COPY path we only DECIDE here (`true`): the value is pinned AFTER `v`'s
+        // borrow of `store` ends (below), because `pin_value_frozen` also borrows `store` (`&self`)
+        // and must not overlap the `read` borrow.
+        let defer_zc = match store.read(conn.db, key, now) {
             Some(v) if v.data_type() == DataType::String => {
-                // HAPPY PATH: frame `$<len>\r\n<bytes>\r\n` straight from the stored bytes into
-                // `out` -- no `Bytes::copy_from_slice`, no `Value::BulkString`. `out` is a distinct
-                // buffer from `store`, so `v.as_bytes()` (a borrow into the store) and `&mut out` do
-                // not alias; the borrow ends at the arm boundary, inside the store scope.
-                ironcache_protocol::encode_bulk_ref(out, v.as_bytes());
                 deltas.keyspace_hits += 1;
+                let bytes = v.as_bytes();
+                // #515 ZERO-COPY GET: a LARGE value on the io_uring serve loop is SPLICED into the
+                // socket write straight from the store -- its bytes are NEVER copied into `out`. A
+                // small value, or any value on the tokio loop (`zc_sink_active()` is a const `false`
+                // off io_uring), takes the by-ref COPY fast path (#511): frame `$<len>\r\n<bytes>\r\n`
+                // straight from the stored bytes into `out` -- no `Bytes::copy_from_slice`, no
+                // `Value::BulkString`. `out` is a distinct buffer from `store`, so `v.as_bytes()` (a
+                // borrow into the store) and `&mut out` do not alias; the borrow ends at the arm
+                // boundary, inside the store scope.
+                if bytes.len() >= ZC_THRESHOLD && zc_sink_active() {
+                    true
+                } else {
+                    ironcache_protocol::encode_bulk_ref(out, bytes);
+                    false
+                }
             }
             Some(_) => {
                 // A non-string key: byte-identical to `cmd_get`'s WRONGTYPE reply. Rare, off the hot
@@ -7352,12 +7546,27 @@ fn get_home_by_ref(
                     &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_type()),
                     conn.proto,
                 );
+                false
             }
             None => {
                 // Missing OR lazily-expired: the null reply (`$-1` RESP2 / `_` RESP3), a keyspace
                 // MISS. Byte-identical to `cmd_get`'s `Value::Null`.
                 encode_into(out, &ironcache_server::Value::Null, conn.proto);
                 deltas.keyspace_misses += 1;
+                false
+            }
+        };
+        // `v` (and its borrow of `store`) is now dropped, so `store` is free to pin. Frame the large
+        // value's reply via the zero-copy splice. `push_zc_bulk` re-probes under this SAME synchronous
+        // `borrow_mut` (no await, nothing else runs), so it is guaranteed to find the still-live key;
+        // its `false` return is the unreachable-in-practice defensive fallback (re-read + copy) so a
+        // missed pin can never desync the reply.
+        if defer_zc && !push_zc_bulk(&store, conn.db, key, now, out) {
+            match store.read(conn.db, key, now) {
+                Some(v) if v.data_type() == DataType::String => {
+                    ironcache_protocol::encode_bulk_ref(out, v.as_bytes());
+                }
+                _ => encode_into(out, &ironcache_server::Value::Null, conn.proto),
             }
         }
         // Drain the lazy-backstop expiry count `store.read` may have produced (a GET of an expired

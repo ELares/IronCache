@@ -1454,6 +1454,23 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// `(ptr, len)` stays valid + immutable for as long as the `ZcPin` is held (the io_uring send owns
     /// it until its CQE), with NO fence and NO copy -- a mutation of the pinned key just forks the live
     /// slot. `None` for an absent / logically-expired / non-String key.
+    ///
+    /// # Immutability scope (what "stays valid + immutable" covers)
+    ///
+    /// The guarantee is over the returned `(ptr, len)` -- the VALUE byte range, `blob[val_off..]`,
+    /// which is the ONLY range the zero-copy send hands to the kernel. That range is immutable while
+    /// the pin is held: every value-MUTATING or value-FREEING store path (overwrite, delete, lazy/
+    /// active expiry, eviction, RENAME, FLUSHDB/ALL, in-place APPEND/SETRANGE, begin_save) funnels
+    /// through [`Arc::make_mut`] on the slot, which -- with the pin holding a second strong ref -- deep-
+    /// clones the slot into a fresh table and leaves THIS pin sole-owning the ORIGINAL blob (the #576
+    /// COW). The rest of the blob is NOT part of this promise: a CONCURRENT read of the still-shared
+    /// (pre-COW) entry may interior-mutably bump the S3-FIFO freq bits in the FLAGS byte (`blob[2]`,
+    /// via [`Entry::bump_freq_shared`]). That is SOUND for the send precisely because the flags byte
+    /// sits BEFORE the key and the value range sits AFTER it (`2 < val_off`; see
+    /// [`Entry::str_value_bytes`]), so the freq write and the kernel's value read touch STRICTLY
+    /// DISJOINT bytes -- no torn value, no data race on any shared location. INVARIANT: the pinned
+    /// range must never widen to include the flags byte (asserted by
+    /// `pinned_value_range_is_disjoint_from_the_freq_flags_byte` in `kvobj`).
     #[must_use]
     pub fn pin_value_frozen(&self, db: u32, key: &[u8], now: UnixMillis) -> Option<ZcPin> {
         let db_idx = self.db_index(db);
