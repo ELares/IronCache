@@ -321,23 +321,26 @@ pub trait BatchedRecvSend: Runtime<Buf = Vec<u8>, Error = std::io::Error> {
     /// and every non-zero-copy reply) lives in `out`; only the value bytes are by-pointer.
     /// RETURNS `out` for reuse. Empty `inserts` is exactly a `send_batch(out)` (byte-identical).
     ///
-    /// # Safety
+    /// # Precondition (the pinned-region contract)
     ///
     /// Each `ZcInsert`'s `(ptr, len)` MUST stay valid + immutable until this send's CQE is reaped,
     /// INCLUDING if the returned future is dropped in flight (the op owns `out` + the iovec array, but
-    /// NOT the pinned regions). The caller upholds this with the store's in-flight fence (it reaps the
-    /// send before freeing any pinned value, and drains on connection close). `inserts` must be sorted
-    /// by `at` ascending with each `at <= out.len()`.
+    /// NOT the pinned regions). Violating it lets the kernel `writev` (or the fallback's
+    /// `from_raw_parts`) read freed memory. `inserts` must be sorted by `at` ascending with each
+    /// `at <= out.len()`.
+    ///
+    /// This is a SAFE fn carrying a caller precondition (rather than an `unsafe fn`) BECAUSE its only
+    /// caller -- the serve loop in the `#![forbid(unsafe_code)]` `ironcache` crate -- cannot write an
+    /// `unsafe` block, and the pins cannot be a lifetime-bound `&[u8]` (they must outlive the `.await`,
+    /// which a store borrow held across the await would forbid). The obligation is instead upheld
+    /// STRUCTURALLY by the store's in-flight fence: it reaps this send before freeing any pinned value
+    /// (every value-pointee free site drains it), and the connection-close path drains before drop.
+    /// That whole-system invariant is verified by the #515 UAF stress test.
     ///
     /// The io_uring backend overrides this with a real vectored `writev`; the DEFAULT materializes the
     /// splice into one contiguous buffer + [`Self::send_batch`] (correct + byte-identical, but copies
     /// the values -- the fallback for a backend without a vectored op).
-    ///
-    /// This is an `unsafe fn` because its soundness rests on the pinned-region contract above, which
-    /// the type system cannot enforce: a caller supplying `(ptr, len)` that the store frees before the
-    /// CQE would let the kernel `writev` (or the fallback's `from_raw_parts`) read freed memory. The
-    /// caller asserts, by using `unsafe`, that it upholds the pin (via the store's in-flight fence).
-    unsafe fn send_zc(
+    fn send_zc(
         &self,
         stream: &mut Self::Stream,
         out: Vec<u8>,
