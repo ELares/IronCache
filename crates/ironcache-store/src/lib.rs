@@ -280,6 +280,17 @@ fn scan_plan<'a>(
 /// Generic over the hook types so PR-3 can swap in the real S3-FIFO eviction and
 /// the jemalloc accounting without touching the waist; PR-2a defaults to
 /// [`NullEviction`] and [`CountingAccounting`].
+/// A boxed ring-drain callback for the #515 zero-copy fence, wrapped so it satisfies the
+/// `#[derive(Debug)]` on [`ShardStore`] (a closure is not `Debug`, unlike the `WriteObserver: Debug`
+/// bound the observer uses). Prints opaquely.
+struct ZcDrainCallback(Box<dyn FnMut()>);
+
+impl std::fmt::Debug for ZcDrainCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ZcDrainCallback(..)")
+    }
+}
+
 #[derive(Debug)]
 pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = CountingAccounting> {
     /// Per-database, per-SLOT SwissTables (#570), each storing a single-allocation
@@ -437,6 +448,24 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// no second field to keep in sync. When `None`, [`Self::touch_dirty`] does that single
     /// compare and returns with NO set probe and NO key allocation on the non-tracking hot path.
     dirty_keys: Option<HashSet<(u32, Box<[u8]>)>>,
+    /// ZERO-COPY GET in-flight count (#515 P2, INERT/default-off): the number of GET replies whose
+    /// value SEGMENT is a raw `(ptr,len)` pointing DIRECTLY at a live entry's inline value blob and
+    /// whose `writev` send has been SUBMITTED but not yet reaped (the pin window). A value pointee is
+    /// freed ONLY by an overwrite/remove/blob-realloc of its OWN key, all of which funnel through the
+    /// mutation sites guarded by [`Self::drain_barrier`]; that guard, when this count is non-zero,
+    /// reaps the outstanding send(s) BEFORE the free so the kernel never reads freed bytes. A plain
+    /// `u32` (single-writer-per-shard, ADR-0002/0005), `0` at boot and while no caller pins, so
+    /// `drain_barrier` is a single `!= 0` compare on the write hot path (the same cost profile as the
+    /// `repl_active` / `watched_count == 0` gates). Nothing sets it yet (P4 wires the flush), so the
+    /// fence is fully INERT.
+    inflight_zc: u32,
+    /// The installed ring-DRAIN callback (#515 P2, INERT/default-off): a `FnMut()` that SYNCHRONOUSLY
+    /// reaps this shard's outstanding zero-copy send CQEs (so their pinned value pointees are no
+    /// longer referenced by the kernel). Runtime-agnostic: the store never touches the ring; serve
+    /// installs a closure over its ring driver via [`Self::install_zc_drain_callback`]. Invoked by
+    /// [`Self::drain_barrier`] only when `inflight_zc != 0`, then the count is reset to 0. `None` by
+    /// default and no caller installs it yet, so the fence never fires (INERT until P4).
+    zc_drain_callback: Option<ZcDrainCallback>,
     /// PASSIVE-REPLICA mode (HA-7d, CARRY-FORWARD 2): when `true`, this shard is a replica
     /// that mirrors a primary, so it removes keys ONLY from the replication stream (the
     /// primary's `StreamDel`), never on its own. A due key is reported as logically expired
@@ -665,6 +694,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // `touch_dirty` is a single compare-and-return at each write-funnel fire (the same
             // cost profile as the WATCH / observer gates). `enable_dirty_tracking` turns it on.
             dirty_keys: None,
+            // No zero-copy GET send in flight at boot (#515 P2): `0` is the fast-path gate, so
+            // `drain_barrier` is a single compare-and-return at each write-funnel free site. Nothing
+            // pins a value yet (the flush wires it in P4), so the fence is fully INERT.
+            inflight_zc: 0,
+            zc_drain_callback: None,
             passive: false,
             // The collection-encoding thresholds default to the compiled Redis defaults (#40), so a
             // store built without an explicit snapshot is byte-identical to the pre-runtime-threshold
@@ -1119,6 +1153,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn put_object(&mut self, db: u32, db_idx: usize, key: &[u8], obj: Entry) -> bool {
+        // #515 P2 fence: an OVERWRITE (the Occupied arm below) frees the old value pointee; reap any
+        // in-flight zero-copy send that pins it first. INERT until P4 (a single `== 0` compare here).
+        self.drain_barrier();
         // WATCH notify (PR-10b): a create or overwrite of a watched key bumps its
         // version (gated behind the watched_count fast path inside touch_watch). This
         // fires for a create on a watched-ABSENT key too (a watched-absent key now
@@ -1195,6 +1232,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn remove_object(&mut self, db: u32, db_idx: usize, key: &[u8]) -> bool {
+        // #515 P2 fence: a REMOVAL frees the value pointee; reap any in-flight zero-copy send that
+        // pins it first. INERT until P4 (a single `== 0` compare here). This funnel covers DELETE,
+        // lazy+active expiry, FLUSHDB/FLUSHALL, eviction, and a RENAME's source removal.
+        self.drain_barrier();
         // WATCH notify (PR-10b): a delete or expiry of a watched key bumps its version.
         // Because the lazy/active expiry paths reach here (expire_if_due / reap_if_expired
         // both call remove_object), a watched key that expires is dirtied too, and
@@ -1242,6 +1283,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         key: &[u8],
         bytes: usize,
     ) -> bool {
+        // #515 P2 fence: this REMOVAL frees the value pointee; reap any in-flight zero-copy send that
+        // pins it first. INERT until P4 (a single `== 0` compare here).
+        self.drain_barrier();
         // WATCH notify (PR-10b): the in-place Delete / empty-collection path also
         // touches a watched key's version (a collection drained to empty by an edit is a
         // modification, like any delete).
@@ -1275,6 +1319,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// add/remove of the deadline rebuilds the blob (the 8-byte field appears/
     /// disappears); a deadline-only change patches in place. A no-op if the key is gone.
     fn set_entry_expire(&mut self, db_idx: usize, key: &[u8], deadline: Option<UnixMillis>) {
+        // #515 P2 fence: for a Str entry, adding/removing a TTL REBUILDS the inline blob (freeing the
+        // old value pointee), so reap any in-flight zero-copy send that pins it first. INERT until P4.
+        self.drain_barrier();
         let h = self.key_hash(key);
         let slot = slot_index(key, self.slots);
         // A TTL write is a MUTATION, so it takes `Arc::make_mut` (COW): during a save this
@@ -1289,6 +1336,76 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         {
             obj.set_expire_at(deadline);
         }
+    }
+
+    /// #515 P2 (INERT): the ZERO-COPY IN-FLIGHT FENCE. Called at the TOP of every value-pointee free
+    /// site (overwrite / remove / TTL-blob-realloc / direct purge) BEFORE the free. When a zero-copy
+    /// GET send is in flight (`inflight_zc != 0`), SYNCHRONOUSLY reap it via the installed drain
+    /// callback so the kernel is done reading the pinned value bytes, THEN clear the count -- so the
+    /// subsequent free never races an in-flight send (no use-after-free). When nothing is pinned (the
+    /// default, and always in P2 since no caller sets `inflight_zc`) this is a single `== 0` compare,
+    /// byte-unchanged on the write hot path. The callback reaps the ring only; it never re-enters the
+    /// store (no recursion into these funnels).
+    #[inline]
+    fn drain_barrier(&mut self) {
+        if self.inflight_zc == 0 {
+            return;
+        }
+        if let Some(cb) = self.zc_drain_callback.as_mut() {
+            (cb.0)();
+        }
+        self.inflight_zc = 0;
+    }
+
+    /// Install the ring-DRAIN callback the zero-copy fence uses (#515). Serve installs a closure that
+    /// synchronously reaps this shard's outstanding zero-copy send CQEs; the store stays
+    /// runtime-agnostic (it never touches the ring). Replaces any prior callback.
+    pub fn install_zc_drain_callback(&mut self, cb: Box<dyn FnMut()>) {
+        self.zc_drain_callback = Some(ZcDrainCallback(cb));
+    }
+
+    /// Note that ONE more zero-copy GET value has been pinned into an in-flight send (#515): the fence
+    /// will now reap before freeing any value. The flush clears the count once the send is reaped
+    /// ([`Self::clear_zc_inflight`]), or [`Self::drain_barrier`] clears it on a conflicting mutation.
+    pub fn note_zc_inflight(&mut self) {
+        self.inflight_zc = self.inflight_zc.saturating_add(1);
+    }
+
+    /// Clear the in-flight zero-copy count after a batch's send(s) have been reaped (#515).
+    pub fn clear_zc_inflight(&mut self) {
+        self.inflight_zc = 0;
+    }
+
+    /// The current in-flight zero-copy count (#515), for the flush accounting + tests.
+    #[must_use]
+    pub fn zc_inflight(&self) -> u32 {
+        self.inflight_zc
+    }
+
+    /// PIN `key`'s STRING value for a zero-copy send (#515): return a raw `(ptr, len)` into the LIVE
+    /// entry's inline value blob, or `None` when the key is absent, logically expired at `now`, or not
+    /// a String. The pointer is STABLE across a table resize (the value bytes are OUT of the bucket:
+    /// the `Entry` is an 8-byte pointer the resize relocates, but not its pointee), so ONLY an
+    /// overwrite/remove/TTL-realloc of THIS exact key frees it -- which [`Self::drain_barrier`] reaps
+    /// the send before.
+    ///
+    /// # Safety contract (caller)
+    ///
+    /// The returned pointer aliases store-owned memory. The caller MUST NOT let it outlive the pin:
+    /// pair this with [`Self::note_zc_inflight`] before submitting the send, and rely on the store's
+    /// `drain_barrier` fence (fired at every value-pointee free) to reap the send before the value can
+    /// be freed. Reading through the pointer after the value is freed is undefined behavior.
+    #[must_use]
+    pub fn pin_value(&self, db: u32, key: &[u8], now: UnixMillis) -> Option<(*const u8, usize)> {
+        let db_idx = self.db_index(db);
+        let table = self.slot_table(db_idx, key)?;
+        let h = self.key_hash(key);
+        let obj = table.find(h, |e| e.key() == key)?;
+        if obj.data_type() != DataType::String || obj.is_expired(now) {
+            return None;
+        }
+        let bytes = obj.str_value_bytes();
+        Some((bytes.as_ptr(), bytes.len()))
     }
 
     /// Build the read-borrow view for an entry. Memory Round 3: an int-encoded value
@@ -2872,6 +2989,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// Two phases per database so no table borrow is held across the mutation: COLLECT the matching
     /// keys (a bounded owned `Vec`), then remove each via the crediting removal path.
     pub fn remove_keys_where<P: Fn(&[u8]) -> bool>(&mut self, pred: P) -> usize {
+        // #515 P2 fence: this purge frees value pointees via a DIRECT `occ.remove()` that BYPASSES
+        // `remove_object` (the sole such bypass), so it needs its own fence: reap any in-flight
+        // zero-copy send before freeing. Once, before the removal phase (the drain clears the count).
+        // INERT until P4 (a single `== 0` compare here).
+        self.drain_barrier();
         let mut removed = 0usize;
         for db_idx in 0..self.dbs.len() {
             // Phase 1: collect the matching keys across every slot table of the DB (#570),
@@ -4711,5 +4833,152 @@ mod dirty_tracking_tests {
         );
         store.enable_dirty_tracking();
         assert_eq!(store.dirty_key_count(), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod zc_fence_tests {
+    //! #515 P2: the zero-copy in-flight fence (`inflight_zc` + `drain_barrier` + `pin_value`). Proves
+    //! (a) when a zero-copy send is pinned (`note_zc_inflight`), every value-pointee free funnel reaps
+    //! it via the installed drain callback BEFORE the free; (b) the gate is INERT when nothing is
+    //! pinned (byte-unchanged hot path); and (c) `pin_value`'s pointer is STABLE across a table resize
+    //! (the value bytes are out-of-bucket), the soundness fact the whole feature rests on.
+
+    use super::*;
+    use ironcache_storage::{ExpireWrite, NewValue, Store};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const NOW: UnixMillis = UnixMillis(0);
+
+    /// Install a drain callback that counts its firings; returns the store + the shared counter.
+    fn store_with_counting_drain() -> (ShardStore, Rc<Cell<u32>>) {
+        let mut store = ShardStore::new(2);
+        let counter = Rc::new(Cell::new(0u32));
+        let c = Rc::clone(&counter);
+        store.install_zc_drain_callback(Box::new(move || c.set(c.get() + 1)));
+        (store, counter)
+    }
+
+    #[test]
+    fn fence_reaps_before_every_free_funnel_when_armed() {
+        let (mut store, drained) = store_with_counting_drain();
+        store.upsert(0, b"k", NewValue::Bytes(b"v1"), ExpireWrite::Clear, NOW);
+        assert_eq!(
+            drained.get(),
+            0,
+            "a Vacant insert with nothing pinned does not drain"
+        );
+
+        // OVERWRITE (put_object Occupied) frees the old pointee -> must reap the pinned send first.
+        store.note_zc_inflight();
+        assert_eq!(store.zc_inflight(), 1);
+        store.upsert(0, b"k", NewValue::Bytes(b"v2"), ExpireWrite::Clear, NOW);
+        assert_eq!(drained.get(), 1, "overwrite drained the fence");
+        assert_eq!(
+            store.zc_inflight(),
+            0,
+            "the fence cleared the in-flight count"
+        );
+
+        // DELETE (remove_object) frees the pointee.
+        store.note_zc_inflight();
+        assert!(store.delete(0, b"k", NOW));
+        assert_eq!(drained.get(), 2, "delete drained");
+        assert_eq!(store.zc_inflight(), 0);
+
+        // remove_keys_where: the DIRECT-free bypass (its own fence).
+        store.upsert(0, b"j", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        store.note_zc_inflight();
+        assert_eq!(store.remove_keys_where(|key| key == b"j"), 1);
+        assert_eq!(drained.get(), 3, "remove_keys_where (direct free) drained");
+        assert_eq!(store.zc_inflight(), 0);
+    }
+
+    #[test]
+    fn fence_is_inert_when_nothing_is_pinned() {
+        // A callback is installed but NOTHING is pinned (`inflight_zc == 0`): the `== 0` gate makes
+        // every funnel a no-op, so the callback never fires -- the byte-unchanged hot path.
+        let (mut store, drained) = store_with_counting_drain();
+        store.upsert(0, b"k", NewValue::Bytes(b"v1"), ExpireWrite::Clear, NOW);
+        store.upsert(0, b"k", NewValue::Bytes(b"v2"), ExpireWrite::Clear, NOW); // overwrite
+        assert!(store.delete(0, b"k", NOW)); // remove
+        store.upsert(0, b"j", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        store.remove_keys_where(|key| key == b"j");
+        assert_eq!(
+            drained.get(),
+            0,
+            "no pin -> the fence never fires (the gate is inert)"
+        );
+        assert_eq!(store.zc_inflight(), 0);
+    }
+
+    #[test]
+    fn pin_value_pointer_is_stable_across_a_table_resize() {
+        // ONE slot table per db, so all keys share it and sibling inserts GROW it -- the exact resize
+        // (rehash + bucket move) the feature's soundness depends on being harmless to the value bytes.
+        let mut store = ShardStore::new(1);
+        store.upsert(
+            0,
+            b"pinned",
+            NewValue::Bytes(b"the-value-bytes"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        let (ptr1, len1) = store
+            .pin_value(0, b"pinned", NOW)
+            .expect("a live string pins");
+        assert_eq!(len1, b"the-value-bytes".len());
+
+        // Force multiple resizes by inserting many siblings into the SAME slot table. Each grow
+        // rehashes + relocates every 8-byte Entry (incl. the pinned key's) into a new bucket array.
+        for i in 0..4096u32 {
+            store.upsert(
+                0,
+                format!("sib-{i}").as_bytes(),
+                NewValue::Bytes(b"x"),
+                ExpireWrite::Clear,
+                NOW,
+            );
+        }
+
+        let (ptr2, len2) = store
+            .pin_value(0, b"pinned", NOW)
+            .expect("still live after the resizes");
+        assert_eq!(
+            ptr2, ptr1,
+            "the value pointee is OUT of the bucket, so it is STABLE across a table resize"
+        );
+        assert_eq!(len2, len1);
+        // SAFETY: the value bytes are still valid (no free happened), so reading through the pinned
+        // pointer yields the unchanged value -- the resize did not corrupt or move the pointee.
+        let seen = unsafe { std::slice::from_raw_parts(ptr2, len2) };
+        assert_eq!(
+            seen, b"the-value-bytes",
+            "the pinned bytes survived the resizes intact"
+        );
+    }
+
+    #[test]
+    fn pin_value_rejects_absent_wrong_type_and_expired() {
+        let mut store = ShardStore::new(2);
+        // Absent.
+        assert!(store.pin_value(0, b"nope", NOW).is_none());
+        // Expired (deadline in the past relative to a later `now`).
+        store.upsert(
+            0,
+            b"ttl",
+            NewValue::Bytes(b"v"),
+            ExpireWrite::Set(UnixMillis(10)),
+            UnixMillis(0),
+        );
+        assert!(
+            store.pin_value(0, b"ttl", UnixMillis(0)).is_some(),
+            "live before its deadline"
+        );
+        assert!(
+            store.pin_value(0, b"ttl", UnixMillis(20)).is_none(),
+            "logically expired -> not pinnable"
+        );
     }
 }
