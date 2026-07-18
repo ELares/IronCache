@@ -1423,6 +1423,57 @@ fn build_writev_iovecs(bufs: &[Vec<u8>], skip: usize) -> Vec<libc::iovec> {
     iovecs
 }
 
+/// The owned resource for an in-flight zero-copy SPLICE `writev` (#515): the iovec ARRAY plus the
+/// `out` scratch buffer some iovecs point into. Held by the `OpFuture` until the CQE (moved into
+/// [`Lifecycle::Ignored`] on drop-in-flight), so `out` + the array outlive the op. The value-pointer
+/// iovecs reference caller-PINNED store memory this struct does NOT own -- the caller's fence keeps
+/// those valid until the CQE (`send_zc`'s safety contract), so a dropped op is sound for what it owns.
+struct OwnedZcWritev {
+    iovecs: Vec<libc::iovec>,
+    out: Vec<u8>,
+}
+
+/// Build the iovec array for the UNWRITTEN suffix `[skip, total)` of the logical splice
+/// `out[0..at1] + val1 + out[at1..at2] + val2 + ... + out[at_n..]`, capped at [`WRITEV_IOV_MAX`]. Each
+/// segment (an `out` slice or a pinned `ZcInsert`) is emitted in order; a segment straddling `skip`
+/// is trimmed to its unwritten tail. `inserts` must be sorted by `at` ascending with `at <= out.len()`.
+fn build_zc_iovecs(out: &[u8], inserts: &[crate::ZcInsert], skip: usize) -> Vec<libc::iovec> {
+    let mut iovecs = Vec::with_capacity((inserts.len() * 2 + 1).min(WRITEV_IOV_MAX));
+    let mut logical = 0usize;
+    // Emit the sub-range of segment `[base, base+len)` that lies past `skip` (an `out` slice or a
+    // pinned value), advancing the logical cursor. Capped at WRITEV_IOV_MAX (the send loop resubmits).
+    let mut emit = |base: *const u8, len: usize| {
+        if len == 0 {
+            return;
+        }
+        let seg_start = logical;
+        logical += len;
+        if logical <= skip || iovecs.len() >= WRITEV_IOV_MAX {
+            return;
+        }
+        // `start_off` = bytes of this segment already written: `skip - seg_start` while the segment
+        // straddles `skip`, else 0. `start_off < len` (the `logical <= skip` guard dropped
+        // fully-written segments), so `add(start_off)` is in-bounds.
+        let start_off = skip.saturating_sub(seg_start);
+        // SAFETY: `start_off < len`, so `base.add(start_off)` is within the segment's allocation (an
+        // `out` slice, or a pinned region the caller keeps valid per `send_zc`'s contract). The kernel
+        // only READS these bytes (a write op).
+        let p = unsafe { base.add(start_off) };
+        iovecs.push(libc::iovec {
+            iov_base: p.cast::<core::ffi::c_void>().cast_mut(),
+            iov_len: len - start_off,
+        });
+    };
+    let mut out_pos = 0usize;
+    for ins in inserts {
+        emit(out[out_pos..].as_ptr(), ins.at - out_pos); // framing slice out[out_pos..at]
+        out_pos = ins.at;
+        emit(ins.ptr, ins.len); // the pinned value
+    }
+    emit(out[out_pos..].as_ptr(), out.len() - out_pos); // trailing framing out[out_pos..]
+    iovecs
+}
+
 /// The raw backend's [`crate::BatchedRecvSend`]: MULTISHOT recv over a provided-buffer group (#513)
 /// when the kernel supports it, else the plain owned recv (the shipped fallback). Both APPEND into
 /// `read_buf` and return the byte count (`0` = clean peer close); `send_batch` writes all + hands the
@@ -1504,6 +1555,56 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
             written += n;
         }
         Ok(bufs)
+    }
+
+    /// ZERO-COPY SPLICE write via a real `IORING_OP_WRITEV` (#515): send the logical splice of `out`
+    /// with the pinned `inserts` (see [`crate::BatchedRecvSend::send_zc`]) as ONE vectored write, with
+    /// the value bytes written straight from store memory (no copy into `out`). Write-ALL: resubmit
+    /// from the running offset across short writevs + the `UIO_MAXIOV` cap. The op owns `out` + the
+    /// iovec array (cancel-safe); the pinned value regions are the caller's contract (kept valid until
+    /// the CQE by the store fence). Empty `inserts` is exactly [`Self::send`] (byte-identical).
+    ///
+    /// # Safety
+    ///
+    /// Each `ZcInsert`'s `(ptr, len)` must stay valid + immutable until this send's CQE is reaped,
+    /// including if the returned future is dropped in flight (see [`crate::BatchedRecvSend::send_zc`]).
+    async unsafe fn send_zc(
+        &self,
+        stream: &mut RawUringTcpStream,
+        out: Vec<u8>,
+        inserts: Vec<crate::ZcInsert>,
+    ) -> io::Result<Vec<u8>> {
+        if inserts.is_empty() {
+            return self.send(stream, out).await;
+        }
+        let total: usize = out.len() + inserts.iter().map(|i| i.len).sum::<usize>();
+        if total == 0 {
+            return Ok(out);
+        }
+        let mut out = out;
+        let mut written = 0usize;
+        while written < total {
+            let iovecs = build_zc_iovecs(&out, &inserts, written);
+            debug_assert!(
+                !iovecs.is_empty(),
+                "written < total implies a non-empty unwritten suffix"
+            );
+            let owned = OwnedZcWritev { iovecs, out };
+            let iov_ptr = owned.iovecs.as_ptr();
+            #[allow(clippy::cast_possible_truncation)] // capped at WRITEV_IOV_MAX (1024).
+            let iov_len = owned.iovecs.len() as u32;
+            let sqe = opcode::Writev::new(types::Fd(stream.fd), iov_ptr, iov_len).build();
+            let (res, owned) = OpFuture::submit(sqe, owned).await;
+            out = owned.out;
+            let n = res?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            #[allow(clippy::cast_sign_loss)] // negatives rejected by `res?`.
+            let n = n as usize;
+            written += n;
+        }
+        Ok(out)
     }
 }
 
@@ -1873,6 +1974,114 @@ mod tests {
                 got, expected,
                 "every byte written in order across short writevs + the IOV_MAX cap"
             );
+        });
+    }
+
+    /// #515 send_zc: SPLICE pinned value regions into the `out` framing buffer and write the logical
+    /// concatenation via one `writev` -- the value bytes go straight from their (pinned) memory to the
+    /// socket, never copied into `out`. Two inserts (a GET-hit shape + a second reply) prove the
+    /// interleave order; the pinned buffers stay alive for the whole send.
+    #[test]
+    fn send_zc_splices_pinned_values_into_the_framing() {
+        use crate::{BatchedRecvSend, ZcInsert};
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let (mut server, mut client) = socket_pair();
+
+            // Pinned values (kept alive by these locals for the whole send).
+            let v1 = b"hello".to_vec();
+            let v2 = b"worldworld".to_vec();
+            // out = framing: `$5\r\n` | (splice v1) | `\r\n$10\r\n` | (splice v2) | `\r\n`.
+            let mut out = Vec::new();
+            out.extend_from_slice(b"$5\r\n");
+            let at1 = out.len();
+            out.extend_from_slice(b"\r\n$10\r\n");
+            let at2 = out.len();
+            out.extend_from_slice(b"\r\n");
+            let inserts = vec![
+                ZcInsert {
+                    at: at1,
+                    ptr: v1.as_ptr(),
+                    len: v1.len(),
+                },
+                ZcInsert {
+                    at: at2,
+                    ptr: v2.as_ptr(),
+                    len: v2.len(),
+                },
+            ];
+            let expected = b"$5\r\nhello\r\n$10\r\nworldworld\r\n";
+
+            // SAFETY: v1/v2 (the pinned regions) outlive the whole send below.
+            let returned = unsafe { rt.send_zc(&mut server, out, inserts) }
+                .await
+                .unwrap();
+            assert_eq!(
+                returned, b"$5\r\n\r\n$10\r\n\r\n",
+                "out (framing only) handed back for reuse"
+            );
+
+            let mut got = vec![0u8; expected.len()];
+            client.read_exact(&mut got).unwrap();
+            assert_eq!(
+                got, expected,
+                "pinned values spliced into the framing in order"
+            );
+            drop((v1, v2));
+        });
+    }
+
+    /// #515 send_zc: empty `inserts` is byte-identical to a plain `send` of `out`; and a large spliced
+    /// payload writes ALL bytes in order across short writevs (concurrent reader drains).
+    #[test]
+    fn send_zc_empty_inserts_and_write_all() {
+        use crate::{BatchedRecvSend, ZcInsert};
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let (mut server, mut client) = socket_pair();
+            // Empty inserts -> plain send of `out`. SAFETY: no pinned regions (empty inserts).
+            let out = unsafe { rt.send_zc(&mut server, b"+PONG\r\n".to_vec(), Vec::new()) }
+                .await
+                .unwrap();
+            assert_eq!(out, b"+PONG\r\n");
+            let mut got = [0u8; 7];
+            client.read_exact(&mut got).unwrap();
+            assert_eq!(&got, b"+PONG\r\n");
+
+            // Large spliced payload: a big pinned value + framing, exceeding the socket buffer.
+            let value = vec![7u8; 3 * 1024 * 1024]; // ~3 MiB pinned value
+            let mut out2 = Vec::new();
+            out2.extend_from_slice(b"$3145728\r\n");
+            let at = out2.len();
+            out2.extend_from_slice(b"\r\n");
+            let inserts = vec![ZcInsert {
+                at,
+                ptr: value.as_ptr(),
+                len: value.len(),
+            }];
+            let mut expected = Vec::new();
+            expected.extend_from_slice(b"$3145728\r\n");
+            expected.extend_from_slice(&value);
+            expected.extend_from_slice(b"\r\n");
+            let total = expected.len();
+
+            let reader = std::thread::spawn(move || {
+                let mut client = client;
+                let mut buf = vec![0u8; total];
+                client.read_exact(&mut buf).unwrap();
+                buf
+            });
+            // SAFETY: `value` (the pinned region) outlives the send below.
+            let _ = unsafe { rt.send_zc(&mut server, out2, inserts) }
+                .await
+                .unwrap();
+            let seen = reader.join().unwrap();
+            assert_eq!(seen.len(), total);
+            assert_eq!(
+                seen, expected,
+                "the large spliced payload arrived intact + in order"
+            );
+            drop(value);
         });
     }
 
