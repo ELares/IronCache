@@ -115,6 +115,35 @@ pub fn run_server_io_uring_for_test(port: u16, shards: usize) -> ShardSet {
     run_server(&config).expect("test io_uring server failed to bind")
 }
 
+/// Boot a real server on `127.0.0.1:port` across `shards` shards on the RAW io_uring datapath (#682,
+/// [`RuntimeBackend::IoUringRaw`](ironcache_config::RuntimeBackend::IoUringRaw)) and return the
+/// running [`ShardSet`]. Identical to [`run_server_io_uring_for_test`] except `runtime = io_uring_raw`
+/// so the serve loop uses the RAW backend's real vectored `send_zc` -- the write submits `iovec`s that
+/// point straight at the pinned store memory, which the kernel reads at COMPLETION time. That is the
+/// exact surface the #515 zero-copy GET must keep valid, so an integration test built here drives the
+/// true splice (not the copying materialize fallback the tokio-uring backend uses).
+///
+/// Cfg-gated to a Linux build with the `io_uring_raw` feature and NO TLS -- the only case in which the
+/// raw backend is honored (every other case silently falls back to tokio; see [`crate::serve::run_server`]).
+///
+/// # Panics
+///
+/// Panics if the server fails to bind (e.g. the port is already in use), which a test wants to
+/// surface immediately.
+#[cfg(all(target_os = "linux", feature = "io_uring_raw"))]
+#[must_use]
+pub fn run_server_io_uring_raw_for_test(port: u16, shards: usize) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        runtime: ironcache_config::RuntimeBackend::IoUringRaw,
+        ..Config::default()
+    };
+    run_server(&config).expect("test raw io_uring server failed to bind")
+}
+
 /// Boot a real server on `127.0.0.1:port` across `shards` shards with the CONNECTION-SAFETY limits
 /// set (PROD-SAFETY #3/#4/#5): `maxclients` (the simultaneous-connection ceiling; `0` disables),
 /// `timeout_secs` (the idle timeout; `0` disables), and `output_buffer_limit` (the per-connection

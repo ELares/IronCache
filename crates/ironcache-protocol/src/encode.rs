@@ -218,10 +218,21 @@ pub fn encode(out: &mut impl BufMut, value: &Value, proto: ProtoVersion) {
 /// INDEPENDENT: a PRESENT bulk string is `$<len>\r\n<bytes>\r\n` in both RESP2 and RESP3 (only the
 /// NULL bulk differs by proto, and a present value is never null), so it needs no `proto` argument.
 pub fn encode_bulk_ref(out: &mut impl BufMut, data: &[u8]) {
-    out.put_u8(b'$');
-    put_i64(out, data.len() as i64);
-    crlf(out);
+    encode_bulk_len_prefix(out, data.len());
     out.put_slice(data);
+    crlf(out);
+}
+
+/// Emit ONLY the RESP bulk-string HEADER `$<len>\r\n` for a present value of `len` bytes -- the
+/// payload and its trailing CRLF are NOT written. This is the #515 ZERO-COPY GET framer: for a large
+/// value whose bytes are spliced into the socket write DIRECTLY from the store (never copied into
+/// `out`), the home GET path writes this header, records the splice offset, then writes the trailing
+/// `\r\n`; the send interleaves the pinned value bytes between them. Header + payload + trailing CRLF
+/// reproduce EXACTLY the [`encode_bulk_ref`] framing (which now shares this fn), so the wire reply is
+/// byte-identical to the copy path -- only the value's copy into `out` is elided.
+pub fn encode_bulk_len_prefix(out: &mut impl BufMut, len: usize) {
+    out.put_u8(b'$');
+    put_i64(out, len as i64);
     crlf(out);
 }
 
