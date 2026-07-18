@@ -313,6 +313,75 @@ pub trait BatchedRecvSend: Runtime<Buf = Vec<u8>, Error = std::io::Error> {
             Ok(bufs)
         }
     }
+
+    /// ZERO-COPY SPLICE write (#515): send the logical concatenation
+    /// `out[0..at1] + val1 + out[at1..at2] + val2 + ... + out[at_n..]` as ONE `writev`, where each
+    /// `val` is a caller-PINNED region ([`ZcInsert`]) spliced into `out` at its `at` offset -- so a
+    /// stored value is written store->socket with NO copy into `out`. The framing (`$len\r\n`, `\r\n`,
+    /// and every non-zero-copy reply) lives in `out`; only the value bytes are by-pointer.
+    /// RETURNS `out` for reuse. Empty `inserts` is exactly a `send_batch(out)` (byte-identical).
+    ///
+    /// # Safety
+    ///
+    /// Each `ZcInsert`'s `(ptr, len)` MUST stay valid + immutable until this send's CQE is reaped,
+    /// INCLUDING if the returned future is dropped in flight (the op owns `out` + the iovec array, but
+    /// NOT the pinned regions). The caller upholds this with the store's in-flight fence (it reaps the
+    /// send before freeing any pinned value, and drains on connection close). `inserts` must be sorted
+    /// by `at` ascending with each `at <= out.len()`.
+    ///
+    /// The io_uring backend overrides this with a real vectored `writev`; the DEFAULT materializes the
+    /// splice into one contiguous buffer + [`Self::send_batch`] (correct + byte-identical, but copies
+    /// the values -- the fallback for a backend without a vectored op).
+    ///
+    /// This is an `unsafe fn` because its soundness rests on the pinned-region contract above, which
+    /// the type system cannot enforce: a caller supplying `(ptr, len)` that the store frees before the
+    /// CQE would let the kernel `writev` (or the fallback's `from_raw_parts`) read freed memory. The
+    /// caller asserts, by using `unsafe`, that it upholds the pin (via the store's in-flight fence).
+    unsafe fn send_zc(
+        &self,
+        stream: &mut Self::Stream,
+        out: Vec<u8>,
+        inserts: Vec<ZcInsert>,
+    ) -> impl Future<Output = std::io::Result<Vec<u8>>> {
+        async move {
+            if inserts.is_empty() {
+                return self.send_batch(stream, out).await;
+            }
+            // Fallback: materialize the spliced sequence into one buffer (copies the pinned values),
+            // byte-identical to the vectored write of the same logical bytes.
+            let total: usize = out.len() + inserts.iter().map(|i| i.len).sum::<usize>();
+            let mut flat = Vec::with_capacity(total);
+            let mut out_pos = 0usize;
+            for ins in &inserts {
+                flat.extend_from_slice(&out[out_pos..ins.at]);
+                out_pos = ins.at;
+                // SAFETY: per this method's contract, `ins.ptr..ins.ptr+ins.len` is a valid,
+                // initialized region the caller keeps alive for the whole call.
+                flat.extend_from_slice(unsafe { std::slice::from_raw_parts(ins.ptr, ins.len) });
+            }
+            flat.extend_from_slice(&out[out_pos..]);
+            self.send_batch(stream, flat).await?;
+            Ok(out)
+        }
+    }
+}
+
+/// One zero-copy value SPLICE for [`BatchedRecvSend::send_zc`] (#515): the pinned region `(ptr, len)`
+/// to insert into the reply `out` buffer AT offset `at` (i.e. after `out[..at]`, before `out[at..]`).
+/// The `at` offsets across a call's inserts are ascending and `<= out.len()`. The pointed-at bytes are
+/// caller-pinned store memory (an inline value blob); see `send_zc`'s safety contract.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
+#[derive(Clone, Copy, Debug)]
+pub struct ZcInsert {
+    /// The offset in the reply `out` buffer to splice the pinned region at.
+    pub at: usize,
+    /// The pinned region's start pointer (caller-owned store memory, valid until the send's CQE).
+    pub ptr: *const u8,
+    /// The pinned region's length in bytes.
+    pub len: usize,
 }
 
 #[cfg(all(test, feature = "tokio"))]
