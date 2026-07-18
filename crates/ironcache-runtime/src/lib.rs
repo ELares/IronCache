@@ -285,6 +285,34 @@ pub trait BatchedRecvSend: Runtime<Buf = Vec<u8>, Error = std::io::Error> {
         stream: &mut Self::Stream,
         data: Vec<u8>,
     ) -> impl Future<Output = std::io::Result<Vec<u8>>>;
+
+    /// SCATTER-GATHER write (#515 P1): write the ordered list of owned buffers `bufs` in full as ONE
+    /// logical reply, RETURNING them for reuse. This is the primitive the zero-copy GET flush builds
+    /// on (#515): a later slice interleaves inline stored-value segments between framing segments so a
+    /// present value is written store->socket with no intermediate copy. The io_uring backend
+    /// overrides this with a real vectored `writev` (one iovec per buffer, no concatenation); the
+    /// DEFAULT here is a behavior-preserving fallback that concatenates into one buffer and calls
+    /// [`Self::send_batch`], so a backend without a vectored op (or a caller before the writev path is
+    /// wired) stays correct + byte-identical. Empty `bufs` (or all-empty) is a no-op returning them.
+    fn send_vectored(
+        &self,
+        stream: &mut Self::Stream,
+        bufs: Vec<Vec<u8>>,
+    ) -> impl Future<Output = std::io::Result<Vec<Vec<u8>>>> {
+        async move {
+            let total: usize = bufs.iter().map(Vec::len).sum();
+            if total == 0 {
+                return Ok(bufs);
+            }
+            // Fallback: one contiguous buffer, byte-identical to a vectored write of the same bytes.
+            let mut flat = Vec::with_capacity(total);
+            for b in &bufs {
+                flat.extend_from_slice(b);
+            }
+            self.send_batch(stream, flat).await?;
+            Ok(bufs)
+        }
+    }
 }
 
 #[cfg(all(test, feature = "tokio"))]

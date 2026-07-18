@@ -1373,6 +1373,56 @@ pub fn peer_local_addrs_raw(stream: &RawUringTcpStream) -> (String, String) {
     (peer, local)
 }
 
+/// The owned resource for an in-flight `writev` (#515 P1): the iovec ARRAY (whose base pointer the
+/// SQE carries) PLUS the buffers the iovecs point into. Held by the `OpFuture` until the CQE, and
+/// moved into [`Lifecycle::Ignored`] if the future is dropped in flight, so BOTH the array and the
+/// buffers outlive the kernel op -- cancel-safe exactly like the single-buffer [`send`]. Moving this
+/// struct moves the OUTER `Vec`s' control blocks but not their heap allocations, so every iovec base
+/// pointer (into `bufs`' inner allocations) and the SQE's iovec-array pointer stay valid.
+struct OwnedWritev {
+    iovecs: Vec<libc::iovec>,
+    bufs: Vec<Vec<u8>>,
+}
+
+/// `writev(2)`/`IORING_OP_WRITEV` caps the iovec count at `UIO_MAXIOV` (1024); a longer array fails
+/// `EINVAL`. `send_vectored` builds at most this many iovecs per submission and resubmits for the
+/// remainder from the new write offset, so an arbitrarily long segment list is written correctly.
+const WRITEV_IOV_MAX: usize = 1024;
+
+/// Build the iovec array for the UNWRITTEN suffix `[skip, total)` of `bufs`: skip buffers already
+/// fully written, and for the partially-written buffer point PAST its consumed prefix. Empty buffers
+/// are dropped (a zero-length iovec is pointless). Capped at [`WRITEV_IOV_MAX`] iovecs (the caller's
+/// loop resubmits for anything beyond). The returned iovec base pointers reference `bufs`' inner heap
+/// allocations, which are STABLE across moving the outer `bufs` `Vec` into the op-future.
+fn build_writev_iovecs(bufs: &[Vec<u8>], skip: usize) -> Vec<libc::iovec> {
+    let mut iovecs = Vec::with_capacity(bufs.len().min(WRITEV_IOV_MAX));
+    let mut acc = 0usize;
+    for b in bufs {
+        let blen = b.len();
+        if blen == 0 || acc + blen <= skip {
+            acc += blen;
+            continue;
+        }
+        if iovecs.len() == WRITEV_IOV_MAX {
+            break;
+        }
+        // `start` = bytes of THIS buffer already written: `skip - acc` while `acc < skip <= acc+blen`,
+        // else 0 (we are past the write cursor). `start < blen` always (the `<= skip` skip above
+        // handled fully-written buffers), so `add(start)` is in-bounds.
+        let start = skip.saturating_sub(acc);
+        // SAFETY: `start < blen`, so `b.as_ptr().add(start)` is within `b`'s initialized allocation.
+        // The kernel only READS these bytes (a write op). The allocation outlives the op: `OwnedWritev`
+        // owns `bufs` until the CQE (moved into `Lifecycle::Ignored` on cancel).
+        let base = unsafe { b.as_ptr().add(start) };
+        iovecs.push(libc::iovec {
+            iov_base: base.cast::<core::ffi::c_void>().cast_mut(),
+            iov_len: blen - start,
+        });
+        acc += blen;
+    }
+    iovecs
+}
+
 /// The raw backend's [`crate::BatchedRecvSend`]: MULTISHOT recv over a provided-buffer group (#513)
 /// when the kernel supports it, else the plain owned recv (the shipped fallback). Both APPEND into
 /// `read_buf` and return the byte count (`0` = clean peer close); `send_batch` writes all + hands the
@@ -1413,6 +1463,47 @@ impl crate::BatchedRecvSend for RawIoUringRuntime {
         data: Vec<u8>,
     ) -> io::Result<Vec<u8>> {
         self.send(stream, data).await
+    }
+
+    /// SCATTER-GATHER write via a real `IORING_OP_WRITEV` (#515 P1): write the ordered `bufs` as ONE
+    /// logical reply with NO concatenation -- the kernel gathers the segments directly. Write-ALL:
+    /// resubmit from the running byte offset until every byte is sent (a short writev advances the
+    /// offset and the next submission rebuilds the iovecs for the remaining suffix, also handling the
+    /// `UIO_MAXIOV` cap). The iovec array + the buffers are owned by the `OpFuture` for the whole op
+    /// (cancel-safe like [`send`]). Hands `bufs` back for reuse.
+    async fn send_vectored(
+        &self,
+        stream: &mut RawUringTcpStream,
+        bufs: Vec<Vec<u8>>,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let total: usize = bufs.iter().map(Vec::len).sum();
+        if total == 0 {
+            return Ok(bufs);
+        }
+        let mut bufs = bufs;
+        let mut written = 0usize;
+        while written < total {
+            let iovecs = build_writev_iovecs(&bufs, written);
+            debug_assert!(
+                !iovecs.is_empty(),
+                "written < total implies a non-empty unwritten suffix"
+            );
+            let owned = OwnedWritev { iovecs, bufs };
+            let iov_ptr = owned.iovecs.as_ptr();
+            #[allow(clippy::cast_possible_truncation)] // capped at WRITEV_IOV_MAX (1024).
+            let iov_len = owned.iovecs.len() as u32;
+            let sqe = opcode::Writev::new(types::Fd(stream.fd), iov_ptr, iov_len).build();
+            let (res, owned) = OpFuture::submit(sqe, owned).await;
+            bufs = owned.bufs;
+            let n = res?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            #[allow(clippy::cast_sign_loss)] // negatives rejected by `res?`.
+            let n = n as usize;
+            written += n;
+        }
+        Ok(bufs)
     }
 }
 
@@ -1712,6 +1803,76 @@ mod tests {
             let mut got = [0u8; 7];
             client.read_exact(&mut got).unwrap();
             assert_eq!(&got, b"+PONG\r\n");
+        });
+    }
+
+    /// #515 P1: `send_vectored` GATHERS an ordered segment list into ONE reply via a real `writev`
+    /// (no concatenation); the peer reads the exact byte-concatenation. An EMPTY segment is dropped
+    /// (not sent as a 0-len iovec). This is the framing + value shape the zero-copy GET flush builds.
+    #[test]
+    fn send_vectored_gathers_segments() {
+        use crate::BatchedRecvSend;
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let (mut server, mut client) = socket_pair();
+
+            let segs: Vec<Vec<u8>> = vec![
+                b"$5\r\n".to_vec(), // bulk header (scratch)
+                b"hello".to_vec(),  // the "value" segment
+                Vec::new(),         // empty -> dropped
+                b"\r\n".to_vec(),   // bulk trailer (scratch)
+                b"+OK\r\n".to_vec(),
+            ];
+            let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+
+            let sent = rt.send_vectored(&mut server, segs).await.unwrap();
+            assert_eq!(
+                sent.iter().flatten().copied().collect::<Vec<u8>>(),
+                expected,
+                "segments handed back for reuse"
+            );
+
+            let mut got = vec![0u8; expected.len()];
+            client.read_exact(&mut got).unwrap();
+            assert_eq!(got, expected, "peer read the exact gathered concatenation");
+        });
+    }
+
+    /// #515 P1: the write-ALL loop resubmits across SHORT writevs (a payload larger than the socket
+    /// buffer) AND across the `WRITEV_IOV_MAX` (1024) iovec cap (2000 segments), delivering every byte
+    /// in order. A reader thread drains concurrently so the single-threaded ring keeps making progress.
+    #[test]
+    fn send_vectored_writes_all_across_short_writevs_and_iov_cap() {
+        use crate::BatchedRecvSend;
+        raw_uring_start(async {
+            let rt = RawIoUringRuntime::new();
+            let (mut server, client) = socket_pair();
+
+            let nseg = 2000usize; // > WRITEV_IOV_MAX (1024): forces multiple writev submissions.
+            let seg_len = 1024usize; // ~2 MiB total: exceeds the socket buffer -> short writevs.
+            let segs: Vec<Vec<u8>> = (0..nseg)
+                .map(|i| vec![u8::try_from(i % 256).unwrap(); seg_len])
+                .collect();
+            let total = nseg * seg_len;
+            let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+
+            // Drain the client end concurrently; `read_exact(total)` returns once all bytes arrive.
+            let reader = std::thread::spawn(move || {
+                let mut client = client;
+                let mut got = vec![0u8; total];
+                client.read_exact(&mut got).unwrap();
+                got
+            });
+
+            let sent = rt.send_vectored(&mut server, segs).await.unwrap();
+            assert_eq!(sent.iter().map(Vec::len).sum::<usize>(), total);
+
+            let got = reader.join().unwrap();
+            assert_eq!(got.len(), total);
+            assert_eq!(
+                got, expected,
+                "every byte written in order across short writevs + the IOV_MAX cap"
+            );
         });
     }
 
