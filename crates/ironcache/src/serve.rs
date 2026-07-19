@@ -41,8 +41,14 @@ use std::sync::atomic::Ordering;
 mod serve_hop;
 #[path = "serve_signal.rs"]
 mod serve_signal;
+#[path = "serve_util.rs"]
+mod serve_util;
 
 use serve_hop::{DeferredHop, drain_deferred_hops};
+// #625: `encode_into` (reply-encoder shim, ~28 call sites) + `ascii_upper` (routing-token
+// uppercaser, also used by `crate::coordinator` as `crate::serve::ascii_upper`). `pub(crate)` so the
+// coordinator path + every sibling serve submodule resolve them unchanged.
+pub(crate) use serve_util::{ascii_upper, encode_into};
 // `main.rs` calls `serve::wait_for_signal` and matches `serve::SignalOutcome`; `serve_tests.rs`
 // (via `use super::*`) references `resolve_signal` / `apply_signal_flag`. Re-export the whole module
 // so all of those paths resolve unchanged.
@@ -7975,13 +7981,6 @@ fn redact_args_for_slowlog(cmd_upper: &[u8], mut args: Vec<Vec<u8>>) -> Vec<Vec<
     args
 }
 
-/// Encode `value` and append the bytes to `out`. `Vec<u8>` is a `bytes::BufMut` sink, so
-/// `encode` writes the reply STRAIGHT into `out` -- no per-reply `BytesMut` allocation and no
-/// intermediate copy (the encoder is generic over the sink; PROTOCOL.md's zero-copy note).
-fn encode_into(out: &mut Vec<u8>, value: &ironcache_server::Value, proto: ProtoVersion) {
-    ironcache_protocol::encode(out, value, proto);
-}
-
 /// Whether EVERY routing key of a KEYED data command (`KeyedSingle`/`KeyedMulti`) is owned
 /// by the HOME shard (COORDINATOR.md #107, the in-MULTI cross-shard guard). Used inside a
 /// transaction to decide whether a queued command is safe to run home-only at EXEC: only a
@@ -8765,17 +8764,6 @@ fn reject_spanning_move(
         ))),
         conn.proto,
     );
-}
-
-/// ASCII-uppercase the command token for routing classification (RESP command tokens are
-/// ASCII; mirrors the dispatcher's own case-insensitive token handling). The classified
-/// token is used ONLY to pick a route; dispatch re-uppercases its own copy. `pub(crate)`
-/// so the [`crate::coordinator`] drain loop classifies the same way (keyed vs whole-keyspace).
-///
-/// Delegates to the canonical [`ironcache_server::cmd_util::ascii_upper`], whose stack-backed
-/// `UpperToken` classifies the per-command token with NO heap allocation on this hot path.
-pub(crate) fn ascii_upper(b: &[u8]) -> ironcache_server::cmd_util::UpperToken {
-    ironcache_server::cmd_util::ascii_upper(b)
 }
 
 /// Wait for a shutdown signal (SIGINT/SIGTERM) and then stop the shard set.
