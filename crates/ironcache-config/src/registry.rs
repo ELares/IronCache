@@ -142,6 +142,14 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "output-buffer-limit",
             kind: SetKind::Runtime,
         },
+        // The #515 zero-copy GET size floor in bytes. RUNTIME-SETTABLE: `CONFIG SET
+        // zero-copy-get-threshold <bytes>` updates the live floor `get_home_by_ref` reads to decide
+        // whether a large String GET is spliced from the store (no copy) or copied into the reply
+        // buffer; `0` disables zero-copy entirely (every GET copies). Inert on the tokio datapath.
+        ParamSpec {
+            name: "zero-copy-get-threshold",
+            kind: SetKind::Runtime,
+        },
         // The per-connection query-buffer hard cap in bytes (#528, the inbound analog of
         // `output-buffer-limit`; Redis `client-query-buffer-limit`). RUNTIME-SETTABLE: `CONFIG SET
         // query-buffer-limit <bytes>` updates the live cap the serve loop enforces after each recv;
@@ -331,6 +339,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // timeout` is reflected. `0` means idle disconnection is disabled.
         "timeout" => runtime.timeout_secs().to_string(),
         "output-buffer-limit" => runtime.output_buffer_limit().to_string(),
+        // The #515 zero-copy GET size floor: read the live value so a `CONFIG SET
+        // zero-copy-get-threshold` is reflected; reported as a byte count (`0` = zero-copy disabled).
+        "zero-copy-get-threshold" => runtime.zero_copy_get_threshold().to_string(),
         // The per-connection query-buffer cap (#528, inbound analog): read the overlay so a
         // `CONFIG SET query-buffer-limit` is reflected; reported as a byte count.
         "query-buffer-limit" => runtime.query_buffer_limit().to_string(),
@@ -530,6 +541,15 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
         "output-buffer-limit" => match crate::parse_human_size(value) {
             Ok(bytes) => {
                 runtime.set_output_buffer_limit(bytes);
+                SetOutcome::Applied
+            }
+            Err(e) => SetOutcome::InvalidValue(e.to_string()),
+        },
+        // The #515 zero-copy GET size floor: a byte count accepted as a human size ("16kb") OR a
+        // plain integer; `0` disables zero-copy. A malformed value is rejected.
+        "zero-copy-get-threshold" => match crate::parse_human_size(value) {
+            Ok(bytes) => {
+                runtime.set_zero_copy_get_threshold(bytes);
                 SetOutcome::Applied
             }
             Err(e) => SetOutcome::InvalidValue(e.to_string()),

@@ -115,6 +115,13 @@ pub struct RuntimeConfig {
     /// load) after each batch is rendered, so a `CONFIG SET` takes effect for subsequent batches.
     /// Seeded from the boot config.
     output_buffer_limit: AtomicU64,
+    /// The #515 zero-copy GET size floor in bytes (`0` DISABLES zero-copy: every GET copies). A home
+    /// GET whose present String value is at least this large, on the io_uring datapath, is SPLICED
+    /// straight from the store into the socket write instead of copied into the reply buffer.
+    /// Runtime-settable via `CONFIG SET zero-copy-get-threshold`; `get_home_by_ref` reads it (one
+    /// relaxed load) per home GET, so a change applies to subsequent GETs. Seeded from the boot
+    /// config. Inert on the tokio datapath (which always copies) and for values below the floor.
+    zero_copy_get_threshold: AtomicU64,
     /// The per-connection query-buffer hard cap in bytes (#528, the inbound analog of
     /// `output_buffer_limit`). `0` disables the cap. Runtime-settable via
     /// `CONFIG SET query-buffer-limit`; the serve loop reads it (one relaxed load) after each recv
@@ -248,6 +255,7 @@ impl RuntimeConfig {
             // live (the serve loop re-reads it each connection-loop iteration).
             timeout_secs: AtomicU64::new(cfg.timeout_secs),
             output_buffer_limit: AtomicU64::new(cfg.output_buffer_limit),
+            zero_copy_get_threshold: AtomicU64::new(cfg.zero_copy_get_threshold),
             // The per-connection query-buffer cap (#528), seeded from the boot config; a later
             // `CONFIG SET query-buffer-limit` overrides it live (the serve loop reads it after each
             // recv grows the inbound buffer).
@@ -482,6 +490,21 @@ impl RuntimeConfig {
     /// after each rendered batch, so the new value applies to subsequent batches (PROD-SAFETY #5).
     pub fn set_output_buffer_limit(&self, bytes: u64) {
         self.output_buffer_limit.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The current effective #515 zero-copy GET size floor in bytes (`0` DISABLES zero-copy). A
+    /// single relaxed atomic load: `get_home_by_ref` reads it per home GET to decide splice vs copy
+    /// (off the per-command decode/dispatch hot path proper; one load per plain 2-arg GET).
+    #[must_use]
+    pub fn zero_copy_get_threshold(&self) -> u64 {
+        self.zero_copy_get_threshold.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET zero-copy-get-threshold <bytes>`: store the new zero-copy GET size floor (a relaxed
+    /// atomic store); `0` disables zero-copy (every GET copies). `get_home_by_ref` reads
+    /// `zero_copy_get_threshold()` per home GET, so the new value applies to subsequent GETs (#515).
+    pub fn set_zero_copy_get_threshold(&self, bytes: u64) {
+        self.zero_copy_get_threshold.store(bytes, Ordering::Relaxed);
     }
 
     /// The current effective per-connection query-buffer hard cap in bytes (#528, the inbound

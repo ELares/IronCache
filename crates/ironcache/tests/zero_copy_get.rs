@@ -32,8 +32,9 @@ use tokio::net::TcpStream;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The #515 zero-copy size floor (`serve::ZC_THRESHOLD`), mirrored here so the boundary cases pin to
-/// the real value. A value at/above this takes the splice path; below it takes the #511 copy path.
+/// The #515 zero-copy size floor: `DEFAULT_ZERO_COPY_GET_THRESHOLD` (the server here runs with the
+/// default `zero-copy-get-threshold`), mirrored so the boundary cases pin to the real value. A value
+/// at/above this takes the splice path; below it takes the #511 copy path.
 const ZC_THRESHOLD: usize = 16 * 1024;
 
 /// Grab a free TCP port by binding an ephemeral listener and dropping it.

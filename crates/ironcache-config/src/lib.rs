@@ -389,6 +389,16 @@ pub struct Config {
     /// ceiling ([`DEFAULT_OUTPUT_BUFFER_LIMIT`]) so a legitimate large pipeline/reply is
     /// unaffected while a pathological accumulation is bounded.
     pub output_buffer_limit: u64,
+    /// The #515 ZERO-COPY GET size floor in bytes: the minimum present String value size for a home
+    /// GET on the io_uring datapath to be SPLICED straight from the store into the socket write
+    /// (`send_zc`) instead of copied into the reply buffer. A smaller value takes the #511 by-ref COPY
+    /// path, because for a small value the fixed splice bookkeeping (a slot `Arc` clone, a boxed pin,
+    /// an extra `iovec`) outweighs the elided memcpy. `0` DISABLES zero-copy entirely (every GET
+    /// copies). The default ([`DEFAULT_ZERO_COPY_GET_THRESHOLD`], 16 KiB) is a measured break-even;
+    /// the c7g A/B shows the win growing with pipeline depth on large values and vanishing (with no
+    /// regression) when un-pipelined, so this is env-dependent and tunable (the tokio datapath always
+    /// copies regardless of this value). Byte-identical replies on either path.
+    pub zero_copy_get_threshold: u64,
     /// The per-connection QUERY-BUFFER hard cap in bytes (the inbound analog of
     /// [`output_buffer_limit`](Self::output_buffer_limit); Redis `client-query-buffer-limit`,
     /// #528). A connection whose accumulated inbound read buffer would exceed this is CLOSED
@@ -768,6 +778,9 @@ impl Default for Config {
             // unbounded accumulation (slow consumer / pub-sub flood) is bounded so it
             // cannot OOM the host. 0 disables it (unbounded, the pre-fix behavior).
             output_buffer_limit: DEFAULT_OUTPUT_BUFFER_LIMIT,
+            // #515: splice a home GET's String value straight from the store at/above the measured
+            // 16 KiB break-even; below it the by-ref copy is cheaper. 0 would disable zero-copy.
+            zero_copy_get_threshold: DEFAULT_ZERO_COPY_GET_THRESHOLD,
             // A high per-connection query-buffer ceiling by default (#528): a legitimate large
             // request / deep pipeline is unaffected, but a slow-dribble multibulk that never
             // completes cannot force unbounded inbound buffering (a pre-auth memory-amplification
@@ -901,6 +914,14 @@ pub const DEFAULT_MAXCLIENTS: u64 = 10_000;
 /// unbounded accumulation is bounded; `0` disables the cap (unbounded, the pre-fix
 /// behavior).
 pub const DEFAULT_OUTPUT_BUFFER_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Default #515 zero-copy GET size floor in bytes: 16 KiB. A home GET whose present String value is
+/// at least this large, on the io_uring datapath, is SPLICED straight from the store into the socket
+/// write (no copy into the reply buffer); a smaller value takes the #511 by-ref copy path. This is
+/// the measured break-even (a c7g A/B shows the splice win growing with pipeline depth on large
+/// values and neutral, with no regression, when un-pipelined; below ~16 KiB the fixed splice
+/// bookkeeping outweighs the elided memcpy). `0` disables zero-copy entirely (every GET copies).
+pub const DEFAULT_ZERO_COPY_GET_THRESHOLD: u64 = 16 * 1024;
 
 /// Default per-connection query-buffer hard cap in bytes (#528): 1 GiB. A connection whose
 /// accumulated inbound read buffer would exceed this is closed, bounding the slow-dribble
@@ -1598,6 +1619,10 @@ pub struct ConfigOverlay {
     /// (`output_buffer_limit = 1073741824`) + the `IRONCACHE_OUTPUT_BUFFER_LIMIT` env var.
     /// `None` leaves the lower layer (default [`DEFAULT_OUTPUT_BUFFER_LIMIT`]); `0` disables it.
     pub output_buffer_limit: Option<u64>,
+    /// The #515 zero-copy GET size floor in bytes. TOML (`zero_copy_get_threshold = 16384`) + the
+    /// `IRONCACHE_ZERO_COPY_GET_THRESHOLD` env var. `None` leaves the lower layer (default
+    /// [`DEFAULT_ZERO_COPY_GET_THRESHOLD`] = 16 KiB); `0` disables zero-copy (every GET copies).
+    pub zero_copy_get_threshold: Option<u64>,
     /// The per-connection query-buffer hard cap in bytes (#528, the inbound analog of
     /// `output_buffer_limit`). TOML (`query_buffer_limit = 1073741824`) + the
     /// `IRONCACHE_QUERY_BUFFER_LIMIT` env var. `None` leaves the lower layer (default
@@ -1795,6 +1820,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "timeout",
     "maxclients",
     "output_buffer_limit",
+    "zero_copy_get_threshold",
     "query_buffer_limit",
     "proto_max_bulk_len",
     "tcp_keepalive_secs",
@@ -2016,6 +2042,13 @@ impl ConfigOverlay {
         if let Ok(v) = env_var("IRONCACHE_OUTPUT_BUFFER_LIMIT") {
             o.output_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "output_buffer_limit",
+                reason: format!("not a number of bytes: {v}"),
+            })?);
+        }
+        // The #515 zero-copy GET size floor in bytes; 0 disables zero-copy (every GET copies).
+        if let Ok(v) = env_var("IRONCACHE_ZERO_COPY_GET_THRESHOLD") {
+            o.zero_copy_get_threshold = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "zero_copy_get_threshold",
                 reason: format!("not a number of bytes: {v}"),
             })?);
         }
@@ -2384,6 +2417,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.output_buffer_limit {
             cfg.output_buffer_limit = v;
+        }
+        if let Some(v) = self.zero_copy_get_threshold {
+            cfg.zero_copy_get_threshold = v;
         }
         if let Some(v) = self.query_buffer_limit {
             cfg.query_buffer_limit = v;
@@ -4361,6 +4397,52 @@ mod tests {
         assert_eq!(runtime.query_buffer_limit(), 0);
         assert!(matches!(
             apply_set("query-buffer-limit", "1.5gb", &runtime),
+            SetOutcome::InvalidValue(_)
+        ));
+    }
+
+    #[test]
+    fn zero_copy_get_threshold_defaults_overlays_and_config_sets() {
+        use crate::registry::{SetOutcome, apply_set, effective_value, lookup};
+        use crate::runtime::RuntimeConfig;
+
+        // Default is the measured 16 KiB break-even.
+        assert_eq!(
+            Config::default().zero_copy_get_threshold,
+            DEFAULT_ZERO_COPY_GET_THRESHOLD
+        );
+        assert_eq!(DEFAULT_ZERO_COPY_GET_THRESHOLD, 16 * 1024);
+
+        // TOML overlay overrides it (env `IRONCACHE_ZERO_COPY_GET_THRESHOLD` shares this field).
+        let overlay = ConfigOverlay::from_toml_str("zero_copy_get_threshold = 65536\n").unwrap();
+        assert_eq!(overlay.zero_copy_get_threshold, Some(65536));
+        let cfg = Config::resolve(&[overlay]).unwrap();
+        assert_eq!(cfg.zero_copy_get_threshold, 65536);
+        cfg.validate().unwrap();
+
+        // The knob is a registered runtime-settable param and CONFIG GET reports the boot value.
+        assert!(lookup("zero-copy-get-threshold").is_some());
+        let runtime = RuntimeConfig::from_config(&cfg);
+        assert_eq!(runtime.zero_copy_get_threshold(), 65536);
+        assert_eq!(
+            effective_value("zero-copy-get-threshold", &runtime, &cfg).as_deref(),
+            Some("65536")
+        );
+
+        // CONFIG SET accepts a human size and takes effect live; `0` disables zero-copy; garbage is
+        // rejected (never a silent accept).
+        assert_eq!(
+            apply_set("zero-copy-get-threshold", "32kb", &runtime),
+            SetOutcome::Applied
+        );
+        assert_eq!(runtime.zero_copy_get_threshold(), 32 * 1024);
+        assert_eq!(
+            apply_set("zero-copy-get-threshold", "0", &runtime),
+            SetOutcome::Applied
+        );
+        assert_eq!(runtime.zero_copy_get_threshold(), 0);
+        assert!(matches!(
+            apply_set("zero-copy-get-threshold", "huge", &runtime),
             SetOutcome::InvalidValue(_)
         ));
     }
