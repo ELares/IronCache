@@ -5,9 +5,9 @@
 //! loop the OWNING serve loop drives. Behavior-preserving relocation: the bodies are byte-identical.
 
 use super::{
-    MigrationCtx, ShardState, ShardStoreImpl, all_keys_home_owned, cluster_redirect, encode_into, handle_request,
-    is_fan_out_spanning_zset, publish_pending_keyspace_events, replica_read_in_sync, shard_blocking,
-    shard_owner_home, shard_state,
+    MigrationCtx, ShardState, ShardStoreImpl, all_keys_home_owned, cluster_redirect, encode_into,
+    handle_request, is_fan_out_spanning_zset, publish_pending_keyspace_events,
+    replica_read_in_sync, shard_blocking, shard_owner_home, shard_state,
 };
 use crate::coordinator;
 use ironcache_env::{Clock, SystemEnv};

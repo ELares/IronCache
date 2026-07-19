@@ -21,8 +21,8 @@ use ironcache_runtime::bootstrap::{ShardConfig, ShardId, ShardSet};
 use ironcache_runtime::{Runtime, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
-    ConnState, CounterDeltas, DecodeOutcome, Limits, ProtoVersion, Request, TimingWheel, UnixMillis,
-    decode_shared, dispatch_with_cmd, route,
+    ConnState, CounterDeltas, DecodeOutcome, Limits, ProtoVersion, Request, TimingWheel,
+    UnixMillis, decode_shared, dispatch_with_cmd, route,
 };
 use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
@@ -36,26 +36,26 @@ use std::sync::atomic::Ordering;
 // self-contained group of items; the `use` re-exports below keep every call site in `serve` +
 // `serve_tests` (which does `use super::*`) + `main.rs` (`serve::wait_for_signal` /
 // `serve::SignalOutcome`) resolving exactly as before.
-#[path = "serve_hop.rs"]
-mod serve_hop;
-#[path = "serve_signal.rs"]
-mod serve_signal;
-#[path = "serve_util.rs"]
-mod serve_util;
-#[path = "serve_shard_state.rs"]
-mod serve_shard_state;
-#[path = "serve_classify.rs"]
-mod serve_classify;
-#[path = "serve_hooks.rs"]
-mod serve_hooks;
-#[path = "serve_pubsub_cmd.rs"]
-mod serve_pubsub_cmd;
 #[path = "serve_admin_cmd.rs"]
 mod serve_admin_cmd;
+#[path = "serve_classify.rs"]
+mod serve_classify;
 #[path = "serve_cluster_cmd.rs"]
 mod serve_cluster_cmd;
+#[path = "serve_hooks.rs"]
+mod serve_hooks;
+#[path = "serve_hop.rs"]
+mod serve_hop;
+#[path = "serve_pubsub_cmd.rs"]
+mod serve_pubsub_cmd;
+#[path = "serve_shard_state.rs"]
+mod serve_shard_state;
+#[path = "serve_signal.rs"]
+mod serve_signal;
 #[path = "serve_txn_block.rs"]
 mod serve_txn_block;
+#[path = "serve_util.rs"]
+mod serve_util;
 
 use serve_hop::{DeferredHop, drain_deferred_hops};
 // #625: MULTI queue-time routing + blocking/WAIT park + spanning-combine dispatch. `pub(crate)`
@@ -65,7 +65,10 @@ pub(crate) use serve_txn_block::{
 };
 // `block_timeout_value` is used ONLY by the io_uring serve loop's FIX1 immediate-reply path (the
 // tokio loop truly parks), so its re-export is cfg-gated to the io_uring datapath.
-#[cfg(all(target_os = "linux", any(feature = "io_uring", feature = "io_uring_raw")))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io_uring", feature = "io_uring_raw")
+))]
 pub(crate) use serve_txn_block::block_timeout_value;
 // #625: the admin (persist/ACL/shutdown) + raft-cluster mutator command handlers. `pub(crate)`
 // re-export of the route_and_dispatch entrypoints so the router resolves them unchanged.
@@ -95,30 +98,31 @@ pub(crate) use serve_hooks::{
 // `pub(crate)` re-export so the spine still in `serve` (route_and_dispatch, handle_request) resolves
 // them unchanged.
 pub(crate) use serve_classify::{
-    all_keys_home_owned, is_fan_out_multikey, is_fan_out_spanning_combine, is_fan_out_spanning_move,
-    is_fan_out_spanning_zset, is_serve_pubsub_command, is_spanning_move_reject, reject_internal_verb,
-    reject_spanning_move,
+    all_keys_home_owned, is_fan_out_multikey, is_fan_out_spanning_combine,
+    is_fan_out_spanning_move, is_fan_out_spanning_zset, is_serve_pubsub_command,
+    is_spanning_move_reject, reject_internal_verb, reject_spanning_move,
 };
 // #625: the per-shard core-local state accessors + lifecycle flags. `pub(crate)` re-export so the
 // spine still in `serve` (serve loops, routing), every sibling submodule, and external callers
 // (`crate::coordinator`, `crate::replica_attach`, `crate::upgrade`, INFO) resolve them unchanged.
 pub(crate) use serve_shard_state::{
-    STORE_SLOTS_PER_DB, TRACKING, adopt_metrics_cell, adopt_process_memory_gauge, ensure_shard_ring,
-    ensure_shard_started, fresh_shard_store, install_receiver_flip_barrier, is_serving,
-    is_shard_loading, quiesce_shard, report_receiver_shard_committed, scan_reserved_bits,
-    set_replica_passive, set_serving, shard_blocking, shard_env, shard_pubsub, shard_started_at,
-    shard_state, shard_store, shard_tracking, shard_wheel, stash_shard_ring, unquiesce_shard,
+    STORE_SLOTS_PER_DB, TRACKING, adopt_metrics_cell, adopt_process_memory_gauge,
+    ensure_shard_ring, ensure_shard_started, fresh_shard_store, install_receiver_flip_barrier,
+    is_serving, is_shard_loading, quiesce_shard, report_receiver_shard_committed,
+    scan_reserved_bits, set_replica_passive, set_serving, shard_blocking, shard_env, shard_pubsub,
+    shard_started_at, shard_state, shard_store, shard_tracking, shard_wheel, stash_shard_ring,
+    unquiesce_shard,
 };
 // These shard-state items are referenced ONLY by the shard-state unit tests in `serve_tests.rs`
 // (via `use super::*`), so their re-exports/imports are `#[cfg(test)]` (mirrors the serve_signal
 // test-only re-exports below): the loading/ring setters + the expiry-tick internals + the reap
 // interval the expiry test drives.
 #[cfg(test)]
+use ironcache_server::EXPIRE_CYCLE_INTERVAL;
+#[cfg(test)]
 pub(crate) use serve_shard_state::{
     expire_cycle_tick, set_shard_loading, shard_ring, spawn_expire_task,
 };
-#[cfg(test)]
-use ironcache_server::EXPIRE_CYCLE_INTERVAL;
 // #625: `encode_into` (reply-encoder shim, ~28 call sites) + `ascii_upper` (routing-token
 // uppercaser, also used by `crate::coordinator` as `crate::serve::ascii_upper`). `pub(crate)` so the
 // coordinator path + every sibling serve submodule resolve them unchanged.

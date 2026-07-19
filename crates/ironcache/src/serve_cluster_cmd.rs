@@ -464,7 +464,9 @@ pub(crate) fn build_flushslots(
 
 /// Parse the slot list of `CLUSTER ADDSLOTS <slot>...` (arity Min(3); each slot strictly
 /// validated, mirroring the static path's Redis error shapes).
-pub(crate) fn parse_addslots_slots(request: &Request) -> Result<Vec<u16>, ironcache_protocol::ErrorReply> {
+pub(crate) fn parse_addslots_slots(
+    request: &Request,
+) -> Result<Vec<u16>, ironcache_protocol::ErrorReply> {
     use ironcache_protocol::ErrorReply;
     if request.args.len() < 3 {
         return Err(ErrorReply::unknown_subcommand(
