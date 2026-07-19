@@ -7318,17 +7318,6 @@ fn handle_request(
     conn.should_close
 }
 
-/// #515 ZERO-COPY GET size floor. A present String value at or above this many bytes takes the
-/// zero-copy home-GET path (its bytes are spliced into the socket write straight from the store,
-/// never copied into `out`); a smaller value takes the by-reference COPY path (#511), because for a
-/// small value the fixed zero-copy bookkeeping -- a slot-`Arc` clone (one atomic), a boxed
-/// [`ironcache_store::ZcPin`], and an extra `iovec` in the writev -- costs more than just memcpying
-/// the bytes into `out`. 16 KiB is a conservative break-even: well above where the pin overhead is
-/// amortized, so the elided copy is always a net win, and small/medium values are byte-for-byte the
-/// pre-#515 path. Applies ONLY on the io_uring serve loop (the only loop that installs a
-/// [`struct@ZC_SINK`] and issues the vectored `send_zc`); the tokio loop always copies.
-const ZC_THRESHOLD: usize = 16 * 1024;
-
 /// The per-shard-thread ZERO-COPY GET sink (#515 P4c). See [`ZC_SINK`] / [`push_zc_bulk`].
 #[cfg(all(
     target_os = "linux",
@@ -7383,8 +7372,8 @@ const fn zc_sink_active() -> bool {
 }
 
 /// PIN a present large String value for a zero-copy send and frame it into `out` (#515 P4c). Called
-/// ONLY after [`zc_sink_active`] returned true and the by-ref classify saw a String hit at/above
-/// [`ZC_THRESHOLD`], so the sink IS installed and the key IS live (same synchronous `borrow_mut`
+/// ONLY after [`zc_sink_active`] returned true and the by-ref classify saw a String hit at/above the
+/// live `zero-copy-get-threshold`, so the sink IS installed and the key IS live (same synchronous `borrow_mut`
 /// scope, no await, no other code interleaves). Frames `$<len>\r\n` then the SPLICE POINT then `\r\n`
 /// -- the value bytes are NOT copied into `out`; the send interleaves them from the pin at that
 /// offset. Returns `true` on success. Returns `false` (leaving `out` UNTOUCHED) only in the
@@ -7523,15 +7512,18 @@ fn get_home_by_ref(
             Some(v) if v.data_type() == DataType::String => {
                 deltas.keyspace_hits += 1;
                 let bytes = v.as_bytes();
-                // #515 ZERO-COPY GET: a LARGE value on the io_uring serve loop is SPLICED into the
-                // socket write straight from the store -- its bytes are NEVER copied into `out`. A
-                // small value, or any value on the tokio loop (`zc_sink_active()` is a const `false`
-                // off io_uring), takes the by-ref COPY fast path (#511): frame `$<len>\r\n<bytes>\r\n`
+                // #515 ZERO-COPY GET: a value at/above the live `zero-copy-get-threshold` on the
+                // io_uring serve loop is SPLICED into the socket write straight from the store -- its
+                // bytes are NEVER copied into `out`. A smaller value, a `0` threshold (zero-copy
+                // disabled), or any value on the tokio loop (`zc_sink_active()` is a const `false` off
+                // io_uring), takes the by-ref COPY fast path (#511): frame `$<len>\r\n<bytes>\r\n`
                 // straight from the stored bytes into `out` -- no `Bytes::copy_from_slice`, no
                 // `Value::BulkString`. `out` is a distinct buffer from `store`, so `v.as_bytes()` (a
                 // borrow into the store) and `&mut out` do not alias; the borrow ends at the arm
-                // boundary, inside the store scope.
-                if bytes.len() >= ZC_THRESHOLD && zc_sink_active() {
+                // boundary, inside the store scope. The threshold is one relaxed atomic load per home
+                // GET (config-tunable, hot-reloadable via `CONFIG SET zero-copy-get-threshold`).
+                let zc_threshold = ctx.runtime.zero_copy_get_threshold();
+                if zc_threshold != 0 && bytes.len() as u64 >= zc_threshold && zc_sink_active() {
                     true
                 } else {
                     ironcache_protocol::encode_bulk_ref(out, bytes);
