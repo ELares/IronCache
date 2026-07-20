@@ -9,8 +9,8 @@ CLUSTER SLOTS/SHARDS/NODES projection) on real hardware with a real Redis-cluste
 
 ## Setup
 
-- **Nodes:** 3x `t4g.micro` (AWS Graviton, aarch64, 2 vCPU burstable, ~1 GiB) in one
-  VPC/subnet/AZ (us-west-2c). Each runs the released `linux-arm64-musl` ironcache binary
+- **Nodes:** 3x `t4g.micro` (AWS Graviton, aarch64, 2 vCPU burstable, ~1 GiB) co-located
+  in one VPC/subnet/AZ. Each runs the released `linux-arm64-musl` ironcache binary
   (2026.0617.2), `shards = 2`, `maxmemory = 600mb`, `maxmemory-policy = allkeys-lru`,
   `cluster_enabled = true`, a per-node `cluster-announce-id`, and the SAME static
   `[[cluster_topology.nodes]]` block splitting the 16384 slots `[0,5461] / [5462,10922] /

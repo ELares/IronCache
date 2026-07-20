@@ -281,8 +281,8 @@ which needed a discriminant + the fat-pointer length word) to a SINGLE 8-byte
 THIN blob `[u32 total_len][the Round-3 blob]` (the length moved INTO the allocation,
 so the pointer is thin), `1` = `Box::into_raw(Box<CollEntry>)`. Both allocations are
 >= 2-aligned (Str is align 8; `CollEntry` has pointer/u32 fields), so the low bit is
-always free. This took LIFTING `#![forbid(unsafe_code)]` on ironcache-store (Zeke
-authorized "use unsafe if you have to"), replaced with `#![deny(unsafe_op_in_unsafe_fn)]`.
+always free. This took LIFTING `#![forbid(unsafe_code)]` on ironcache-store (the owner
+authorized use of unsafe where necessary), replaced with `#![deny(unsafe_op_in_unsafe_fn)]`.
 The unsafe is CONFINED to one `Entry` impl in kvobj.rs (manual alloc/dealloc, tag
 set/clear via strict-provenance `map_addr`, the access reconstructions, Drop, Clone),
 every block with a `// SAFETY:` justification; the blob CONTENT is still parsed with

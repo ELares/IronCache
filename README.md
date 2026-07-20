@@ -335,9 +335,10 @@ from-source:
 - **`hugepages`**: backs the store tables and value blobs with transparent huge
   pages by appending `thp:always,metadata_thp:auto` to the baked-in jemalloc
   `malloc_conf`. The same behavior is available at RUNTIME on any binary (including
-  the shipped ones, no rebuild) via `_RJEM_MALLOC_CONF=thp:always`. Measured: ~45%
-  fewer dTLB misses and ~5% fewer cycles on both index arms, qps-neutral. Default
-  off because `thp:always` can raise RSS against the `maxmemory` ceiling.
+  the shipped ones, no rebuild) via `_RJEM_MALLOC_CONF=thp:always`. Measured (A/B in
+  [docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md)): ~45% fewer dTLB
+  misses and ~5% fewer cycles on both index arms, qps-neutral. Default off because
+  `thp:always` can raise RSS against the `maxmemory` ceiling.
 - **`hashbrown-index`**: the SwissTable fallback arm for the store's per-slot index
   (the pre-#285 default), kept fully CI-gated so the Dash-index flip is reversible.
 
@@ -508,12 +509,14 @@ shard); Dragonfly runs `--cluster_mode=emulated`. Both driven by
 | 1  | 0.70 / 0.69 | **1.02 / 0.98** | -31% |
 | 16 | **3.35 / 2.91** | 2.82 / 2.61 | **+19%** |
 | 32 | **4.08 / 3.46** | 2.83 / 3.34 | **+44%** |
-| 64 | **4.31 / 3.95** | 3.45 / 3.98 | **+25%** |
+| 64 | **4.31** / 3.95 | 3.45 / **3.98** | **+25%** |
 
 At every pipeline depth of 16 or more, IronCache **leads GET by +19 to +60%**
-(the +60% is the 256B leg) and **SET by +3 to +24%**, on the SHIPPED binary. At
-256B IronCache leads GET at every depth. The single row Dragonfly wins is
-**pipeline 1** (no pipelining), by about 30%: with no batch to amortize, its
+(the +60% is the 256B leg), on the SHIPPED binary. At 256B IronCache leads GET at
+every depth. SET also leads at 128B pipeline 16 to 32 (+4 to +12%) and across the
+256B legs, with one honest exception: **128B pipeline 64, where SET is a
+within-noise tie** (IronCache 3.95 vs Dragonfly 3.98). The single row Dragonfly
+wins outright is **pipeline 1** (no pipelining), by about 30%: with no batch to amortize, its
 leaner per-command path shows, and IronCache's own per-key cluster routing cost
 is not yet paid back at depth 1 (single-endpoint IronCache is actually faster
 than cluster-routed at depth 1). Real high-throughput deployments pipeline,
@@ -533,7 +536,9 @@ outright.
 | 64 | 1.26 / 1.01 | 2.98 / 2.95 | **3.34 / 3.83** |
 
 **Memory** (`used_memory` delta over exactly-N distinct 128B keys, fine keycount
-sweep in one environment):
+sweep in ONE environment: colima aarch64 Linux, IronCache on jemalloc vs Dragonfly
+on mimalloc, populated via `redis-cli --pipe` / `DEBUG POPULATE`. Each engine's
+allocator is inherent to it and materially shapes bytes/key):
 
 | keys | IronCache (Dash index) | Dragonfly v1.39.0 |
 | ---: | ---: | ---: |
@@ -553,19 +558,21 @@ one (the index slot cost is about 12 to 14 B/key either way, measured
 resize-free), so it is bounded and honest: predictable-flat versus lower-but-swingy.
 
 **How to read this (honestly).** On the realistic pipelined, cluster-aware
-config IronCache leads Dragonfly on both GET and SET, on the shipped binary, with
-a reproducible artifact behind every number. Baseline p99.9 latency **ties**
-Dragonfly (measured identical at a matched load). Two rows honestly go the other
+config IronCache leads Dragonfly on GET at every pipelined depth and on SET at all
+but one cell (the 128B pipeline-64 SET is a within-noise tie), on the shipped
+binary, with a reproducible artifact behind every number. Baseline p99.9 latency
+**ties** Dragonfly (measured identical at a matched load). Two rows honestly go the other
 way: **pipeline 1** (no pipelining) throughput, where Dragonfly's leaner
 per-command path wins about 30%, and the **during-snapshot tail** (IronCache's
 291ms durable-save p99.9 vs Dragonfly's ~15ms), a known limitation at a
 memory-bandwidth floor that only incremental snapshots can move (tracked, not yet
 built). Memory is a wash decided by keycount: IronCache flat-and-predictable,
 Dragonfly lower in a narrow short-key window and much higher in others. Versus
-**Redis 8** the SET story is unassailable: IronCache's per-core
-write path is about **2.5x** Redis 8's best config (Redis serializes every write
-on its single main thread regardless of io-threads). IronCache's decisive edges
-are pipelined throughput, memory, and determinism.
+**Redis 8**, IronCache's thread-per-core write path parallelizes SET across all
+shards where Redis serializes every write on its single main thread (regardless of
+io-threads); a committed per-core SET A/B against Redis 8 is future work, so no
+throughput multiple is claimed here. IronCache's decisive, reproducible edges are
+pipelined cluster-aware throughput, memory, and determinism.
 
 ### Pipelined pinned-core depth sweep (dated 2026-07-13)
 
@@ -592,10 +599,13 @@ wakes), NOT an engine ceiling, and a cluster-aware client sidesteps all of it. T
 makes the deep-pipeline cliff a CLIENT-ROUTING artifact; server-side hop batching was
 analyzed and deliberately NOT pursued (it would trade the eager-hop overlap for
 uncertain savings). The same sweep also overturned an earlier io_uring reading: the
-io_uring datapath is **+189% at depth 32** once the load generator pipelines (the
-prior "~6% slower than tokio" was a non-pipelined-loadgen artifact). Lesson kept: a
-throughput verdict is meaningless without a pipelined load generator. The full
-record is in [docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md).
+io_uring datapath is materially faster once the load generator pipelines
+(**+187% at depth 32** in the committed re-bench,
+[docs/bench/IOURING_DATAPATH_BENCH.md](docs/bench/IOURING_DATAPATH_BENCH.md); this
+earlier depth sweep read ~+189% before a reproducible log existed, and the ~2-point
+delta is run noise). The prior "~6% slower than tokio" was a non-pipelined-loadgen
+artifact. Lesson kept: a throughput verdict is meaningless without a pipelined load
+generator. The full record is in [docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md).
 
 ### Index memory: flat bytes/key (dated 2026-07-15)
 
@@ -612,65 +622,17 @@ scan, absorbed by higher IPC) that no realistic bottleneck profile surfaces as q
 The hashbrown arm stays CI-gated behind `hashbrown-index`, so the arms remain
 comparable and the flip reversible.
 
-### Small-node (2-vCPU) worst case (dated 2026-06-21)
+### Small-node (2-vCPU) worst case
 
-The earlier run below intentionally used 2-vCPU nodes -- the WORST case for a
-thread-per-core design (no core headroom), where single-threaded Redis stays most
-competitive. It predates the move to the Redis 8 baseline (it used Redis 7.4.1), and the
-higher-core numbers above supersede its overall standings -- the multi-threaded engines
-have no headroom on 2 cores and stretch out at real core count, where the corrected
-thread-per-core re-bench above shows IronCache LEADING GET rather than trailing Dragonfly.
-
-**Setup.** Server nodes are **t4g.medium** (2 vCPU / 4 GB, arm64, AL2023); the load
-generator is a separate **t4g.2xlarge**. The tool is `memtier_benchmark` against
-32-byte values over a 1,000,000-key space, pipeline 16 for throughput and pipeline 1
-for latency, peak across a connection sweep, persistence off. Each engine is given
-both cores (Redis `io-threads 2`, KeyDB `server-threads 2`, Dragonfly
-`proactor_threads 2`, IronCache `shards 2`). Versions: Redis 7.4.1, KeyDB 6.3.4,
-Dragonfly v1.39.0, IronCache (this build).
-
-### Single node, peak ops/sec
-
-| Workload | Redis 7.4 | KeyDB 6.3 | Dragonfly 1.39 | IronCache |
-| --- | ---: | ---: | ---: | ---: |
-| SET | 570,912 | 361,198 | 517,079 | **596,495** |
-| GET | 610,241 | 347,058 | 529,331 | **642,425** |
-| MIX 1:10 | **574,344** | 346,011 | 453,481 | 562,124 |
-| INCR | **924,908** | 541,577 | 548,804 | 663,373 |
-| GET p99 ms (pipeline 1) | 0.447 | 0.455 | 0.431 | **0.407** |
-
-### 3-node cluster, peak ops/sec
-
-| Workload | Redis 7.4 | KeyDB 6.3 | Dragonfly 1.39 | IronCache |
-| --- | ---: | ---: | ---: | ---: |
-| SET | **1,223,353** | 665,630 | 1,026,420 | 1,067,433 |
-| GET | 1,298,207 | 1,011,979 | 1,104,863 | **1,298,452** |
-| MIX 1:10 | **1,222,915** | 969,486 | 936,071 | 1,057,888 |
-
-### How to read this (honestly)
-
-These are small (2-vCPU) nodes, chosen deliberately. On only two cores the
-multi-threaded engines have very limited headroom, so single-threaded Redis stays
-extremely competitive and in fact **wins the tiny-payload commands** (INCR
-single-node, SET and MIX on the cluster) where its hand-tuned single-thread core has
-the least overhead to amortize.
-
-Where IronCache leads: it **tops SET and GET throughput and GET tail latency
-single-node**, and it **ties Redis on cluster GET (about 1.30M ops/sec)**. KeyDB and
-Dragonfly trail here, but note that is a 2-vCPU artifact: with only two cores the
-multi-threaded engines cannot stretch. Given real core count the field spreads out (see
-the pinned Dragonfly head-to-head above), where the cluster-aware re-bench shows
-IronCache **LEADING GET** (+19 to +60% at pipeline depths of 16 or more) once #517
-zero-hop routing removes the cross-shard hop. The picture is honest in both directions:
-Redis wins the small-op rows, IronCache wins the bulk SET/GET and latency rows on these
-nodes.
-
-That "higher-core nodes would widen the multi-threaded engines' lead over
-single-threaded Redis" is no longer a projection -- the pinned head-to-head above
-measures it; this run intentionally used small nodes to show the worst case for a
-thread-per-core design, not its best. Reproduce a row with `memtier_benchmark` (32-byte
-values, 1M keyspace, `--pipeline 16` for throughput / `--pipeline 1` for latency, both
-cores per engine), sweeping connections for the peak.
+An earlier run (2026-06-21) benchmarked all four engines on 2-vCPU `t4g.medium`
+nodes -- the worst case for a thread-per-core design (no core headroom), where
+single-threaded Redis stays most competitive. It predated the Redis 8 baseline (it
+used Redis 7.4.1) and, unlike every number above, its raw `memtier` logs were never
+committed to `docs/bench/`, so those standings are NOT reproducible and are not
+published here. The pinned, artifact-backed head-to-head above (real core count,
+Redis 8, both engines owner-routed) is the authoritative comparison; on only two
+cores the multi-threaded engines have no headroom to stretch, which is exactly why
+that worst case is not the standing IronCache should be measured on.
 
 ---
 
