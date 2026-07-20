@@ -144,6 +144,15 @@ jobs:
       # the musl std on the same toolchain that compiles the workspace.
       - run: rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release --target x86_64-unknown-linux-musl
+      # #682: the RAW io_uring backend (`io_uring_raw`) is built directly on the `io-uring` crate
+      # (NOT tokio-uring), specifically so the io_uring datapath can ride the static-musl release
+      # that tokio-uring's `io_uring` feature CANNOT cross-build (tokio-uring pulls libc `statx`
+      # types that fail against musl). This step is the regression gate for that "unblock musl"
+      # guarantee: the SAME musl target must compile the binary WITH `--features io_uring_raw`.
+      # (The tokio-uring `io_uring` feature is deliberately NOT built here -- it is expected to fail
+      # on musl; that failure is the whole reason the raw backend exists.)
+      - name: build --features io_uring_raw (musl unblock, #682)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ironcache --features io_uring_raw
 
   io-uring:
     name: io_uring datapath (Linux, default-off feature)
