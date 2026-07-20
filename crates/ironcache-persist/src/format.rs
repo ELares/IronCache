@@ -105,6 +105,20 @@ pub fn delta_file_name(shard: u32, delta_epoch: u64) -> String {
     format!("dump-shard-{shard}-delta-{delta_epoch}.icsd")
 }
 
+/// Parse a file name back into its `(shard, delta_epoch)` iff it is EXACTLY a
+/// [`delta_file_name`] output; `None` for a base `.icss` file, the manifest, or any foreign name.
+/// This is the strict inverse of [`delta_file_name`] (both integer components must round-trip), so
+/// the orphan GC (#676, [`crate::gc_orphan_deltas`]) only ever considers reclaiming files it can
+/// prove this crate wrote as deltas -- never a base file or an unrelated file that merely shares a
+/// prefix.
+#[must_use]
+pub fn parse_delta_file_name(name: &str) -> Option<(u32, u64)> {
+    let rest = name.strip_prefix("dump-shard-")?;
+    let (shard, rest) = rest.split_once("-delta-")?;
+    let epoch = rest.strip_suffix(".icsd")?;
+    Some((shard.parse().ok()?, epoch.parse().ok()?))
+}
+
 /// The full path to the manifest within `dir`.
 #[must_use]
 pub fn manifest_path(dir: &Path) -> PathBuf {

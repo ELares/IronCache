@@ -715,7 +715,7 @@ async fn save_all_to_dir(
         base_final,
         delta_final,
     ) {
-        Ok(_) => {
+        Ok(manifest) => {
             if durable {
                 match mode {
                     // A durable base bumps the base generation; a durable delta stays on its base
@@ -732,6 +732,16 @@ async fn save_all_to_dir(
                 // A handoff commits only to tmpfs (the durable base is NOT advanced), so `needs_base`
                 // stays forced (set after the fan-out): the next durable save re-bases.
                 persist.record_handoff_committed(save_unix_secs);
+            }
+            // Reclaim delta files the NEW manifest no longer references (#676 GC): a base compaction
+            // orphans the whole prior chain, and each new base generation orphans the previous base's
+            // deltas. Runs AFTER the manifest is committed (the sole commit point), so an unreferenced
+            // delta is provably dead. Best-effort: the save has already succeeded, so a GC failure is
+            // logged, never propagated.
+            match ironcache_persist::gc_orphan_deltas(dir, &manifest) {
+                Ok(n) if n > 0 => tracing::info!(reclaimed = n, "reclaimed orphan delta files"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("orphan delta GC failed (non-fatal): {e}"),
             }
             Ok(())
         }

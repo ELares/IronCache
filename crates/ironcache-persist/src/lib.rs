@@ -88,8 +88,8 @@ pub mod format;
 
 pub use format::{
     DeltaManifestEntry, MANIFEST_VERSION_BASE, MANIFEST_VERSION_DELTA, Manifest,
-    ShardManifestEntry, SnapshotLoadError, crc32, delta_file_name, manifest_path, shard_file_name,
-    shard_path,
+    ShardManifestEntry, SnapshotLoadError, crc32, delta_file_name, manifest_path,
+    parse_delta_file_name, shard_file_name, shard_path,
 };
 
 use std::io;
@@ -478,6 +478,50 @@ pub fn write_manifest_v2(
     let path = format::manifest_path(dir);
     format::write_file_atomic(&path, &manifest.encode())?;
     Ok(manifest)
+}
+
+/// RECLAIM orphan delta files (#676 GC): delete every `.icsd` delta file in `dir` that the
+/// just-committed `manifest` does NOT reference. Delta files are epoch-unique
+/// ([`format::delta_file_name`]) so they ACCUMULATE; a base compaction ([`SaveMode::Base`]) resets
+/// the manifest to base-only, orphaning the whole prior chain, and a new base generation orphans the
+/// previous base's deltas -- without this sweep those files live on disk forever.
+///
+/// MUST be called only AFTER `manifest` is durably committed (it is [`write_manifest_v2`]'s return,
+/// written LAST as the sole commit point). That ordering is what makes this safe: the loader reads
+/// ONLY files the committed manifest names, so any `.icsd` the manifest omits is provably dead, and a
+/// crash mid-sweep merely leaves orphans for the next save's sweep (never loses a referenced file).
+/// Only files that round-trip through [`format::parse_delta_file_name`] are ever considered, so a
+/// base `.icss`, the manifest, or any foreign file is never touched. Best-effort per file: a removal
+/// error (e.g. a concurrent unlink) is skipped, not propagated, so GC never fails an already-committed
+/// save. Returns the number of files reclaimed.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] only if the directory itself cannot be READ (`read_dir`); per-file
+/// removal errors are swallowed.
+pub fn gc_orphan_deltas(dir: &Path, manifest: &Manifest) -> io::Result<usize> {
+    // The keep-set: the live delta chain the committed manifest references, by file name.
+    let keep: std::collections::HashSet<&str> =
+        manifest.deltas.iter().map(|d| d.file.as_str()).collect();
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Consider ONLY files this crate wrote as deltas (strict inverse of `delta_file_name`); a
+        // base file / manifest / foreign name never parses and is left alone.
+        if format::parse_delta_file_name(name).is_none() {
+            continue;
+        }
+        if keep.contains(name) {
+            continue; // still referenced by the live chain -> keep.
+        }
+        // Unreferenced delta => dead. Best-effort remove; ignore a race/ENOENT.
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// The maximum number of DELTA rounds chained onto one base before a save COMPACTS to a fresh base
@@ -1559,6 +1603,86 @@ mod tests {
         assert_eq!(m2.version, format::MANIFEST_VERSION_DELTA);
         assert_eq!(read_manifest(&dir).expect("v2 reads back"), m2);
         assert_eq!(m2.deltas.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_delta_file_name_is_the_strict_inverse_of_delta_file_name() {
+        // Round-trips exactly what `delta_file_name` produces.
+        assert_eq!(parse_delta_file_name(&delta_file_name(0, 1)), Some((0, 1)));
+        assert_eq!(
+            parse_delta_file_name(&delta_file_name(37, 900)),
+            Some((37, 900))
+        );
+        // Rejects a base file, the manifest, and anything non-integer / foreign -> GC never touches it.
+        assert_eq!(parse_delta_file_name(&shard_file_name(0)), None);
+        assert_eq!(parse_delta_file_name("dump.manifest"), None);
+        assert_eq!(parse_delta_file_name("dump-shard-x-delta-1.icsd"), None);
+        assert_eq!(parse_delta_file_name("dump-shard-0-delta-y.icsd"), None);
+        assert_eq!(parse_delta_file_name("unrelated.txt"), None);
+    }
+
+    #[test]
+    fn gc_orphan_deltas_removes_only_unreferenced_deltas() {
+        let dir = temp_dir("gc-orphan");
+        // A base file, three delta files, and two files GC must NEVER touch.
+        let base = shard_file_name(0);
+        std::fs::write(dir.join(&base), b"base").unwrap();
+        for e in [1u64, 2, 3] {
+            std::fs::write(dir.join(delta_file_name(0, e)), b"delta").unwrap();
+        }
+        std::fs::write(dir.join("dump.manifest"), b"m").unwrap();
+        std::fs::write(dir.join("unrelated.txt"), b"x").unwrap();
+
+        // A committed manifest referencing ONLY delta epoch 3 (epochs 1 + 2 are now orphans).
+        let base_entries = vec![ShardManifestEntry {
+            shard: 0,
+            file: base.clone(),
+            keys: 1,
+            crc: 0,
+        }];
+        let deltas = vec![DeltaManifestEntry {
+            shard: 0,
+            file: delta_file_name(0, 3),
+            puts: 1,
+            tombstones: 0,
+            crc: 0,
+            base_epoch: 1,
+            delta_epoch: 3,
+        }];
+        let manifest = write_manifest_v2(&dir, 1, 100, base_entries, deltas).unwrap();
+
+        assert_eq!(gc_orphan_deltas(&dir, &manifest).unwrap(), 2);
+        assert!(dir.join(delta_file_name(0, 3)).exists(), "referenced kept");
+        assert!(!dir.join(delta_file_name(0, 1)).exists(), "orphan 1 gone");
+        assert!(!dir.join(delta_file_name(0, 2)).exists(), "orphan 2 gone");
+        assert!(dir.join(&base).exists(), "base untouched");
+        assert!(dir.join("dump.manifest").exists(), "manifest untouched");
+        assert!(dir.join("unrelated.txt").exists(), "foreign untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_orphan_deltas_base_compaction_reclaims_whole_chain() {
+        let dir = temp_dir("gc-compact");
+        let base = shard_file_name(0);
+        std::fs::write(dir.join(&base), b"base").unwrap();
+        for e in [1u64, 2, 3, 4] {
+            std::fs::write(dir.join(delta_file_name(0, e)), b"delta").unwrap();
+        }
+        // A base-only manifest (compaction): no deltas referenced -> the whole chain is orphaned.
+        let base_entries = vec![ShardManifestEntry {
+            shard: 0,
+            file: base.clone(),
+            keys: 1,
+            crc: 0,
+        }];
+        let manifest = write_manifest_v2(&dir, 2, 100, base_entries, vec![]).unwrap();
+        assert_eq!(gc_orphan_deltas(&dir, &manifest).unwrap(), 4);
+        assert!(dir.join(&base).exists());
+        for e in [1u64, 2, 3, 4] {
+            assert!(!dir.join(delta_file_name(0, e)).exists());
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
