@@ -639,9 +639,8 @@ impl<C: ClusterClient, U: NodeUpgrader> LiveCluster<C, U> {
         // and short-circuit the roll to a FALSE success (the old primary never upgraded). `CLUSTER
         // SHARDS` moves it to `replica` immediately (ownership transferred), so we key roles off it.
         // A node absent from `CLUSTER SHARDS` (e.g. a slot-less voter) falls back to its INFO role.
-        let shard_role = |id: &str| -> Option<NodeRole> {
-            members.iter().find(|m| m.id == id).map(|m| m.role)
-        };
+        let shard_role =
+            |id: &str| -> Option<NodeRole> { members.iter().find(|m| m.id == id).map(|m| m.role) };
         // 2. Membership cross-check: the live set MUST equal the static inventory set (drift aborts).
         let discovered: BTreeSet<String> = members.iter().map(|m| m.id.clone()).collect();
         let inventory_ids = self.inventory.ids();
@@ -1979,7 +1978,8 @@ mod tests {
         let order = Rc::new(RefCell::new(Vec::new()));
         let mut live = build_live(&sim, &order);
 
-        let err = run_cluster_upgrade(&mut live, 50).expect_err("must fail loud, not report success");
+        let err =
+            run_cluster_upgrade(&mut live, 50).expect_err("must fail loud, not report success");
         match err {
             ClusterUpgradeError::IncompleteRoll {
                 node,
@@ -2007,7 +2007,10 @@ mod tests {
         };
         let reply = RawReply::Array(Some(vec![RawReply::Array(Some(vec![
             RawReply::Bulk(Some(b"nodes".to_vec())),
-            RawReply::Array(Some(vec![node("owner1", "master"), node("repl1", "replica")])),
+            RawReply::Array(Some(vec![
+                node("owner1", "master"),
+                node("repl1", "replica"),
+            ])),
         ]))]));
         let members = collect_members(&reply);
         assert_eq!(members.len(), 2);
