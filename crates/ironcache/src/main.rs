@@ -924,8 +924,8 @@ fn cmd_upgrade_streamed(
 /// error, naming the blocking step.
 fn cmd_upgrade_cluster(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
     use ironcache::cluster_upgrade_driver::{
-        DriverConfig, FreezeCfg, LiveCluster, PollCfg, RespClusterClient, SshUpgrader,
-        ThreadSleeper, run_cluster_upgrade,
+        CommandUpgrader, DriverConfig, FreezeCfg, LiveCluster, NodeUpgrader, PollCfg,
+        RespClusterClient, SshUpgrader, ThreadSleeper, run_cluster_upgrade,
     };
     use ironcache::cluster_upgrade_inventory::{derive_plan, load_inventory};
     use ironcache::upgrade::pause::LoopbackPauser;
@@ -960,13 +960,21 @@ fn cmd_upgrade_cluster(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
         },
     };
 
-    // The prod seams: authenticated RESP client (bounded per-exchange), SSH per-node swap, the shipped
-    // loopback write-freeze pauser (pointed at the old primary during a promotion), a real sleeper.
+    // The prod seams: authenticated RESP client (bounded per-exchange), the per-node binary-swap
+    // actuator (default SSH; `--actuator-command` swaps in a local-command actuator for orchestrator /
+    // docker-smoke deployments), the shipped loopback write-freeze pauser (pointed at the old primary
+    // during a promotion), a real sleeper.
     let client = RespClusterClient::new(Duration::from_secs(args.per_node_timeout))
         .context("building the RESP cluster client")?;
+    let upgrader: Box<dyn NodeUpgrader> = match args.actuator_command.as_deref() {
+        Some(template) => Box::new(CommandUpgrader::from_template(template).ok_or_else(|| {
+            anyhow::anyhow!("--actuator-command is empty (needs at least a program to run)")
+        })?),
+        None => Box::new(SshUpgrader::new()),
+    };
     let mut live = LiveCluster::new(
         client,
-        SshUpgrader::new(),
+        upgrader,
         Box::new(LoopbackPauser),
         Box::new(ThreadSleeper),
         config,

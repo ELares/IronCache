@@ -915,6 +915,89 @@ impl NodeUpgrader for SshUpgrader {
     }
 }
 
+/// A per-node binary-swap actuator that runs an operator-supplied LOCAL COMMAND instead of SSH: the
+/// [`SshUpgrader`] alternative for deployments that actuate a node's swap through a container
+/// orchestrator, `systemd`, or a config-management runner rather than an interactive SSH login (and
+/// the seam the #630 docker rolling-upgrade smoke drives, so the live composition can be exercised
+/// without an sshd in the distroless node image). The command TEMPLATE is a whitespace-split
+/// `program arg...` in which the placeholders `{id}`, `{source}`, and `{target}` are replaced, per
+/// node, by that node's inventory `id`, `upgrade_source`, and `ssh` target respectively. Like
+/// [`SshUpgrader`] it is a thin `std::process::Command` wrapper that MUST exit 0 only once the node
+/// is up on the new binary; the driver observes the re-attach / in-sync on the next
+/// [`LiveCluster::refresh`].
+///
+/// Example (#630 docker smoke): `docker compose up -d --force-recreate --wait {id}`.
+///
+/// PRIVACY / trust: the template is OPERATOR-SUPPLIED (a CLI flag), exactly as the SSH target is
+/// operator-supplied in the inventory; the driver never hardcodes an actuation command.
+#[derive(Debug, Clone)]
+pub struct CommandUpgrader {
+    /// The program to run (the first template token).
+    program: String,
+    /// The argument template (the remaining tokens); `{id}` / `{source}` / `{target}` are expanded
+    /// per node on each `upgrade`.
+    arg_template: Vec<String>,
+}
+
+impl CommandUpgrader {
+    /// Build a command actuator from a whitespace-split template (`program arg1 arg2 ...`), the first
+    /// token being the program. Returns `None` when the template has no program token (empty /
+    /// whitespace-only), so the caller can fail loud rather than spawn nothing.
+    #[must_use]
+    pub fn from_template(template: &str) -> Option<Self> {
+        let mut parts = template.split_whitespace().map(str::to_owned);
+        let program = parts.next()?;
+        Some(Self {
+            program,
+            arg_template: parts.collect(),
+        })
+    }
+
+    /// Substitute the per-node placeholders in one template argument.
+    fn expand(arg: &str, target: &ActuationTarget) -> String {
+        arg.replace("{id}", &target.id)
+            .replace("{source}", &target.upgrade_source)
+            .replace("{target}", &target.ssh)
+    }
+}
+
+impl NodeUpgrader for CommandUpgrader {
+    fn upgrade(&mut self, target: &ActuationTarget) -> Result<(), ClusterUpgradeError> {
+        // `<program> <arg...>` with `{id}` / `{source}` / `{target}` expanded per node. Same
+        // contract as `SshUpgrader`: the command runs the node's own verify -> swap -> health-gate
+        // out of band and only exits 0 once healthy on the new binary.
+        let mut cmd = std::process::Command::new(&self.program);
+        for a in &self.arg_template {
+            cmd.arg(Self::expand(a, target));
+        }
+        let output = cmd.output().map_err(|e| ClusterUpgradeError::Upgrade {
+            node: target.id.clone(),
+            detail: format!("spawning the actuation command `{}`: {e}", self.program),
+        })?;
+        if !output.status.success() {
+            return Err(ClusterUpgradeError::Upgrade {
+                node: target.id.clone(),
+                detail: format!(
+                    "the actuation command `{}` exited {:?}: {}",
+                    self.program,
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Forward `NodeUpgrader` through a `Box`, so the CLI can pick the actuator (SSH vs command) at
+/// runtime and hand the generic driver ONE boxed upgrader instead of monomorphizing the whole
+/// orchestrator twice.
+impl NodeUpgrader for Box<dyn NodeUpgrader> {
+    fn upgrade(&mut self, target: &ActuationTarget) -> Result<(), ClusterUpgradeError> {
+        (**self).upgrade(target)
+    }
+}
+
 /// The prod loop-pacing sleeper: a real thread sleep. This is the short-lived CLI orchestrator path
 /// (off the server determinism boundary), so a wall-clock sleep is appropriate.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1852,5 +1935,92 @@ mod tests {
             st.failover_lag_at_commit.is_none(),
             "a stuck drain must never promote"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CommandUpgrader (#630): the non-SSH, operator-supplied command actuator.
+    // -----------------------------------------------------------------------
+
+    fn cmd_target(id: &str) -> ActuationTarget {
+        ActuationTarget {
+            id: id.to_owned(),
+            resp_addr: "127.0.0.1:6379".to_owned(),
+            auth: None,
+            ssh: "deploy@host".to_owned(),
+            upgrade_source: "--to v2".to_owned(),
+        }
+    }
+
+    #[test]
+    fn command_upgrader_from_template_splits_program_and_args() {
+        let u = CommandUpgrader::from_template("docker compose up -d --force-recreate {id}")
+            .expect("non-empty template");
+        assert_eq!(u.program, "docker");
+        assert_eq!(
+            u.arg_template,
+            vec!["compose", "up", "-d", "--force-recreate", "{id}"]
+        );
+    }
+
+    #[test]
+    fn command_upgrader_empty_template_is_none() {
+        assert!(CommandUpgrader::from_template("").is_none());
+        assert!(CommandUpgrader::from_template("   ").is_none());
+    }
+
+    #[test]
+    fn command_upgrader_expands_every_placeholder_per_node() {
+        let t = cmd_target("node-a");
+        assert_eq!(CommandUpgrader::expand("{id}", &t), "node-a");
+        assert_eq!(CommandUpgrader::expand("{target}", &t), "deploy@host");
+        assert_eq!(CommandUpgrader::expand("{source}", &t), "--to v2");
+        // Multiple placeholders in one arg all expand.
+        assert_eq!(
+            CommandUpgrader::expand("swap-{id}::{source}", &t),
+            "swap-node-a::--to v2"
+        );
+        // A literal with no placeholder is untouched.
+        assert_eq!(
+            CommandUpgrader::expand("--force-recreate", &t),
+            "--force-recreate"
+        );
+    }
+
+    #[test]
+    fn command_upgrader_ok_on_zero_exit() {
+        // `true` ignores its args and exits 0 -> a successful actuation. (Placeholders still expand.)
+        let mut u = CommandUpgrader::from_template("true {id}").expect("template");
+        assert!(u.upgrade(&cmd_target("node-a")).is_ok());
+    }
+
+    #[test]
+    fn command_upgrader_errors_on_nonzero_exit_naming_the_node() {
+        // `false` exits 1 -> the driver must see an Upgrade error carrying the node id.
+        let mut u = CommandUpgrader::from_template("false").expect("template");
+        let err = u.upgrade(&cmd_target("node-a")).unwrap_err();
+        assert!(
+            matches!(&err, ClusterUpgradeError::Upgrade { node, .. } if node == "node-a"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn command_upgrader_errors_when_program_is_missing() {
+        // A non-existent program is a spawn failure surfaced as an Upgrade error, not a panic.
+        let mut u = CommandUpgrader::from_template("ironcache-no-such-actuator-binary-xyz {id}")
+            .expect("template");
+        let err = u.upgrade(&cmd_target("node-a")).unwrap_err();
+        assert!(
+            matches!(&err, ClusterUpgradeError::Upgrade { node, .. } if node == "node-a"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn boxed_node_upgrader_forwards() {
+        // The CLI hands the driver a `Box<dyn NodeUpgrader>` so it can pick SSH vs command at runtime.
+        let mut boxed: Box<dyn NodeUpgrader> =
+            Box::new(CommandUpgrader::from_template("true").expect("template"));
+        assert!(boxed.upgrade(&cmd_target("node-a")).is_ok());
     }
 }

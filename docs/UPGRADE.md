@@ -402,6 +402,23 @@ Cluster-mode tuning flags (sensible defaults; match the driver / server defaults
 | `--per-node-timeout <SECS>` | `30` | bound on each per-node RESP exchange |
 | `--max-ticks <N>` | `300` | tick budget before failing loud (`StalledAfterBudget`) instead of looping |
 | `--dry-run` | off | observe once, print the plan, take no action |
+| `--actuator-command <TEMPLATE>` | off (SSH) | actuate each node's swap by running a LOCAL command instead of SSH |
+
+**Actuation: SSH by default, or a local command.** By default the driver actuates each
+node's out-of-band binary swap over SSH (`ssh <ssh_target> ironcache upgrade <upgrade_source>
+--yes`), so the node's own hardened single-node upgrade (verify -> SAVE -> swap -> restart ->
+health-gate -> auto-rollback) runs on the node host. For deployments that actuate through a
+container orchestrator, `systemd`, or config-management rather than an interactive SSH login,
+`--actuator-command '<TEMPLATE>'` runs a local command per node instead, with `{id}` /
+`{source}` / `{target}` replaced by that node's inventory `id` / `upgrade_source` /
+`ssh_target`. The command is run directly (no shell), must exit 0 only once the node is up on
+the new binary, and the orchestration (observe -> replicas first -> failover-freeze -> primary
+last) is identical to the SSH path. For example, to roll a docker-composed cluster:
+
+```sh
+ironcache upgrade --cluster --inventory cluster.toml --to v1.2.3 \
+  --actuator-command 'docker compose up -d --force-recreate --wait {id}'
+```
 
 On a stall or an action error the driver exits NONZERO and names the blocking step (no
 quorum, no in-sync candidate, or a node upgrade that did not complete), fail-closed. The
