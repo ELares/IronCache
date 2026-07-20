@@ -279,6 +279,17 @@ pub struct UpgradeArgs {
     /// -- taking NO action (no upgrade, no failover). Use it to confirm primary-last before committing.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// CLUSTER MODE actuation override (#630): instead of the default SSH per-node swap
+    /// (`ssh <ssh_target> ironcache upgrade <upgrade_source> --yes`), actuate each node by running
+    /// this LOCAL command template, with `{id}` / `{source}` / `{target}` replaced per node by the
+    /// node's inventory `id` / `upgrade_source` / `ssh_target`. For deployments that actuate through a
+    /// container orchestrator, `systemd`, or config-management rather than an interactive SSH login
+    /// (and the seam the docker rolling-upgrade smoke drives). Whitespace-split; the command MUST exit
+    /// 0 only once the node is up on the new binary. Example:
+    /// `--actuator-command 'docker compose up -d --force-recreate --wait {id}'`.
+    #[arg(long, value_name = "TEMPLATE")]
+    pub actuator_command: Option<String>,
 }
 
 impl UpgradeArgs {
