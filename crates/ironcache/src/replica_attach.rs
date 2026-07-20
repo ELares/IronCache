@@ -247,6 +247,28 @@ pub(crate) fn spawn_on_shard(
         return;
     };
 
+    // #731 GUARD: the HA cluster-replica path is single-shard BY DESIGN (see this module's
+    // "Single-shard correctness (shards == 1)" doc + the "MULTI-SHARD generalization ... is the real
+    // fix, tracked" notes). A replica full-syncs the WHOLE keyspace into ONE internal shard; once it
+    // is promoted, the N-shard owner routes lookups by slot across N shards, so only the ~1/N of keys
+    // whose slots map to the populated shard are served -- the rest are present-but-unreachable and
+    // `DBSIZE` misleadingly shows the full count. Warn LOUDLY, ONCE per node (gate on shard 0), when a
+    // node wires cluster replication with `shards > 1`, so an operator sees it BEFORE a failover
+    // silently drops N-1/N of their reads. Deliberately a WARN, not a hard refusal: a multi-shard raft
+    // cluster that never assigns a replica is unaffected in practice, and refusing would break it; the
+    // `ironcache upgrade --cluster` driver additionally FAILS CLOSED on `shards > 1` (its RPO=0
+    // contract is unachievable here). Remove when the tracked multi-shard replica generalization lands.
+    if shard_index == 0 && ctx.shards > 1 {
+        tracing::warn!(
+            shards = ctx.shards,
+            "this raft node runs with shards > 1: the HA replica path is single-shard, so IF this node \
+             is assigned an HA replica role, once promoted it will serve only ~1/N of its keyspace (the \
+             remainder present-but-unreachable, DBSIZE misleading) and `ironcache upgrade --cluster` \
+             cannot guarantee RPO=0. Set `shards = 1` for HA cluster replication / rolling upgrades \
+             (multi-shard remains fine for non-HA / throughput-only deployments) (#731)."
+        );
+    }
+
     // INTRA-CLUSTER TRANSPORT SECURITY (PROD-3) for the REPLICATION transport: build the SAME
     // optional TLS + shared-secret handle the Raft cluster-bus uses, from the SAME config
     // (`cluster_tls` / `cluster_secret` / cert / key / CA -- no new knobs). `None` (the default) is

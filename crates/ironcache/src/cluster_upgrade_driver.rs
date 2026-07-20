@@ -168,6 +168,11 @@ pub struct NodeObservation {
     pub link: LinkStatus,
     /// A MASTER's per-replica `slaveN` view (empty for a replica).
     pub slaves: Vec<SlaveEntry>,
+    /// The node's internal shard count, from INFO `io_threads_active` (#731). `1` when the field is
+    /// absent (an older node, or one that does not report it) so we never SPURIOUSLY refuse a roll;
+    /// the pre-flight refuses only on a node that AFFIRMATIVELY reports `> 1` (the HA replica path is
+    /// single-shard, so a multi-shard node cannot deliver RPO=0 -- it would serve ~1/N after promotion).
+    pub shards: usize,
 }
 
 /// The raft quorum signal parsed from `CLUSTER INFO` (#392): quorum is `cluster_state:ok` AND a
@@ -334,6 +339,19 @@ pub enum ClusterUpgradeError {
         /// The number of polls attempted.
         polls: u32,
     },
+    /// #731: a node reports `shards > 1`. The HA cluster-replica path is single-shard by design
+    /// (a replica full-syncs the WHOLE keyspace into ONE internal shard), so a multi-shard node
+    /// promoted on failover would serve only ~1/N of its keyspace -- the driver CANNOT deliver its
+    /// RPO=0 contract. FAIL CLOSED at the pre-flight rather than roll into silent partial-data.
+    #[error(
+        "node {node} has shards={shards} (>1): the HA replica path is single-shard, so `ironcache upgrade --cluster` cannot guarantee RPO=0 on it (a promoted replica would serve ~1/{shards} of its keyspace). Set `shards = 1` on every node for cluster replication / rolling upgrades (multi-shard is fine for non-HA / throughput-only deployments) (#731)."
+    )]
+    MultiShardUnsupported {
+        /// The node reporting more than one shard.
+        node: String,
+        /// The reported shard count.
+        shards: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +367,9 @@ pub fn parse_info_replication(info: &str) -> NodeObservation {
     let mut version = String::new();
     let mut link = LinkStatus::Down;
     let mut slaves = Vec::new();
+    // #731: default 1 so an absent field (older node) never spuriously refuses a roll; only an
+    // affirmative `io_threads_active:N` (N>1) trips the multi-shard pre-flight refusal.
+    let mut shards = 1usize;
     for raw in info.lines() {
         let field = raw.trim_end_matches('\r');
         if let Some(v) = field.strip_prefix("role:") {
@@ -365,6 +386,12 @@ pub fn parse_info_replication(info: &str) -> NodeObservation {
             } else {
                 LinkStatus::Down
             };
+        } else if let Some(v) = field.strip_prefix("io_threads_active:") {
+            // The node's internal shard count (ironcache-observe renders `server.shards` here). A
+            // malformed value keeps the safe default of 1.
+            if let Ok(n) = v.trim().parse::<usize>() {
+                shards = n.max(1);
+            }
         } else if let Some(rest) = strip_slave_prefix(field) {
             if let Some(entry) = parse_slave_line(rest) {
                 slaves.push(entry);
@@ -376,6 +403,7 @@ pub fn parse_info_replication(info: &str) -> NodeObservation {
         version,
         link,
         slaves,
+        shards,
     }
 }
 
@@ -603,6 +631,17 @@ impl<C: ClusterClient, U: NodeUpgrader> LiveCluster<C, U> {
         for target in self.inventory.iter() {
             let obs = self.client.observe_node(target)?;
             observed.push((target.clone(), obs));
+        }
+        // 3b. #731 PRE-FLIGHT: refuse a node with shards > 1. The HA cluster-replica path is
+        // single-shard (a replica full-syncs the whole keyspace into ONE internal shard), so a
+        // multi-shard node promoted on the failover-freeze fence would serve only ~1/N of its
+        // keyspace -- the driver's RPO=0 contract is unachievable. FAIL CLOSED here (before any
+        // upgrade/promote action) rather than silently roll into partial data after a failover.
+        if let Some((target, obs)) = observed.iter().find(|(_, o)| o.shards > 1) {
+            return Err(ClusterUpgradeError::MultiShardUnsupported {
+                node: target.id.clone(),
+                shards: obs.shards,
+            });
         }
         // 4. The MASTER's per-replica view is authoritative for lag (HA-7e).
         let master_slaves: Vec<SlaveEntry> = observed
@@ -1403,6 +1442,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_info_reads_shard_count_from_io_threads_active() {
+        // #731: the shard count comes from INFO `io_threads_active` (ironcache-observe renders
+        // `server.shards` there). A multi-shard node reports > 1 (the pre-flight refuses it).
+        let multi = "role:master\r\nio_threads_active:4\r\nironcache_version:1.2.3\r\n";
+        assert_eq!(parse_info_replication(multi).shards, 4);
+        // Absent field -> default 1 (never spuriously refuse an older node that omits it).
+        let absent = "role:master\r\nironcache_version:1.2.3\r\n";
+        assert_eq!(parse_info_replication(absent).shards, 1);
+        // A single-shard node reports 1 explicitly.
+        let single = "role:replica\r\nio_threads_active:1\r\n";
+        assert_eq!(parse_info_replication(single).shards, 1);
+        // Malformed value falls back to the safe default of 1.
+        let bad = "role:master\r\nio_threads_active:notanumber\r\n";
+        assert_eq!(parse_info_replication(bad).shards, 1);
+    }
+
+    #[test]
     fn parse_cluster_info_reads_quorum_signal() {
         // ok + a recognized leader -> quorum.
         let ok = "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_raft_leader:node-a\r\n";
@@ -1448,6 +1504,9 @@ mod tests {
         /// Ticks remaining until a just-upgraded replica has caught up (link down + large lag while
         /// > 0). Models the swap+resync the StubUpgrader triggers.
         resync: u32,
+        /// The node's internal shard count reported via INFO `io_threads_active` (#731). Default 1
+        /// (the supported single-shard HA config); a test sets it > 1 to exercise the pre-flight.
+        shards: usize,
     }
 
     struct Sim {
@@ -1465,6 +1524,7 @@ mod tests {
                 version: node_version.to_owned(),
                 role,
                 resync: 0,
+                shards: 1,
             };
             Rc::new(RefCell::new(Sim {
                 nodes: vec![
@@ -1551,6 +1611,7 @@ mod tests {
                 version: n.version.clone(),
                 link,
                 slaves,
+                shards: n.shards,
             })
         }
         fn observe_quorum(
@@ -1738,6 +1799,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refresh_fails_closed_on_a_multishard_node() {
+        // #731: a node reporting shards > 1 cannot deliver RPO=0 (the HA replica path is
+        // single-shard), so the pre-flight refuses BEFORE any upgrade/promote action.
+        let sim = Sim::three_node("1.2.3", "1.2.2");
+        sim.borrow_mut().node_mut("r1").shards = 4; // a replica is multi-shard
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut live = build_live(&sim, &order);
+        let err = live.refresh().expect_err("multi-shard must fail closed");
+        match err {
+            ClusterUpgradeError::MultiShardUnsupported { node, shards } => {
+                assert_eq!(node, "r1");
+                assert_eq!(shards, 4);
+            }
+            other => panic!("expected MultiShardUnsupported, got {other:?}"),
+        }
+        // No failover / upgrade action ran (refused at the pre-flight).
+        assert_eq!(sim.borrow().failovers, 0);
+    }
+
+    #[test]
+    fn refresh_allows_an_all_single_shard_cluster() {
+        // The supported config (every node shards == 1) passes the #731 pre-flight cleanly.
+        let sim = Sim::three_node("1.2.3", "1.2.2");
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut live = build_live(&sim, &order);
+        assert!(
+            live.refresh().is_ok(),
+            "an all-single-shard cluster must pass the pre-flight"
+        );
+    }
+
     // ---- the failover-freeze fence (the RPO=0 core) ----
 
     // A freeze-focused client: the candidate's master-side lag drains by one per observe of the old
@@ -1778,6 +1871,7 @@ mod tests {
                     port,
                     lag: cur,
                 }],
+                shards: 1,
             })
         }
         fn observe_quorum(

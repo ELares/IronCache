@@ -1029,6 +1029,9 @@ impl ClusterClient for RollHarnessClient {
             version,
             link,
             slaves,
+            // #731: carry the REAL observed shard count (the loopback nodes are single-shard, so this
+            // is 1 and passes the pre-flight; the roll model overlays only role/version/link/lag).
+            shards: real.shards,
         })
     }
 
