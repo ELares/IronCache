@@ -1,0 +1,61 @@
+# #630 live-composition rolling-upgrade smoke: a REPLICATED 3-node IronCache raft
+# cluster on a thin debian base. Each node bind-mounts a VERSIONED ironcache binary
+# (bin/ironcache-${IC_VER_N}); the "upgrade" of node N is `IC_VER_N=v2 docker compose
+# up -d --force-recreate --wait ironcache-N`, which the driver's --actuator-command
+# runs (via recreate.sh). No image build: the version swap is a bind-mount swap.
+#
+# This is a MASTER + in-sync-REPLICA topology (node-1 owns all slots; node-2/3 attach
+# as replicas at runtime), which is what a replica-first-then-promote rolling upgrade
+# needs -- distinct from the 3-way SHARDED deploy/compose/docker-compose.cluster.yml.
+# Populate bin/ with `./build.sh` first; run the whole smoke with `./smoke.sh`.
+name: ic630
+
+x-node: &node
+  image: debian:bookworm-slim
+  environment:
+    # Local-only smoke value; override via the environment if you like. NOT a real secret.
+    IRONCACHE_CLUSTER_SECRET: ${IRONCACHE_CLUSTER_SECRET:-smoke-only-change-me}
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/ironcache", "cli", "-h", "127.0.0.1", "-p", "6379"]
+    interval: 3s
+    timeout: 3s
+    retries: 10
+    start_period: 5s
+  restart: "no"
+  command:
+    - /usr/local/bin/ironcache
+    - server
+    - --config
+    - /etc/ironcache/ironcache.toml
+    - --metrics-addr
+    - 0.0.0.0:9121
+    - --log-level
+    - ${IC_LOG:-info}
+
+services:
+  ironcache-1:
+    <<: *node
+    hostname: ironcache-1
+    volumes:
+      - ./bin/ironcache-${IC_VER_1:-v1}:/usr/local/bin/ironcache:ro
+      - ./config/node1.toml:/etc/ironcache/ironcache.toml:ro
+      - ic1-data:/var/lib/ironcache
+  ironcache-2:
+    <<: *node
+    hostname: ironcache-2
+    volumes:
+      - ./bin/ironcache-${IC_VER_2:-v1}:/usr/local/bin/ironcache:ro
+      - ./config/node2.toml:/etc/ironcache/ironcache.toml:ro
+      - ic2-data:/var/lib/ironcache
+  ironcache-3:
+    <<: *node
+    hostname: ironcache-3
+    volumes:
+      - ./bin/ironcache-${IC_VER_3:-v1}:/usr/local/bin/ironcache:ro
+      - ./config/node3.toml:/etc/ironcache/ironcache.toml:ro
+      - ic3-data:/var/lib/ironcache
+
+volumes:
+  ic1-data:
+  ic2-data:
+  ic3-data:

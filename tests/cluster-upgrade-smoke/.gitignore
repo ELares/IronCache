@@ -1,0 +1,7 @@
+# Built node/driver binaries (produced by ./build.sh; ~130MB each, never committed).
+bin/
+# Runtime load-test output (acked.txt / errors.txt, written by load.sh at run time).
+out/
+# The live versions.env is rewritten in place by recreate.sh during a roll; seed from
+# versions.env.example instead (smoke.sh copies it). Never commit the mutated file.
+versions.env
