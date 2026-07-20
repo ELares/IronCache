@@ -76,7 +76,7 @@ use ironcache::cluster_upgrade::{ClusterView, NodeRole};
 use ironcache::cluster_upgrade_driver::{
     ActuationTarget, ClusterClient, ClusterUpgradeError, DriverConfig, FreezeCfg, Inventory,
     LiveCluster, NodeObservation, NodeUpgrader, PollCfg, QuorumObservation, RespClusterClient,
-    SlaveEntry, Sleeper, run_cluster_upgrade,
+    ShardMember, SlaveEntry, Sleeper, run_cluster_upgrade,
 };
 use ironcache::raft_boot::bus_port;
 use ironcache::test_support::{run_raft_node_for_test_min_replicas, run_server_for_test};
@@ -455,9 +455,23 @@ impl ClusterClient for MembershipShimClient {
     fn discover_members(
         &mut self,
         seed: &ActuationTarget,
-    ) -> Result<Vec<String>, ClusterUpgradeError> {
-        let _ = self.inner.discover_members(seed); // exercise the real CLUSTER SHARDS transport
-        Ok(self.member_ids.clone())
+    ) -> Result<Vec<ShardMember>, ClusterUpgradeError> {
+        // Exercise the real CLUSTER SHARDS transport AND take its per-member roles (#733), overlaying
+        // only the controlled member-id set for the membership cross-check.
+        let real = self.inner.discover_members(seed)?;
+        let role_of = |id: &str| {
+            real.iter()
+                .find(|m| m.id == id)
+                .map_or(NodeRole::Master, |m| m.role)
+        };
+        Ok(self
+            .member_ids
+            .iter()
+            .map(|id| ShardMember {
+                id: id.clone(),
+                role: role_of(id),
+            })
+            .collect())
     }
     fn observe_node(
         &mut self,
@@ -979,9 +993,27 @@ impl ClusterClient for RollHarnessClient {
     fn discover_members(
         &mut self,
         seed: &ActuationTarget,
-    ) -> Result<Vec<String>, ClusterUpgradeError> {
+    ) -> Result<Vec<ShardMember>, ClusterUpgradeError> {
         let _ = self.inner.discover_members(seed); // real CLUSTER SHARDS transport
-        Ok(self.member_ids.clone())
+        // #733: CLUSTER SHARDS projects the COMMITTED role, which is the roll model's effective role
+        // (the injected promotion flips the candidate to master + the old primary to replica). The
+        // "real role" fallback (pre-promotion) is master for the pre-roll primary, replica otherwise.
+        let st = self.state.borrow();
+        Ok(self
+            .member_ids
+            .iter()
+            .map(|id| {
+                let pre_promotion = if *id == st.primary_id {
+                    NodeRole::Master
+                } else {
+                    NodeRole::Replica
+                };
+                ShardMember {
+                    id: id.clone(),
+                    role: st.effective_role(id, pre_promotion),
+                }
+            })
+            .collect())
     }
 
     fn observe_node(
