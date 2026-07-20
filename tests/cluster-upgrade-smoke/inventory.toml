@@ -1,0 +1,17 @@
+# #630 driver inventory (the static actuation map): the master+replica shard pair the
+# rolling-upgrade driver observes + actuates. resp_addr uses the compose-network DNS
+# names because the driver runs ON that network (see smoke.sh). node-2 is a quorum
+# voter that owns no slots, so it is not a roll target and is omitted here.
+seeds = ["1111111111111111111111111111111111111111", "3333333333333333333333333333333333333333"]
+
+[[node]]
+id = "1111111111111111111111111111111111111111"
+resp_addr = "ironcache-1:6379"
+ssh_target = "ironcache-1"
+upgrade_source = "2.0.0"
+
+[[node]]
+id = "3333333333333333333333333333333333333333"
+resp_addr = "ironcache-3:6379"
+ssh_target = "ironcache-3"
+upgrade_source = "2.0.0"

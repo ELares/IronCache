@@ -1,0 +1,41 @@
+# #630 rolling-upgrade smoke: node 1 of a REPLICATED 3-node raft cluster.
+# node-1 owns ALL 16384 slots (the primary); node-2/3 are voters owning NO slots
+# (empty ranges validate in raft mode), promoted to REPLICAS of node-1 at runtime
+# via CLUSTER REPLICATE. This is the 1-master / in-sync-replica shape the roll needs.
+# shards = 1 is REQUIRED: the HA replica path is single-shard (see #731), so a
+# multi-shard node cannot deliver RPO=0 on promotion.
+bind = "0.0.0.0"
+port = 6379
+cluster_enabled = true
+shards = 1
+cluster_mode = "raft"
+cluster_announce_id = "1111111111111111111111111111111111111111"
+data_dir = "/var/lib/ironcache"
+save_interval_secs = 900
+save_min_changes = 1
+# 0 so writes ack without waiting on replicas: the ADVERSARIAL (no-freeze) arm can then
+# demonstrate acked-write loss, while the FENCED roll prevents it via freeze+drain.
+min_replicas_to_write = 0
+# Auto-failover OFF for a DRIVER-orchestrated roll: the driver does the CONTROLLED
+# freeze-drain-CLUSTER-FAILOVER promotion, so an aggressive auto-failover (default 5s)
+# must not race it and self-promote a replica mid-setup. The explicit CLUSTER FAILOVER
+# the driver issues is unaffected by this timeout.
+failover_timeout_secs = 3600
+
+[[cluster_topology.nodes]]
+id = "1111111111111111111111111111111111111111"
+host = "ironcache-1"
+port = 6379
+slots = [[0, 16383]]
+
+[[cluster_topology.nodes]]
+id = "2222222222222222222222222222222222222222"
+host = "ironcache-2"
+port = 6379
+slots = []
+
+[[cluster_topology.nodes]]
+id = "3333333333333333333333333333333333333333"
+host = "ironcache-3"
+port = 6379
+slots = []
