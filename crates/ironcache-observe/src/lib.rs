@@ -34,9 +34,24 @@ pub mod hotkeys;
 
 pub use hotkeys::{DEFAULT_HOTKEYS_COUNT, Hotkeys, HotkeysConfig, HotkeysSnapshot};
 
-/// The IronCache server version reported in `INFO` and `HELLO`. Sourced from the
-/// crate version at build time.
-pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The IronCache server version reported in `INFO` (`ironcache_version`), `HELLO`, and `LOLWUT`.
+///
+/// Prefers the compile-time `IRONCACHE_BUILD_VERSION` (the tagged / rolling-release stamp set in
+/// `release.yml` / `rolling-release.yml`), falling back to `CARGO_PKG_VERSION` (dev / CI, pinned at
+/// `0.0.0`). This MUST match `ironcache::cli::BUILD_VERSION` (the `--version` banner), so `INFO`, the
+/// CLI, and the cluster rolling-upgrade driver's version-completion check all agree on the SAME
+/// string.
+///
+/// Before this, `INFO` hardcoded `CARGO_PKG_VERSION` and so reported `ironcache_version:0.0.0` on
+/// EVERY release (releases stamp `IRONCACHE_BUILD_VERSION`, never `CARGO_PKG_VERSION`). Because the
+/// `ironcache upgrade --cluster` driver observes each node's `ironcache_version` and only completes
+/// once every node reports the `--to <TAG>` target, a roll on real release binaries could never see
+/// any node as upgraded and would stall (`StalledAfterBudget`). `build.rs` emits
+/// `rerun-if-env-changed=IRONCACHE_BUILD_VERSION` so a version change rebuilds this crate.
+pub const SERVER_VERSION: &str = match option_env!("IRONCACHE_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// One command's execution tally for INFO `COMMANDSTATS` (#413): the Redis `cmdstat_<cmd>`
 /// fields. `calls`/`usec` accumulate over every execution; `usec_per_call` is derived at render.
@@ -2372,6 +2387,17 @@ mod tests {
     use super::*;
     use ironcache_env::{Monotonic, TestEnv};
     use std::time::Duration;
+
+    #[test]
+    fn server_version_prefers_build_version_over_crate_version() {
+        // SERVER_VERSION must resolve to IRONCACHE_BUILD_VERSION when the release build stamped it,
+        // else CARGO_PKG_VERSION -- the SAME rule as `ironcache::cli::BUILD_VERSION`, so INFO, the CLI
+        // banner, and the rolling-upgrade driver's version-completion check all agree. (Before the
+        // fix INFO hardcoded CARGO_PKG_VERSION and reported 0.0.0 on releases, stalling the roll.)
+        let expected = option_env!("IRONCACHE_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(SERVER_VERSION, expected);
+        assert!(!SERVER_VERSION.is_empty());
+    }
 
     #[test]
     fn per_shard_render_labels_each_shard_in_a_distinct_namespace() {
