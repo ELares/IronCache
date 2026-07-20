@@ -875,6 +875,25 @@ impl<C: ClusterClient, U: NodeUpgrader> UpgradeActions for LiveCluster<C, U> {
         // (d) UNPAUSE for cleanliness: the old primary is demoted (a refresh confirms), so it no
         //     longer accepts writes, but release the freeze so nothing lingers.
         let _ = self.pauser.unfreeze(&pause_target);
+
+        // (e) #733 CONFIRM the promotion is VISIBLE to our own observer before returning, so the next
+        //     planning tick does not re-derive a stale "not demoted" from a seed that has not yet
+        //     APPLIED the committed PromoteReplica. `cluster_failover` resolves on COMMIT (majority
+        //     append + commit-advance); a FOLLOWER seed applies the entry into its SlotMap only on its
+        //     next heartbeat, so its CLUSTER SHARDS can briefly still project the OLD owner as master.
+        //     A stale re-derive would drive a spurious second Promote (the server's in-sync gate
+        //     refuses re-failover of the already-promoted candidate, so it is fail-closed -- never a
+        //     double promotion -- but it needlessly hard-fails a good roll). We read seeds in a fixed
+        //     inventory order, so once ANY seed reflects the demotion it stays reflected; poll until it
+        //     does. BEST-EFFORT: if it does not become visible within the drain budget we proceed
+        //     anyway (falling back to the fail-closed behavior above rather than inventing a new
+        //     failure mode). Zero-cost when there is no lag (the first poll already sees the demotion).
+        for _ in 0..self.freeze.max_drain_polls {
+            if self.refresh().is_ok() && self.view().primary_demoted() {
+                break;
+            }
+            self.sleeper.sleep(self.freeze.drain_poll_delay);
+        }
         Ok(())
     }
 
@@ -923,15 +942,15 @@ pub fn run_cluster_upgrade<C: ClusterClient, U: NodeUpgrader>(
     // than let `ironcache upgrade --cluster` exit 0 on a partial roll.
     if report == UpgradeReport::Completed {
         live.refresh()?; // a fresh FINAL observation, so the assertion checks the true end state.
-        if !live.view().shard_fully_upgraded() {
-            let target = live.view().target_version.clone();
-            if let Some(node) = live.view().nodes.iter().find(|n| n.version != target) {
-                return Err(ClusterUpgradeError::IncompleteRoll {
-                    node: node.id.clone(),
-                    version: node.version.clone(),
-                    target,
-                });
-            }
+        // Find ANY node still off the target directly (not gated on `shard_fully_upgraded()`, whose
+        // empty-node-set-is-false semantics would let a degenerate empty view slip through as success).
+        let target = live.view().target_version.clone();
+        if let Some(node) = live.view().nodes.iter().find(|n| n.version != target) {
+            return Err(ClusterUpgradeError::IncompleteRoll {
+                node: node.id.clone(),
+                version: node.version.clone(),
+                target,
+            });
         }
     }
     Ok(report)
@@ -1603,6 +1622,13 @@ mod tests {
         /// plan is fully fooled into `Done` with the old primary still on the old version. Exercises
         /// the `run_cluster_upgrade` completeness assertion (it must FAIL LOUD, not report success).
         demote_leaves_committed_master: bool,
+        /// #733 (confirm-poll test): how many `CLUSTER SHARDS` reads AFTER a failover still project the
+        /// PRE-promotion ownership (a follower seed that has not yet APPLIED the committed
+        /// PromoteReplica). 0 = no lag. `cluster_failover` snapshots the pre-flip roles for this many
+        /// `discover_members` calls; `promote_candidate`'s confirm-poll must absorb it (no re-promote).
+        promote_visibility_lag: u32,
+        /// Runtime state for the lag above: the pre-promotion `(id, role)` projection + reads remaining.
+        lagging_roles: Option<(Vec<(String, NodeRole)>, u32)>,
     }
 
     impl Sim {
@@ -1627,6 +1653,8 @@ mod tests {
                 events: Vec::new(),
                 demoted_info_stays_master: false,
                 demote_leaves_committed_master: false,
+                promote_visibility_lag: 0,
+                lagging_roles: None,
             }))
         }
 
@@ -1659,11 +1687,32 @@ mod tests {
             &mut self,
             _seed: &ActuationTarget,
         ) -> Result<Vec<ShardMember>, ClusterUpgradeError> {
+            let mut sim = self.sim.borrow_mut();
+            // #733: while a follower seed's applied slot map lags the committed PromoteReplica, CLUSTER
+            // SHARDS projects the PRE-promotion ownership. Serve the snapshot until the lag drains.
+            let lagged = match &mut sim.lagging_roles {
+                Some((snapshot, ticks)) if *ticks > 0 => {
+                    *ticks -= 1;
+                    let members: Vec<ShardMember> = snapshot
+                        .iter()
+                        .map(|(id, role)| ShardMember {
+                            id: id.clone(),
+                            role: *role,
+                        })
+                        .collect();
+                    Some((members, *ticks == 0))
+                }
+                _ => None,
+            };
+            if let Some((members, cleared)) = lagged {
+                if cleared {
+                    sim.lagging_roles = None;
+                }
+                return Ok(members);
+            }
             // CLUSTER SHARDS projects the COMMITTED ownership role (`n.role`), which the sim flips on
             // failover -- so it is fresh even when a node's INFO self-role is modeled as stale.
-            Ok(self
-                .sim
-                .borrow()
+            Ok(sim
                 .nodes
                 .iter()
                 .map(|n| ShardMember {
@@ -1726,6 +1775,12 @@ mod tests {
             let mut sim = self.sim.borrow_mut();
             let stale = sim.demoted_info_stays_master;
             let leave_committed = sim.demote_leaves_committed_master;
+            // #733: capture the PRE-promotion ownership so a lagging follower seed keeps projecting it
+            // for `promote_visibility_lag` CLUSTER SHARDS reads (the follower-apply-lag window).
+            if sim.promote_visibility_lag > 0 {
+                let snapshot = sim.nodes.iter().map(|n| (n.id.clone(), n.role)).collect();
+                sim.lagging_roles = Some((snapshot, sim.promote_visibility_lag));
+            }
             if let Some(old_master) = sim.master_id() {
                 if !leave_committed {
                     // Normal: the committed CLUSTER SHARDS role moves to Replica (ownership transferred).
@@ -1992,6 +2047,36 @@ mod tests {
             }
             other => panic!("expected IncompleteRoll, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn roll_is_safe_under_follower_seed_shards_lag_exactly_one_failover() {
+        // #733 (the MEDIUM from review): after the failover a follower CLUSTER SHARDS seed briefly
+        // still projects the PRE-promotion ownership (its applied slot map lags the commit). This test
+        // drives that window (2 stale reads) and pins the SAFE end-to-end outcome: the roll completes
+        // with EXACTLY ONE failover and every node on target -- the lag never causes a spurious second
+        // promotion or strands a node. Safety is layered and this test does not isolate one layer:
+        // `promote_candidate`'s best-effort confirm-poll waits for the demotion to become visible before
+        // returning; the freshly-promoted node also reads as an upgraded-not-yet-in-sync replica during
+        // the window (a safe Phase-1 `AwaitInSync` wait); and a re-`CLUSTER FAILOVER` of the already-
+        // promoted candidate would be refused server-side (fail-closed). Any of these keeps it to one
+        // failover; the assertion guards the composite invariant.
+        let sim = Sim::three_node("1.2.3", "1.2.2");
+        sim.borrow_mut().promote_visibility_lag = 2; // 2 stale CLUSTER SHARDS reads after the failover
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut live = build_live(&sim, &order);
+
+        let report = run_cluster_upgrade(&mut live, 50).expect("roll ok");
+        assert_eq!(report, UpgradeReport::Completed);
+        assert_eq!(
+            sim.borrow().failovers,
+            1,
+            "follower-seed lag caused no spurious second promotion"
+        );
+        assert!(
+            sim.borrow().nodes.iter().all(|n| n.version == "1.2.3"),
+            "every node on target"
+        );
     }
 
     #[test]
