@@ -779,6 +779,22 @@ impl SlotMap {
             .map(|n| (n.host.to_string(), n.port))
     }
 
+    /// The id of the node currently OWNING `slot`, or `None` if unassigned. Parallel to
+    /// [`moved_target`](Self::moved_target) but returns the owner's NODE ID (owned) instead of its
+    /// endpoint; the owner index is read INSIDE the node lock so it stays consistent with the `nodes`
+    /// snapshot during a concurrent FORGET renumber. Used by the [`ConfigCmd::PromoteReplica`] apply
+    /// (#728) to capture the demoted OLD owner before the ownership flip so it can be re-homed as the
+    /// slot's replica of the new primary.
+    #[must_use]
+    pub fn owner_id(&self, slot: u16) -> Option<Box<str>> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = self.owner[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return None;
+        }
+        table.nodes.get(idx as usize).map(|n| n.id.clone())
+    }
+
     /// The node INDICES that replicate `slot` (HA-7d), as an owned `Vec` so the caller holds no
     /// borrow into the locked table. COLD projection, parallel to [`moved_target`](Self::moved_target):
     /// it reads `replicas[slot]` (the MVP single replica) and returns it (or empty if none). The hot
@@ -3136,21 +3152,6 @@ mod tests {
             "the forgotten peer's migration is cleared"
         );
         assert!(map.migration_peer_endpoint(8).is_none());
-    }
-
-    // ----- test-only helper: an owned owner id for a slot (mirrors the removed `owner()` ref) -----
-
-    impl SlotMap {
-        /// The id of the node owning `slot`, or `None` if unassigned. Test-only convenience that
-        /// reads the owner index then the (locked) node table.
-        fn owner_id(&self, slot: u16) -> Option<Box<str>> {
-            let idx = self.owner[slot as usize].load(Ordering::Acquire);
-            if idx == UNASSIGNED {
-                return None;
-            }
-            let table = self.table.lock().expect("slot-map node lock poisoned");
-            table.nodes.get(idx as usize).map(|n| n.id.clone())
-        }
     }
 
     // ----- HA-3c: committed-config serialize / restore (the Raft snapshot SlotMap half) -----

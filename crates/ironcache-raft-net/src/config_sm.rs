@@ -161,8 +161,28 @@ impl StateMachine for ConfigSm {
                 // owner (the redirect itself carries no epoch -- the epoch is the consensus-side
                 // ordering that guarantees the old owner stops owning once it applies this entry).
                 for &slot in slots {
+                    // #728: capture the DEMOTED old owner BEFORE the flip so we can re-home it as the
+                    // slot's replica of `new_primary` below. Without this the failover leaves the old
+                    // owner ORPHANED -- its role stays master, its `run_replica_control` sees no
+                    // `any_replica_of_self` so it never re-attaches, and CLUSTER SHARDS projects the
+                    // new owner with NO replica (diverging from CLUSTER NODES + the true ownership),
+                    // which stalls `ironcache upgrade --cluster` at a membership-drift abort.
+                    let old_owner = self.map.owner_id(slot);
                     let _ = self.map.set_slot_node(slot, new_primary);
                     self.map.clear_slot_replica(slot, new_primary);
+                    // Re-home the demoted old owner as the slot's replica (single-replica MVP: the
+                    // replica set is empty now that the promoted node was cleared). Skip on an
+                    // idempotent re-apply (old == new, already owned by new_primary) and when the slot
+                    // had no prior owner. Deterministic (same map + command on every node). Once the
+                    // old owner applies this entry it sees `any_replica_of_self` and attaches + syncs
+                    // from the new owner (role -> replica); an auto-failover's dead old owner is
+                    // recorded as a currently-down replica that re-attaches on recovery. The unknown-
+                    // node error is swallowed like the sibling ownership applies.
+                    if let Some(old) = old_owner.as_deref() {
+                        if old != new_primary.as_str() {
+                            let _ = self.map.set_slot_replica(slot, old);
+                        }
+                    }
                 }
             }
             ConfigCmd::SetSlotMigrating { slot, dest } => {
@@ -490,6 +510,13 @@ mod tests {
             !map.is_replica_of(0, ID1) && !map.is_replica_of(1, ID1),
             "the promoted node is cleared from the replica set"
         );
+        // #728: the DEMOTED old owner (ID0) is re-homed as the slot's replica, so it re-attaches +
+        // syncs from the new owner (its run_replica_control sees any_replica_of_self) and CLUSTER
+        // SHARDS shows a replica instead of an ownerless-looking shard that stalls the rolling upgrade.
+        assert!(
+            map.is_replica_of(0, ID0) && map.is_replica_of(1, ID0),
+            "the demoted old owner ID0 is recorded as the new replica"
+        );
         // Exactly one epoch bump for the one PromoteReplica entry (the split-brain fence: a stale
         // client sees the advanced epoch in its MOVED).
         assert_eq!(sm.config_epoch(), epoch_before + 1);
@@ -506,6 +533,12 @@ mod tests {
         ));
         assert!(map.owns(0) && map.owns(1));
         assert!(!map.is_replica_of(0, ID1) && !map.is_replica_of(1, ID1));
+        // #728: an idempotent re-apply (owner already == new_primary) leaves the old owner as the
+        // replica rather than clearing it or re-homing new_primary onto itself.
+        assert!(
+            map.is_replica_of(0, ID0) && map.is_replica_of(1, ID0),
+            "idempotent re-apply keeps the old owner ID0 as the replica"
+        );
         assert_eq!(sm.config_epoch(), epoch_before + 2);
     }
 
