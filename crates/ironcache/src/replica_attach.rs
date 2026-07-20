@@ -709,9 +709,30 @@ async fn serve_replica_conn(
             }
         })
         .await;
-        // Publish the advancing master head (and re-affirm the slave's last-known offset) so the
-        // observable master offset tracks the writes shipped. Cold node-level publish, not per key.
+        // Publish the advancing master head AND advance THIS replica's reported offset to what we
+        // have SHIPPED it (#726). INFO / CLUSTER `slaveN:offset=/lag=` and the `ironcache upgrade
+        // --cluster` driver's in-sync + failover-freeze drain-to-lag-0 all read this per-replica
+        // cell; before this it was written ONLY once at attach (the resume ack, 0 for a fresh
+        // replica) and never advanced, so `lag` (= head - 0) grew without bound under writes and the
+        // rolling upgrade STALLED at AwaitInSync on any live cluster with traffic. Advance it with the
+        // SAME shipped-based offset the write-quorum measures just below (`set_replica` is monotonic,
+        // so a transiently-lower value is ignored); a PLAIN attach only, never a scoped slot importer
+        // (which is not an INFO `slaveN` and whose entry was never recorded). Cold node-level publish,
+        // not per stored key.
+        //
+        // SAFETY (why SHIPPED, not applied, is sound here): this master-side lag only clears the
+        // rolling-upgrade driver's freeze gate (its drain-to-lag-0). It does NOT by itself promote a
+        // candidate: `CLUSTER FAILOVER` is re-checked ON THE CANDIDATE against its TRUE APPLIED offset
+        // (`build_failover` -> `replica_read_in_sync` -> `is_in_sync`, reading the candidate's own
+        // `node_offset`, advanced only by `set_replica_applied` AFTER a synchronous store apply) and
+        // committed through the raft `PromoteReplica` fence; a FORCE/TAKEOVER that would bypass it is
+        // refused. So this is the SAME shipped-lag definition the ADR-0026 write-durability quorum
+        // already uses -- not a new, weaker one -- and the applied-through-H truth check is a separate,
+        // load-bearing gate that MUST stay intact.
         status.set_master_head(ring.borrow().head());
+        if slot_filter.is_none() {
+            status.set_replica(replica_node_id, send_cursor);
+        }
         // WRITE-SIDE GUARDRAIL (ADR-0026): recompute this replica's in-sync verdict from the lag
         // it has SHIPPED to (`head - send_cursor`) and nudge the shared count on a change. The
         // source measures lag by how far its shipping is behind the head: a replica being kept
@@ -2418,6 +2439,118 @@ mod tests {
             assert!(
                 r2.contains(b"live".as_slice()),
                 "consumer 2 ALSO received it -- the tail fanned out to BOTH, no split"
+            );
+        });
+    }
+
+    /// #726 REGRESSION: the primary must ADVANCE its per-replica reported offset (the INFO `slaveN
+    /// offset` / the rolling-upgrade in-sync signal) as it ships the tail, not leave it frozen at the
+    /// attach ack. Before the fix `set_replica` was called ONCE at attach (ack 0 for a fresh replica)
+    /// and never again, so `lag = head - 0` grew without bound under writes and `ironcache upgrade
+    /// --cluster` STALLED at AwaitInSync on a live cluster. Drive the real `serve_replica_conn`: attach
+    /// one replica (ack 0), write past attach, and assert the primary's status entry for it advanced
+    /// past 0.
+    #[test]
+    fn primary_advances_reported_replica_offset_as_it_ships_the_tail() {
+        use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener = bind_exclusive(addr).unwrap();
+
+            let store_rc: Rc<RefCell<ShardStoreImpl>> = Rc::new(RefCell::new(
+                crate::serve::fresh_shard_store(2, "noeviction", 0),
+            ));
+            let ring = ReplRing::new(TAIL_RING_CAP, ReplOffset::ZERO);
+            store_rc
+                .borrow_mut()
+                .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+            store_rc.borrow_mut().upsert(
+                0,
+                b"pre",
+                NewValue::Bytes(b"v0"),
+                ExpireWrite::Clear,
+                now_from_env(),
+            );
+
+            // SHARED status (the fix advances the per-replica entry here; the test reads it back).
+            let status = std::sync::Arc::new(ReplNodeStatus::new());
+            let src_store = Rc::clone(&store_rc);
+            let src_ring = Rc::clone(&ring);
+            let src_status = std::sync::Arc::clone(&status);
+            tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                let replid = ReplId::from_bytes([0x5a; 20]);
+                let (stream, _peer) = rt.accept(&listener).await.expect("accept");
+                let in_sync = std::sync::Arc::new(InSyncReplicas::new());
+                tokio::task::spawn_local(async move {
+                    serve_replica_conn(
+                        TokioRuntime::new(),
+                        SecureStream::plain(stream),
+                        replid,
+                        src_store,
+                        src_ring,
+                        src_status,
+                        in_sync,
+                        u64::MAX,
+                    )
+                    .await;
+                });
+                rt.timer(Duration::from_secs(5)).await;
+            });
+
+            // One replica attaches (node id 0, ack 0) + drains the snapshot + collects the tail.
+            let consumer = tokio::task::spawn_local(two_consumer_collect_tail(addr));
+            // A post-attach write it must receive through the tail (drives send_cursor past the cut).
+            let writer_store = Rc::clone(&store_rc);
+            tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                rt.timer(Duration::from_millis(150)).await;
+                writer_store.borrow_mut().upsert(
+                    0,
+                    b"live",
+                    NewValue::Bytes(b"v1"),
+                    ExpireWrite::Clear,
+                    now_from_env(),
+                );
+            });
+            let tail = consumer.await.expect("consumer joined");
+            assert!(
+                tail.contains(b"live".as_slice()),
+                "the replica received the post-attach tail write"
+            );
+
+            // The primary must have advanced the reported offset for this replica past the attach ack
+            // (0). Poll briefly: the set_replica lands in the tail loop right after the ship.
+            let poll_rt = TokioRuntime::new();
+            let mut acked = ReplOffset::ZERO;
+            for _ in 0..50 {
+                if let Some(e) = status
+                    .snapshot()
+                    .replicas
+                    .iter()
+                    .find(|r| r.node_id == 0)
+                {
+                    acked = e.acked;
+                    if acked.0 > 0 {
+                        break;
+                    }
+                }
+                poll_rt.timer(Duration::from_millis(20)).await;
+            }
+            assert!(
+                acked.0 > 0,
+                "#726: the primary must advance the per-replica reported offset as it ships the tail \
+                 (it stayed frozen at the attach ack 0, so lag never converged)"
             );
         });
     }
