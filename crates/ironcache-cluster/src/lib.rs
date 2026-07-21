@@ -784,16 +784,13 @@ impl SlotMap {
     /// re-home the DEMOTED old owner as the new owner's replica (#728/#730) so the `CLUSTER SHARDS`
     /// projection continues to list it.
     #[must_use]
-    pub fn owner_id(&self, slot: u16) -> Option<String> {
+    pub fn owner_id(&self, slot: u16) -> Option<Box<str>> {
         let table = self.table.lock().expect("slot-map node lock poisoned");
         let idx = self.owner[slot as usize].load(Ordering::Acquire);
         if idx == UNASSIGNED {
             return None;
         }
-        table
-            .nodes
-            .get(idx as usize)
-            .map(|n| n.id.as_ref().to_owned())
+        table.nodes.get(idx as usize).map(|n| n.id.clone())
     }
 
     /// The node INDICES that replicate `slot` (HA-7d), as an owned `Vec` so the caller holds no
@@ -3155,20 +3152,8 @@ mod tests {
         assert!(map.migration_peer_endpoint(8).is_none());
     }
 
-    // ----- test-only helper: an owned owner id for a slot (mirrors the removed `owner()` ref) -----
-
-    impl SlotMap {
-        /// The id of the node owning `slot`, or `None` if unassigned. Test-only convenience that
-        /// reads the owner index then the (locked) node table.
-        fn owner_id(&self, slot: u16) -> Option<Box<str>> {
-            let idx = self.owner[slot as usize].load(Ordering::Acquire);
-            if idx == UNASSIGNED {
-                return None;
-            }
-            let table = self.table.lock().expect("slot-map node lock poisoned");
-            table.nodes.get(idx as usize).map(|n| n.id.clone())
-        }
-    }
+    // (The former test-only `owner_id` helper is now the PRODUCTION `SlotMap::owner_id` (#735), used
+    // both by the `PromoteReplica` re-home and these tests.)
 
     // ----- HA-3c: committed-config serialize / restore (the Raft snapshot SlotMap half) -----
 
