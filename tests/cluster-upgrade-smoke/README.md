@@ -5,20 +5,19 @@ cluster from one binary version to the next **under continuous write load**, rep
 RPO=0 failover-freeze fence, and asserts the properties the decomposed unit tests + DST cannot
 observe (they stub the live cluster signals).
 
-> **Status: `smoke.sh` currently FAILS on purpose -- it reproduces [#735].** Running it end to end
-> reliably surfaces an intermittent `CLUSTER SHARDS` projection bug: shortly after the replica is
-> attached, `CLUSTER SHARDS` momentarily reports the *replica* as the slot owner and omits the real
-> owner, so the driver aborts with `cluster membership drift: discovered=[3]`. The real owner still
-> owns and serves (no promotion; not the 5s auto-failover). This harness is committed as the
-> **reliable repro** for that bug; once [#735] / [#728] are fixed it becomes a passing on-demand smoke.
+It reliably reproduced the bugs #630 was filed to catch (#733 driver false-success, #728/#735 the
+post-promotion CLUSTER SHARDS membership drift) and is now the standing regression gate for them.
 
 ## What it asserts
 
 1. the driver reports **SUCCESS**;
 2. **every node -- including the old primary -- reaches the target version** (regression gate for
    [#733], where the old primary was silently left on the old binary);
-3. **zero acked-write loss** across the roll (RPO=0);
-4. **zero writer outages** during the roll (zero-downtime).
+3. **zero acked-write loss** across the roll (RPO=0, the durability guarantee);
+4. only a **brief, bounded write-pause** (< 5% of writes): the RPO=0 fence deliberately
+   `CLIENT PAUSE WRITE`s the old primary for the drain window, and this single-entry writer also
+   blips when its entry node is recreated -- so a short pause is expected + correct; a SUSTAINED
+   outage (the cluster going unavailable) is the real failure this catches.
 
 ## Why its own topology
 

@@ -779,6 +779,23 @@ impl SlotMap {
             .map(|n| (n.host.to_string(), n.port))
     }
 
+    /// The current OWNER's node id for `slot` (or `None` if unassigned), resolved through the node
+    /// table exactly like [`moved_target`](Self::moved_target). Used by the `PromoteReplica` apply to
+    /// re-home the DEMOTED old owner as the new owner's replica (#728/#730) so the `CLUSTER SHARDS`
+    /// projection continues to list it.
+    #[must_use]
+    pub fn owner_id(&self, slot: u16) -> Option<String> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = self.owner[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return None;
+        }
+        table
+            .nodes
+            .get(idx as usize)
+            .map(|n| n.id.as_ref().to_owned())
+    }
+
     /// The node INDICES that replicate `slot` (HA-7d), as an owned `Vec` so the caller holds no
     /// borrow into the locked table. COLD projection, parallel to [`moved_target`](Self::moved_target):
     /// it reads `replicas[slot]` (the MVP single replica) and returns it (or empty if none). The hot

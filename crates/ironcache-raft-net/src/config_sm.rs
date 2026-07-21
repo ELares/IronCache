@@ -161,8 +161,18 @@ impl StateMachine for ConfigSm {
                 // owner (the redirect itself carries no epoch -- the epoch is the consensus-side
                 // ordering that guarantees the old owner stops owning once it applies this entry).
                 for &slot in slots {
+                    // #728/#730: capture the DEMOTED old owner BEFORE flipping, then re-home it as the
+                    // new owner's REPLICA so the CLUSTER SHARDS projection keeps listing it (else it is
+                    // omitted -> the rolling-upgrade driver's post-promotion membership check sees
+                    // `discovered=[new]` != inventory and aborts with a spurious drift).
+                    let old_owner = self.map.owner_id(slot);
                     let _ = self.map.set_slot_node(slot, new_primary);
                     self.map.clear_slot_replica(slot, new_primary);
+                    if let Some(old) = old_owner.as_deref() {
+                        if old != new_primary.as_str() {
+                            let _ = self.map.set_slot_replica(slot, old);
+                        }
+                    }
                 }
             }
             ConfigCmd::SetSlotMigrating { slot, dest } => {
@@ -490,6 +500,13 @@ mod tests {
             !map.is_replica_of(0, ID1) && !map.is_replica_of(1, ID1),
             "the promoted node is cleared from the replica set"
         );
+        // #728/#730: the DEMOTED old owner (ID0) is RE-HOMED as the new owner's REPLICA, so the
+        // CLUSTER SHARDS projection keeps listing it. Without this, a rolling upgrade's post-promotion
+        // membership check sees only the new owner (discovered=[new]) and aborts with a spurious drift.
+        assert!(
+            map.is_replica_of(0, ID0) && map.is_replica_of(1, ID0),
+            "the demoted old owner is re-homed as the new owner's replica"
+        );
         // Exactly one epoch bump for the one PromoteReplica entry (the split-brain fence: a stale
         // client sees the advanced epoch in its MOVED).
         assert_eq!(sm.config_epoch(), epoch_before + 1);
@@ -506,6 +523,10 @@ mod tests {
         ));
         assert!(map.owns(0) && map.owns(1));
         assert!(!map.is_replica_of(0, ID1) && !map.is_replica_of(1, ID1));
+        assert!(
+            map.is_replica_of(0, ID0) && map.is_replica_of(1, ID0),
+            "the re-homed old owner stays the replica across an idempotent re-apply"
+        );
         assert_eq!(sm.config_epoch(), epoch_before + 2);
     }
 
