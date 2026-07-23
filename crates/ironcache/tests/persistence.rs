@@ -358,12 +358,13 @@ async fn bgsave_yields_so_concurrent_writes_are_serviced_and_snapshot_loads() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// #577 SAVE-BACKPRESSURE knob: `CONFIG SET save-backpressure-percent` is LIVE-settable + VALIDATED,
-/// and a BGSAVE with the knob set still commits (manifest-last crash-safety unchanged), still services
-/// concurrent writes DURING the dump, and reloads every pre-existing key on restart. NOTE (#576): the
-/// freeze-based off-thread save does NO serving-side copy loop for the knob to throttle, so the knob is
-/// now INERT for pacing (it stays settable for compatibility); this asserts the knob is still wired end
-/// to end (GET/SET/validation) and that a save with it set preserves correctness.
+/// #577/#676 SAVE-BACKPRESSURE knob: `CONFIG SET save-backpressure-percent` is LIVE-settable +
+/// VALIDATED, and a BGSAVE with the knob set still commits (manifest-last crash-safety unchanged),
+/// still services concurrent writes DURING the dump, and reloads every pre-existing key on restart.
+/// The knob PACES the base save's persist-thread READ (#676): below 100 the read sleeps proportionally
+/// between ~1 MiB chunks so it leaves DRAM-bandwidth headroom for the serving datapath (the measured
+/// during-save starvation cause). This asserts the knob is wired end to end (GET/SET/validation) and
+/// that a paced save preserves correctness + crash-safety.
 #[tokio::test(flavor = "current_thread")]
 async fn bgsave_backpressure_percent_is_live_settable_validated_and_still_commits() {
     let dir = temp_data_dir("throttle");
@@ -416,14 +417,15 @@ async fn bgsave_backpressure_percent_is_live_settable_validated_and_still_commit
             set(&mut c, &format!("pre-{i}"), &format!("v-{i}")).await;
         }
 
-        // Kick the THROTTLED background save; it sleeps proportionally between chunks on shard 0.
+        // Kick the PACED background save; its persist-thread read sleeps proportionally between
+        // chunks, leaving DRAM-bandwidth headroom for shard 0's datapath.
         assert_eq!(
             cmd1(&mut c, "BGSAVE").await,
             b"+Background saving started\r\n"
         );
 
-        // Concurrent writes are STILL serviced during the throttled dump (the proportional sleep lets
-        // the shard drain queued writes -- the whole point of the backpressure).
+        // Concurrent writes are STILL serviced during the paced dump (the off-thread save keeps the
+        // shard serving; pacing the persist read leaves it bandwidth headroom).
         let live = 100usize;
         for i in 0..live {
             let (key, val) = (format!("live-{i}"), format!("lv-{i}"));

@@ -1533,12 +1533,18 @@ const _: fn() = || {
 /// save) is ignored by load. `now` is read from THIS shard's Env clock (ADR-0003, the lazy-expiry
 /// basis); the save produces NO counter deltas.
 ///
-/// ## Save-backpressure throttle (#578): now INERT for the tail (the copy it throttled is gone)
+/// ## Save-backpressure throttle (#577/#676): re-targeted to pace the persist READ
 ///
-/// The `save-backpressure-percent` knob stays settable (CONFIG), but the freeze-based save does NO
-/// serving-side copy loop for it to throttle, so it no longer paces the datapath -- consistent with the
-/// #576 finding that throttling only STRETCHED (never bounded) the during-save tail. It is not read
-/// here.
+/// The `save-backpressure-percent` knob (default 100 = off, byte-identical) now paces the BASE
+/// save's persist-thread READ, not the (removed) serving-side copy. MEASURED root cause on c7g: the
+/// base save's full-keyspace read+encode saturates shared DRAM bandwidth and STARVES the all-cores
+/// serving datapath (the during-save p99.9) -- ablation ruled out COW / slot-size / queueing. Below
+/// 100, [`encode_shard_save`] sleeps proportionally after each ~1 MiB encode chunk
+/// ([`ironcache_runtime::ChunkPacer`], `sleep = chunk_time * (100 - pct) / pct`, capped) so the read
+/// holds a ~pct% duty cycle and leaves bandwidth for serving. The earlier "throttle made it worse"
+/// finding was the OLD site (the serving copy at a 3s cadence); pacing the persist read at a
+/// realistic cadence (cadence >> stretched duration) is the lever. Read LIVE per chunk, base arm
+/// only (deltas read only the dirty fraction, not bandwidth-bound).
 /// The parsed `__ICSAVE` request (#676): the shard index, the target snapshot dir, and the DELTA mode
 /// (`Some((base_epoch, delta_epoch))` for a delta save, `None` for a base save).
 type IcsaveParsed = (u32, std::path::PathBuf, Option<(u64, u64)>);
@@ -1591,6 +1597,12 @@ fn parse_icsave(request: &Request) -> Result<IcsaveParsed, Value> {
 /// value or a TOMBSTONE) as a DELTA `dump-shard-<n>-delta-<epoch>.icsd`. Returns the manifest reply the
 /// home core collects. Runs ON the persist thread (the caller wraps it in `catch_unwind`); touches
 /// only the frozen `Arc`s + the filesystem.
+/// Pacer chunk size (#676): the base-save read is paced after every ~1 MiB of encoded body. Small
+/// enough that a low `save-backpressure-percent` keeps a fine-grained duty cycle (the datapath sees
+/// frequent short bandwidth gaps, not one long burst); large enough that the per-chunk pacing
+/// overhead (one relaxed atomic load + a clock read) is negligible against ~1 MiB of encode work.
+const PACE_CHUNK_BYTES: usize = 1 << 20;
+
 fn encode_shard_save(
     delta_mode: Option<(u64, u64)>,
     frozen: &[ironcache_store::FrozenSlot],
@@ -1598,10 +1610,23 @@ fn encode_shard_save(
     shard_index: u32,
     now: UnixMillis,
     dir: &std::path::Path,
+    pace_cfg: &ironcache_config::RuntimeConfig,
 ) -> std::io::Result<crate::persist::SaveReply> {
     match delta_mode {
         None => {
-            let dump = ironcache_persist::dump_frozen_slots(frozen, shard_index, now);
+            // BASE save: pace the full-keyspace read so it leaves DRAM-bandwidth headroom for the
+            // serving datapath (#676). `save-backpressure-percent` is read LIVE per chunk (its
+            // documented contract), so a `CONFIG SET` mid-save applies; `100` (default) is a true
+            // no-op -> byte-identical. The DELTA arm is NOT paced: it reads only the dirty fraction,
+            // which is not bandwidth-bound, so pacing would needlessly stretch a cheap save.
+            let mut pacer = ironcache_runtime::ChunkPacer::new();
+            let dump = ironcache_persist::dump_frozen_slots_paced(
+                frozen,
+                shard_index,
+                now,
+                PACE_CHUNK_BYTES,
+                || pacer.pace(pace_cfg.save_backpressure_percent()),
+            );
             ironcache_persist::write_shard_dump(&dump, shard_index, dir)
                 .map(crate::persist::SaveReply::Base)
         }
@@ -1620,6 +1645,8 @@ fn encode_shard_save(
     }
 }
 
+// Freeze + epoch-cut + dirty drain + persist-thread spawn + await, one cohesive save routine.
+#[allow(clippy::too_many_lines)]
 async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     let (shard_index, dir, delta_mode) = match parse_icsave(request) {
         Ok(parsed) => parsed,
@@ -1696,6 +1723,10 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     // closure so the pin is applied ON the persist thread (affinity is per-thread). Empty = the
     // default no-pin (float, byte-unchanged); a no-op on non-Linux (see `crate::affinity`).
     let persist_cpu_spec = ctx.boot.persist_cpu.clone();
+    // #676: the persist-read pacer reads `save-backpressure-percent` LIVE per chunk off this Arc
+    // (a relaxed load, off the per-command hot path), so a `CONFIG SET` mid-save applies. Cloning
+    // the Arc moves a shared handle into the persist thread; default 100 = the read is never paced.
+    let pace_cfg = ctx.runtime.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("ic-persist-{shard_index}"))
         .spawn(move || {
@@ -1724,6 +1755,7 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
                     shard_index,
                     now,
                     &dir_for_thread,
+                    &pace_cfg,
                 )
             })) {
                 Ok(r) => r,

@@ -227,6 +227,14 @@ pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
 pub mod affinity;
 pub use affinity::{AFFINITY_SUPPORTED, current_thread_cpus, pin_thread_to_cpus};
 
+// The persist-read pacer (#676, driving the `save-backpressure-percent` knob #577): bounds the
+// base snapshot's read+encode duty cycle so it leaves DRAM-bandwidth headroom for the serving
+// datapath. Lives in this runtime TIMER seam (not the linted/`forbid(unsafe)` persist crate) so the
+// `Instant` clock read passes the determinism-invariant lint; the persist encode loop only calls a
+// clock-free `FnMut()` callback.
+pub mod pace;
+pub use pace::ChunkPacer;
+
 // The systemd socket-activation (sd_listen_fds) protocol parser (#389 Phase 2a). A PURE
 // string->typed-result gate deciding whether to adopt an inherited listening fd vs self-bind; the
 // raw-fd adoption itself is a thin Linux-only layer downstream. Cfg-free so it builds + unit-tests

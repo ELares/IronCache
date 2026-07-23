@@ -190,7 +190,28 @@ pub fn dump_shard_keyspace<E: EvictionHook, A: AccountingHook>(
 /// already-expired key.
 #[must_use]
 pub fn dump_frozen_slots(frozen: &[FrozenSlot], shard: u32, now: UnixMillis) -> ShardDump {
+    // Unpaced: `pace_chunk_bytes == 0` disables the callback, so this is byte-identical to the
+    // pre-pacer loop (the `on_chunk` closure is never invoked).
+    dump_frozen_slots_paced(frozen, shard, now, 0, || {})
+}
+
+/// Like [`dump_frozen_slots`] but PACED (#676, the `save-backpressure-percent` lever): after every
+/// `pace_chunk_bytes` of encoded body, invoke `on_chunk` -- the caller's between-chunks pacer, which
+/// owns the clock + the sleep (this crate stays `#![forbid(unsafe_code)]` + clock-free, so timing
+/// lives in `ironcache-runtime`). `pace_chunk_bytes == 0` disables pacing entirely.
+///
+/// The sealed [`ShardDump`] is BYTE-IDENTICAL whether paced or not: pacing only inserts the callback
+/// BETWEEN `push_entry` calls, it never changes what is pushed or the header/CRC sealed at `finish`.
+#[must_use]
+pub fn dump_frozen_slots_paced(
+    frozen: &[FrozenSlot],
+    shard: u32,
+    now: UnixMillis,
+    pace_chunk_bytes: usize,
+    mut on_chunk: impl FnMut(),
+) -> ShardDump {
     let mut builder = ShardDumpBuilder::new();
+    let mut paced_at = 0usize;
     for slot in frozen {
         let db = slot.db();
         for entry in slot.entries() {
@@ -198,6 +219,12 @@ pub fn dump_frozen_slots(frozen: &[FrozenSlot], shard: u32, now: UnixMillis) -> 
                 continue; // never persist a logically-dead key (matches snapshot_chunk / SCAN).
             }
             builder.push_entry(db, entry);
+            // Pace on a BYTE accumulator (slots vary wildly in size, so per-slot would pace
+            // unevenly). `!= 0` guards the unpaced delegate + keeps `pct=100` fully callback-free.
+            if pace_chunk_bytes != 0 && builder.body_len() - paced_at >= pace_chunk_bytes {
+                on_chunk();
+                paced_at = builder.body_len();
+            }
         }
     }
     builder.finish(shard)
@@ -316,6 +343,14 @@ impl ShardDumpBuilder {
         ironcache_repl::encode_entry_into(&mut self.scratch, entry);
         format::put_record(&mut self.body, db, &self.scratch);
         self.keys += 1;
+    }
+
+    /// Bytes of encoded record body accumulated so far (the file header is prepended only at
+    /// [`Self::finish`]). The persist-read pacer (#676) uses this as its chunk-boundary signal:
+    /// after every ~N bytes of body it invokes the caller's between-chunks pacer.
+    #[must_use]
+    pub fn body_len(&self) -> usize {
+        self.body.len()
     }
 
     /// SEAL the accumulated body into a [`ShardDump`]: prepend the file header for `shard` and
@@ -1132,6 +1167,36 @@ mod tests {
             checked, 17,
             "expected all 17 inserted entries frozen and checked"
         );
+    }
+
+    #[test]
+    fn paced_dump_is_byte_identical_to_unpaced_and_invokes_the_pacer() {
+        let now = UnixMillis(1_000);
+        let mut store: TestStore = ShardStore::new(2);
+        // Enough body (64 x ~256B values) to cross a small pace-chunk boundary many times.
+        for i in 0..64u32 {
+            store.insert_object(
+                0,
+                KvObj::from_bytes(format!("k{i}").as_bytes(), &vec![b'x'; 256], None),
+            );
+        }
+        let frozen = store.begin_save();
+
+        let unpaced = dump_frozen_slots(&frozen, 7, now);
+        let mut chunks = 0usize;
+        let paced = dump_frozen_slots_paced(&frozen, 7, now, 512, || chunks += 1);
+
+        // BYTE-IDENTICAL: pacing only inserts the callback BETWEEN push_entry calls.
+        assert_eq!(paced.bytes, unpaced.bytes, "paced dump bytes diverged");
+        assert_eq!(paced.crc, unpaced.crc, "paced dump CRC diverged");
+        assert_eq!(paced.keys, unpaced.keys, "paced dump key count diverged");
+        // The pacer fired (64 x ~256B >> 512B chunk -> many boundaries).
+        assert!(chunks >= 1, "expected the pacer callback to fire, got {chunks}");
+
+        // And `pace_chunk_bytes == 0` (the unpaced delegate) NEVER invokes the callback.
+        let mut never = 0usize;
+        let _ = dump_frozen_slots_paced(&frozen, 7, now, 0, || never += 1);
+        assert_eq!(never, 0, "pace_chunk_bytes=0 must never invoke the callback");
     }
 
     #[test]
