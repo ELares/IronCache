@@ -1191,12 +1191,18 @@ mod tests {
         assert_eq!(paced.crc, unpaced.crc, "paced dump CRC diverged");
         assert_eq!(paced.keys, unpaced.keys, "paced dump key count diverged");
         // The pacer fired (64 x ~256B >> 512B chunk -> many boundaries).
-        assert!(chunks >= 1, "expected the pacer callback to fire, got {chunks}");
+        assert!(
+            chunks >= 1,
+            "expected the pacer callback to fire, got {chunks}"
+        );
 
         // And `pace_chunk_bytes == 0` (the unpaced delegate) NEVER invokes the callback.
         let mut never = 0usize;
         let _ = dump_frozen_slots_paced(&frozen, 7, now, 0, || never += 1);
-        assert_eq!(never, 0, "pace_chunk_bytes=0 must never invoke the callback");
+        assert_eq!(
+            never, 0,
+            "pace_chunk_bytes=0 must never invoke the callback"
+        );
     }
 
     #[test]
