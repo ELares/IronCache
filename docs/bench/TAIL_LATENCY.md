@@ -10,10 +10,10 @@ metric was originally framed as IronCache's "moat"; the harness itself REFUTED t
 (sub-second after #588), not category-leading. The doc keeps the harness; the honest
 result is stated plainly.
 
-It is the committed, reproducible HARNESS + methodology. It claims **no numbers**:
-the cross-competitor figures are produced by running this harness on a pinned
-Linux box (a Graviton `c7g` in the plan), an owner-gated spend. What is validated
-here is that the harness runs, fires the adversarial load, and reports the tail.
+It is the committed, reproducible HARNESS + methodology. The cross-competitor
+figures come from running it on a pinned Graviton `c7g` (an owner-gated spend);
+the first full cross-competitor run (2026-07-23) is recorded under **Measured
+record (c7g Graviton3)** below, and it confirms the honest narrative in this doc.
 
 ## TL;DR
 
@@ -171,6 +171,69 @@ cheap stopgap that cuts that tail (~3-4x) while the ms-class isolation fix is bu
   **ms-class** isolation of a decoupled save. The durable fix is the epoch-cut copy-on-write snapshot
   on a dedicated persist thread (#576 PR-B); the throttle buys the tail-cut cheaply until it lands.
 
+## Measured record (c7g Graviton3, 2026-07-23)
+
+First full cross-competitor run on a 16-vCPU Graviton3 `c7g.4xlarge`: IronCache
+release build vs Redis 7.0.15, Valkey 8.1.1, and Dragonfly 1.39.0. Pinning was the
+`#589` layout (8 server cores `0-7`, a dedicated persist core `8`, client on `9-15`),
+`SNAPSHOT=1` with `BGSAVE` every 3s during the open-loop pass, `EVICT=0` (pure
+during-save tail, no eviction stacked, so all servers are comparable at the same 4gb
+ceiling and Dragonfly's per-thread floor is satisfied), 90/10 GET/SET, zipf 0.99,
+open-loop 50k ops/s. Two storage backings were run: **tmpfs** (RAM, to isolate the
+snapshot ALGORITHM from disk) and the **gp3 EBS** root volume (125 MB/s, the durable
+case). All numbers are OVERALL open-loop op-latency percentiles.
+
+**tmpfs (algorithm-isolated), 1,000,000 keys, ~176 MB resident:**
+
+| Server | p50 | p99 | p99.9 | p99.99 |
+| --- | --- | --- | --- | --- |
+| IronCache, base every save | 5.2 ms | 768 ms | 794 ms | 805 ms |
+| IronCache, #676 deltas ON  | 2.6 ms | 613 ms | 757 ms | 772 ms |
+| Redis 7.0.15               | 5.3 ms | 671 ms | 719 ms | 732 ms |
+| Valkey 8.1.1               | 4.0 ms | 453 ms | 510 ms | 539 ms |
+| Dragonfly 1.39.0           | 2.1 ms | 12.6 ms | 19 ms | 36 ms |
+
+**Control, NO concurrent save (`SNAPSHOT=0`), same config:** IronCache p99.9 = **25 ms**,
+Redis p99.9 = 21 ms. So the entire hundreds-of-ms tail above IS the concurrent save;
+with no save, IronCache's tail is ms-class and ties the field.
+
+**Durable gp3 EBS (125 MB/s) instead of tmpfs, 1M keys, p99.9:** IronCache base 1010 ms,
+delta 940 ms; Redis 684 ms; Valkey 512 ms; Dragonfly 27 ms. Disk adds ~20-30% on top
+of the tmpfs figure; it is NOT the dominant term (see the next point).
+
+**The base save stall is O(resident data), not disk-bound.** Moving the save to tmpfs
+cut IronCache's p99.9 only ~20% (1010 -> 794 ms base), so the stall is CPU / memory
+bandwidth, not write bandwidth. It scales ~linearly with the resident set (tmpfs,
+deltas ON):
+
+| Dataset | p99.9 |
+| --- | --- |
+| 34 MB (200k keys)  | 135 ms |
+| 83 MB (500k keys)  | 370 ms |
+| 176 MB (1M keys)   | 757 ms |
+
+That is ~4.3 ms of datapath stall per MB of resident data. This **reconciles the prior
+~291 ms record**: 291 ms is the ~500k-key regime (370 ms here). There is no regression;
+the p99.9 simply tracks dataset size because the periodic BASE save reads/encodes the
+whole keyspace.
+
+**What #676 deltas actually buy.** The delta path works exactly as designed: the
+server log shows only ~0.8% of keys dirty per interval (`dirty_keys ~= 950` of
+`live_keys ~= 125000` per shard), so non-base saves write ~1% of the data. That cuts
+the p99 tail ~20% (768 -> 613 ms) by making the frequent saves cheap. It does NOT move
+p99.9, because a cold run still needs ONE base save and that base stall alone sets
+p99.9. The deltas' p99.9 win grows over a LONG steady-state window where base saves
+amortize; a cold 20s window overweights the single mandatory base.
+
+**Honest verdict.** IronCache's during-save p99.9 is on par with Redis, worse than
+Valkey, and ~40x worse than Dragonfly at 1M keys. Dragonfly's async io_uring snapshot
+adds almost nothing to its tail (19 ms with a save vs its own sub-ms baseline) -- that
+is the architecture to beat. Deltas (#676) are a real but partial lever: they fix the
+INCREMENTAL save cost, not the periodic base-save datapath stall. Closing the gap to
+ms-class needs the base save decoupled from serving (a versioned, non-blocking snapshot
+writer that never quiesces a serving shard), which is a larger structural change than
+the delta path and is the open Phase 2/3 question on #676.
+
 ## Reproducing on real hardware
 
 The measured claim needs a pinned Linux box (disjoint server/client cores) against
@@ -199,7 +262,11 @@ Notes for a real run:
 
 ## Validation status
 
-Harness + methodology only, validated in SMOKE locally (IronCache vs a
-`redis-server` stand-in). SMOKE confirms: the run completes, reports p99.9/p99.99
-for both servers, and the concurrent BGSAVE fires and is confirmed during the
-measured window. No cross-competitor numbers are claimed until the `c7g` run.
+Harness + methodology validated in SMOKE locally (IronCache vs a `redis-server`
+stand-in) AND in a full cross-competitor `c7g` run (2026-07-23, see **Measured
+record** above) against Redis 7.0.15, Valkey 8.1.1, and Dragonfly 1.39.0. SMOKE
+confirms the run completes, reports p99.9/p99.99 for both servers, and the
+concurrent BGSAVE fires and is confirmed during the measured window. The `c7g`
+run supplies the cross-competitor numbers and the honest verdict: IronCache's
+during-save tail is competitive with Redis, trails Valkey, and trails Dragonfly's
+async-snapshot architecture by ~40x at 1M keys.
