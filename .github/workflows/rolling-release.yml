@@ -151,7 +151,11 @@ jobs:
           # re-stamp reliably even on a warm target.
           IRONCACHE_BUILD_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          cargo auditable zigbuild --release --locked --target "${{ matrix.target }}"
+          # #682 P5(a): ship the RAW io_uring backend opt-in (`--runtime io_uring_raw`); default stays
+          # tokio+epoll. `ironcache/io_uring_raw` targets the feature to the ironcache package; the -p
+          # pair builds both shipped binaries (virtual workspace cannot take a bare --features).
+          cargo auditable zigbuild --release --locked --target "${{ matrix.target }}" \
+            -p ironcache -p ironcache-console --features ironcache/io_uring_raw
       - name: Package the tarball
         shell: bash
         env:

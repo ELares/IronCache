@@ -89,7 +89,11 @@ jobs:
         run: |
           IRONCACHE_BUILD_VERSION="${IRONCACHE_BUILD_VERSION#v}"
           export IRONCACHE_BUILD_VERSION
-          cargo zigbuild --release --locked --target "${{ matrix.target }}"
+          # #682 P5(a): ship the RAW io_uring backend opt-in (`--runtime io_uring_raw`); default stays
+          # tokio+epoll. `ironcache/io_uring_raw` targets the feature to the ironcache package; the -p
+          # pair builds both staged binaries (virtual workspace cannot take a bare --features).
+          cargo zigbuild --release --locked --target "${{ matrix.target }}" \
+            -p ironcache -p ironcache-console --features ironcache/io_uring_raw
       - name: Stage the static binary under dist/<arch>/
         shell: bash
         run: |
