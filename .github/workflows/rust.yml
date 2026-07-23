@@ -151,8 +151,12 @@ jobs:
       # guarantee: the SAME musl target must compile the binary WITH `--features io_uring_raw`.
       # (The tokio-uring `io_uring` feature is deliberately NOT built here -- it is expected to fail
       # on musl; that failure is the whole reason the raw backend exists.)
-      - name: build --features io_uring_raw (musl unblock, #682)
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ironcache --features io_uring_raw
+      #
+      # #682 P5(a): this mirrors the EXACT invocation the release/image workflows now use to SHIP the
+      # raw backend (both shipped binaries + the feature targeted at ironcache), so a change that
+      # breaks the shipping build fails HERE, not at tag time.
+      - name: build --features io_uring_raw (musl unblock + release-parity, #682)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ironcache -p ironcache-console --features ironcache/io_uring_raw
 
   io-uring:
     name: io_uring datapath (Linux, default-off feature)
