@@ -50,8 +50,10 @@ jobs:
           helm lint deploy/helm/ironcache
           helm package deploy/helm/ironcache -d "${RUNNER_TEMP}/chart"
           tgz="$(ls "${RUNNER_TEMP}/chart"/ironcache-*.tgz)"
+          version="$(helm show chart deploy/helm/ironcache | awk -F': *' '/^version:/{print $2; exit}')"
           echo "tgz=${tgz}" >> "$GITHUB_OUTPUT"
-          echo "Packaged: ${tgz}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Packaged: ${tgz} (chart version ${version})"
       # Everything below PUBLISHES -- skip it on pull_request (validate the path only).
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -68,6 +70,15 @@ jobs:
           set -euo pipefail
           owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
           repo="ghcr.io/${owner_lc}/charts"
+          version="${{ steps.pkg.outputs.version }}"
+          # REFUSE TO CLOBBER: GHCR OCI tags are mutable, so re-pushing an existing chart version
+          # would silently overwrite an already-published (and possibly already-signed) artifact --
+          # a supply-chain footgun. Since the chart version is decoupled from the app tag, guard it:
+          # fail unless Chart.yaml was bumped to a not-yet-published version.
+          if helm show chart "oci://${repo}/ironcache" --version "${version}" >/dev/null 2>&1; then
+            echo "ERROR: ${repo}/ironcache:${version} is already published -- bump Chart.yaml version before releasing the chart"
+            exit 1
+          fi
           # helm push reads the docker config credentials set by docker/login-action above.
           helm push "${{ steps.pkg.outputs.tgz }}" "oci://${repo}" 2>&1 | tee "${RUNNER_TEMP}/push.log"
           # helm push prints `Digest: sha256:...`; sign the immutable by-digest ref so the
