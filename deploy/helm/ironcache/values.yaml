@@ -302,6 +302,14 @@ preStop:
 # StatefulSet RollingUpdate: pods roll ONE AT A TIME by descending ordinal, each gated by the
 # readinessProbe + minReadySeconds. `partition` is a canary lever: freeze ordinals < partition,
 # verify, then patch it down to 0 to roll the rest. 0 = roll everything (the normal case).
+#
+# UPGRADE SEMANTICS: a `helm upgrade` that changes image.tag rolls the StatefulSet, but the
+# native rollout has NO failover-before-drain hook and the preStop is a lame-duck sleep only.
+# With the default no-replica topology, each node's slots are briefly UNAVAILABLE during its
+# graceful restart (RPO=0 -- save-on-exit + retained PVC). For a zero-downtime upgrade of a
+# REPLICATED cluster, drive the controlled `CLUSTER FAILOVER` fence out of band (the
+# `ironcache upgrade --cluster` driver), not a bare `helm upgrade`. See docs/UPGRADE.md
+# "Kubernetes (Helm) rolling upgrades".
 updateStrategy:
   partition: 0
 # A "ready" pod must stay ready this long before the rollout advances to the next ordinal, so a
