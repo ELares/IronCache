@@ -29,12 +29,11 @@ Bottom line: **the data-plane and cluster mechanisms are production-grade; the g
 
 ---
 
-## 1a. Implementation status (P0 + P1 + P2 COMPLETE)
+## 1a. Implementation status (P0 + P1 COMPLETE; P2 mostly shipped)
 
-The P0 and the full P1 tier below have SHIPPED. The inline `MISSING`/`PARTIAL` markers in the
-tables that follow describe the pre-work baseline and are kept for context; this block is the
-current truth. The chart is now production-safe for **fixed-size** clusters; only P2 packaging
-polish and the day-2-scaling Operator remain.
+P0 and the full P1 tier have SHIPPED, along with most of P2. The Section 2 checklist below is
+kept in sync with this block (a row still reading `MISSING`/`PARTIAL` is a REAL remaining gap,
+not stale text). The chart is production-safe for **fixed-size** clusters.
 
 - **P0 (merged):** maxmemory auto-derived from the cgroup limit (OOMKill guard, #743);
   startupProbe + native `SleepAction` preStop + drain-on-`/readyz` graceful lifecycle (#745).
@@ -53,16 +52,24 @@ polish and the day-2-scaling Operator remain.
   REBALANCE APPLY` IS implemented (arms the slot copies) -- only the auto ownership-flip is the
   tracked follow-up; scale-in remains manual per-slot because APPLY spreads evenly and cannot
   drain a node.
-- **P2 packaging polish (SHIPPED, 6/6):** `appVersion`/`image.tag` pinned off `latest` (#755);
-  `values.schema.json` typed values + fail-early invariants (#756); the `values-k3s.yaml` overlay
-  + `K3S.md` (local-path / ARM / Traefik / servicelb / air-gapped) (#757); Grafana dashboard
-  auto-provision as a sidecar ConfigMap (#758); `helm test` connectivity hook + a kind e2e CI gate
-  -- which on its first run caught + fixed a real shipped preStop-gate bug (SleepAction is
-  beta/default-on only from 1.30, not 1.29) (#759); OCI chart publish to GHCR + keyless cosign
-  signing (#760). The chart is now 0.3.0.
-- **Remaining: only the day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the
-  chart + the #392 upgrade driver cover fixed-size clusters. The whole P0/P1/P2 line was 18 PRs
-  (#743-760).
+- **P2 packaging polish (partially shipped -- see Section 3 for the P2-1..P2-8 list):**
+  P2-1 Grafana dashboard auto-provisioned as a sidecar ConfigMap (#758); P2-2 `values.schema.json`
+  (#756); P2-4 OCI chart publish + keyless cosign signing (#760); P2-5 `appVersion`/`image.tag`
+  pinned off `latest` (#755). Plus the Section 4 k3s work: the `values-k3s.yaml` overlay + `K3S.md`
+  (#757). **P2-3 is PARTIAL** -- the `helm test` hook + a kind **install** e2e landed (#759), and
+  on its first run it caught + fixed a real shipped preStop-gate bug (SleepAction is
+  beta/default-on only from **1.30**, not 1.29), but `ct` and an **upgrade**-path test are still
+  missing. The chart is now 0.3.0.
+- **Genuinely remaining** (each also flagged in the Section 2 table):
+  1. **P2-3 finish** -- an upgrade-path e2e (install -> `helm upgrade` -> re-test), the case that
+     catches charts which lint clean but fail to *upgrade*. Highest value of the leftovers.
+  2. **Alert rules are not templated** -- the dashboard is auto-provisioned but
+     `deploy/prometheus/ironcache-alerts.yml` has no `PrometheusRule` template (an asymmetry
+     introduced by #758).
+  3. **P2-6** ServiceMonitor `relabelings`/`sampleLimit` passthrough; **P2-7** console-UI Ingress
+     template; **P2-8** doc-only clarifications (incl. pinning the busybox init image by digest).
+  4. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
+     #392 upgrade driver cover fixed-size clusters.
 
 ---
 
@@ -74,46 +81,46 @@ polish and the day-2-scaling Operator remain.
 | Headless Service + `publishNotReadyAddresses` | **DONE** | `clusterIP: None` + not-ready peers published for boot-time Raft discovery. DNS-propagation caveat: raft peer-join must retry, not fail-fast (M4). |
 | Separate client ClusterIP Service | **DONE** | With documented MOVED / cluster-aware-client caveat. |
 | `volumeClaimTemplates` + StorageClass + RWO | **DONE** | Per-pod sticky PVC at `data_dir`, settable class, emptyDir fallback. |
-| `persistentVolumeClaimRetentionPolicy: Retain` | **MISSING** | Never set; must be explicitly `Retain` (never `whenScaled: Delete`) so scale-in / rollout never nukes a data PVC. |
+| `persistentVolumeClaimRetentionPolicy: Retain` | **DONE** | Set explicitly to `Retain`/`Retain` (gated `>=1.27-0`) so scale-in / rollout never nukes a data PVC (#746). |
 | `podManagementPolicy: Parallel` | **DONE** | Correct for quorum bootstrap (avoids OrderedReady deadlock). Note: does **not** affect rolling updates (always one-at-a-time by ordinal). |
 | Quorum-preserving PDB (N≥3 only, odd N) | **DONE (scope corrected)** | `maxUnavailable: 1`; distinct selector vs console. Protects against **involuntary** disruption (drain/autoscaler)  -- does **NOT** gate rolling upgrades. |
 | podAntiAffinity (soft default / hard opt-in) | **DONE** | `topologyKey: kubernetes.io/hostname`. |
-| `topologySpreadConstraints` (zone spread) | **MISSING** | No zone-aware spread; a zone outage can kill quorum in multi-AZ. |
+| `topologySpreadConstraints` (zone spread) | **DONE** | Opt-in `topologySpread.enabled` passthrough (#746); CI renders it. |
 | Resource requests + limits; no CPU limit | **DONE** | Burstable posture, memory-limit-above-maxmemory documented. |
-| Guaranteed-QoS opt-in documented | **MISSING** | The requests==limits knob for strongest eviction protection undocumented. |
+| Guaranteed-QoS opt-in documented | **DONE** | values.yaml documents the memory-request lower bound + requests==limits, incl. the cpu-limit/CFS caveat (needs the kubelet `static` policy) (#750). |
 | Liveness `/livez` + readiness `/readyz` (membership-aware) | **DONE** | `/readyz` = per-shard AND-reduce + leader-known  -- best-in-class. Verify listener binds *before* snapshot reload (C3). |
-| `startupProbe` for slow snapshot reload | **MISSING** | Large restore can trip liveness (~65s) → CrashLoopBackOff. |
-| `preStop` lame-duck hook (native SleepAction) | **MISSING** | Endpoint-deprogram race; exec-sleep would break on distroless. |
-| Readiness flips to 503 on drain | **MISSING** | Shutdown flag not surfaced in `readiness()`. |
-| `terminationGracePeriodSeconds` sized to drain+save | **PARTIAL** | Fixed 60s; no size-aware guidance; risks SIGKILL mid-save. |
-| `minReadySeconds` (rollout soak) | **MISSING** | The *actual* soak lever for a safe rollout (not the PDB). |
-| Explicit `updateStrategy: RollingUpdate` (+ partition) | **PARTIAL** | Relies on k8s default; no partition/canary lever exposed. |
-| `revisionHistoryLimit` | **MISSING** | Defaults to 10; unbounded with manual patches. |
+| `startupProbe` for slow snapshot reload | **DONE** | `/readyz` startupProbe, default 60*10 = 10 min budget, sized to worst-case reload (#745). |
+| `preStop` lame-duck hook (native SleepAction) | **DONE** | Native `SleepAction` (shell-free image). Version-gated `>=1.30-0` -- originally shipped as `>=1.29` which was a BUG (SleepAction is alpha-off in 1.29 -> invalid pod); caught by the kind e2e and fixed + regression-guarded (#745, #759). |
+| Readiness flips to 503 on drain | **DONE** | `readiness()` checks the shutdown `AtomicBool` first; test-covered (#745). |
+| `terminationGracePeriodSeconds` sized to drain+save | **DONE** | Size-aware guidance (preStopSleep + drain + snapshot/throughput + margin) in values.yaml (#745). |
+| `minReadySeconds` (rollout soak) | **DONE** | Default 15s; documented as the real soak lever (not the PDB) (#746). |
+| Explicit `updateStrategy: RollingUpdate` (+ partition) | **DONE** | Explicit strategy + `partition` canary lever (#746). |
+| `revisionHistoryLimit` | **DONE** | Default 3 (etcd hygiene) (#746). |
 | Security context PSS *restricted* | **DONE** | nonroot 65532, RO-root, drop ALL, seccomp; init container too. |
-| `fsGroupChangePolicy: OnRootMismatch` | **UNVERIFIED** | Needed or every mount does a recursive chown on large PVCs → slow restarts (worsens startupProbe budget). Confirm + set. |
-| `automountServiceAccountToken: false` | **MISSING** | Cache pods + init need no API access; standard restricted hardening. |
-| PSA namespace-enforce label guidance | **MISSING** | Chart complies but doesn't recommend the enforce label. |
+| `fsGroupChangePolicy: OnRootMismatch` | **DONE** | Set, avoiding a recursive chown of a large data_dir on every mount (#746). |
+| `automountServiceAccountToken: false` | **DONE** | Cache pods (#746) and the console Deployment (#750) -- neither needs API access (console verified to have zero kube client deps). |
+| PSA namespace-enforce label guidance | **DONE** | values.yaml documents the `pod-security.kubernetes.io/enforce=restricted` recipe; all containers incl. the busybox init pass restricted (#750). |
 | ConfigMap + Secret + `checksum/config` roll | **DONE** | Full topology in ConfigMap; checksum annotation rolls pods. |
 | `existingSecret` delegation | **DONE** | Keeps creds out of Helm history. |
-| Cluster secret stable across upgrade | **PARTIAL** | `randAlphaNum` regenerates on bare `helm upgrade` → split-brain; warned in NOTES only. |
+| Cluster secret stable across upgrade | **DONE** | `lookup`-based preserve across `helm upgrade` (#747), with a nil-`data` guard (a review-caught render panic). GitOps/`helm template` still needs an explicit value -- documented. |
 | Init-container ordinal identity stamp | **DONE** | `stamp-identity.sh`; TOML prepend gotcha handled. |
 | Turnkey fresh-cluster auto-apply (fresh-only, idempotent) | **DONE** | Integration-tested; restart doesn't re-bootstrap. |
 | Readiness-gated one-at-a-time rolling upgrade | **DONE** | `/readyz` gate + ordinal serialization pace the rollout (NOT the PDB). |
-| Primary-failover-before-drain (RPO=0) | **PARTIAL** | #392 mechanism exists but is CLI-only, **not** wired as preStop/operator. |
-| Online scale-out (learner-join + reshard) | **PARTIAL** | Runtime primitives exist (MEET/REBALANCE/SETSLOT/FORGET) but manual; chart replica bump ≠ reshard; runtime slot map diverges from static ConfigMap after any reshard (S2). |
+| Primary-failover-before-drain (RPO=0) | **PARTIAL (documented; by design)** | Still CLI-only (#392). A preStop CANNOT self-fence: no self-failover command exists and a safe handoff needs cluster orchestration (find the leader, drain a candidate to lag 0, `CLUSTER FAILOVER` the candidate). Gap + the out-of-band procedure documented in `docs/UPGRADE.md` (#751); automating it is operator charter. |
+| Online scale-out (learner-join + reshard) | **PARTIAL (documented; by design)** | Primitives exist but are manual; a bare `kubectl scale` UP crash-loops (off-topology pod) and DOWN orphans slots. `REBALANCE APPLY` arms copies but never auto-flips and cannot drain a node. Documented in `deploy/SCALING.md` (#749). **Corrected:** a restart does NOT silently revert a reshard -- the Raft log wins (see S2 below). |
 | CPU cgroup awareness (shards) | **DONE** | `available_parallelism()` honors CFS quota. |
-| Memory cgroup awareness (maxmemory from limit) | **MISSING** | No `memory.max` reader; `maxmemory=0`; not wired from limit → **OOMKill**. Requires non-`noeviction` policy to actually guard. |
-| No HPA / VPA-caution documented | **MISSING** | HPA on a sharded raft store = automated orphaned-slot/re-election disaster; must be explicitly forbidden. |
-| Backup / restore / DR (snapshot, VolumeSnapshot, PITR) | **MISSING** | No backup CronJob, no CSI-snapshot guidance, no restore runbook, no RPO/RTO. |
+| Memory cgroup awareness (maxmemory from limit) | **DONE** | cgroup v2/v1 reader derives `maxmemory` = 70% of the limit at boot (tunable); default policy is already `allkeys-lru`, so it evicts instead of OOMKilling (#743). |
+| No HPA / VPA-caution documented | **DONE** | `deploy/SCALING.md` forbids HPA outright and restricts VPA to Off/Initial (#749). |
+| Backup / restore / DR (snapshot, VolumeSnapshot, PITR) | **DONE (docs-first, by decision)** | `deploy/BACKUP.md`: the artifact (whole `data_dir`), RPO/RTO, CSI VolumeSnapshot/Velero, the app-level sidecar copy for local-path, per-key DUMP, and a restore runbook (#752). No always-on CronJob is shipped on purpose (RWO + shell-free image + no native object-store = env-specific). |
 | ServiceMonitor (CRD-gated) | **DONE** | Rendered only when enabled; correct for CRD-less k3s. |
-| Prometheus alerts + Grafana dashboard | **PARTIAL** | Both exist as files; dashboard not auto-provisioned via ConfigMap. |
-| Cache-pods NetworkPolicy | **MISSING** | Only console has one; cluster-bus/repl ports wide open. |
-| `values.schema.json` | **MISSING** | No install-time validation of cross-field invariants. |
-| `helm test` + `ct` (kind/k3d install) | **MISSING** | Only static render/kubeconform today. |
-| OCI chart publish + signing | **MISSING** | Checkout-only; not GitOps/Argo-consumable. |
-| `appVersion` / default `image.tag` pinned | **PARTIAL** | Both `latest`; not reproducible. |
-| Ingress template (console UI) | **MISSING** | No Ingress; RESP is L4 so needs TCP path documented. |
-| k3s guidance (local-path/Traefik/servicelb/air-gap) | **MISSING** | Zero k3s notes in deploy tree/DEPLOY.md. |
+| Prometheus alerts + Grafana dashboard | **PARTIAL** | Dashboard is now auto-provisioned as a sidecar-discoverable ConfigMap (#758); the **alert rules are still a bare file** (`deploy/prometheus/ironcache-alerts.yml`) with no `PrometheusRule` template -- the remaining asymmetry. |
+| Cache-pods NetworkPolicy | **DONE** | Opt-in policy locking cluster-bus/repl to peers; client + metrics ports stay open by design (the metrics port serves the kubelet probes) (#748). Inert on flannel/k3s-default. |
+| `values.schema.json` | **DONE** | draft-07: types, enums, port bounds, conditional-requires, and top-level `additionalProperties:false`; doc-only for the non-encodable rules. Negative tests in CI (#756). |
+| `helm test` + `ct` (kind/k3d install) | **PARTIAL** | `helm test` PING hook + a kind **install** e2e (#759) -- which caught a real shipped preStop bug on its first run. Still missing: `ct` and, more importantly, an **upgrade** path test (the plan's P2-3 asks for install AND upgrade). |
+| OCI chart publish + signing | **DONE** | Packaged + pushed to `ghcr.io/<owner>/charts` and keyless cosign-signed by digest on a release tag, with a clobber guard (#760). |
+| `appVersion` / default `image.tag` pinned | **DONE** | `appVersion: 0.1.0` drives the tag (`image.tag | default .Chart.AppVersion`); raw manifests pinned too (#755). |
+| Ingress template (console UI) | **MISSING** | Still no Ingress template (plan P2-7). RESP is L4 so the TCP path is documented in `deploy/K3S.md`, but the console UI has no templated Ingress. |
+| k3s guidance (local-path/Traefik/servicelb/air-gap) | **DONE** | `deploy/K3S.md` + the `values-k3s.yaml` single-node overlay (#757). |
 
 ---
 
