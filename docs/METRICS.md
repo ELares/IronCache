@@ -16,7 +16,8 @@ Companion artifacts:
   connections, memory, per-shard hot-shard detection, replication, persistence).
   Set `metrics.grafanaDashboard.enabled=true` to auto-provision it as a
   sidecar-discoverable ConfigMap.
-- `deploy/prometheus/ironcache-alerts.yml` -- starter Prometheus alerting rules.
+- `deploy/helm/ironcache/alerts/ironcache-alerts.yml` -- starter Prometheus alerting rules
+  (also shipped as a PrometheusRule via `metrics.prometheusRule.enabled=true`).
 
 ## The ops endpoint
 

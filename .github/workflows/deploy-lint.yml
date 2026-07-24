@@ -75,7 +75,11 @@ jobs:
           # a bad key in values-k3s.yaml fails CI (helm auto-validates -f files against the schema).
           k3s_set="-f deploy/helm/ironcache/values-k3s.yaml"
           gd_set="--set metrics.grafanaDashboard.enabled=true"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set" "$gd_set"; do
+          # The monitoring CRD surface: the PrometheusRule (rules embedded from the in-chart
+          # alerts file) plus the ServiceMonitor scrape knobs. -ignore-missing-schemas skips the
+          # CRDs themselves, so the guards below assert the CONTENT actually rendered.
+          mon_set="--set metrics.prometheusRule.enabled=true --set metrics.serviceMonitor.enabled=true --set metrics.serviceMonitor.sampleLimit=50000"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set" "$gd_set" "$mon_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
@@ -123,6 +127,17 @@ jobs:
                 fi
                 grep -qE "^  replicas: 1$" <<< "$rendered" \
                   || { echo "ERROR: k3s overlay did not render replicas: 1"; exit 1; }
+                ;;
+              *prometheusRule.enabled=true*)
+                # The rules are embedded from alerts/ironcache-alerts.yml via .Files.Get; assert the
+                # PrometheusRule rendered AND actually carries rule bodies (a bad path or a moved
+                # file would otherwise yield a valid-but-EMPTY spec that kubeconform happily skips).
+                grep -q "kind: PrometheusRule" <<< "$rendered" \
+                  || { echo "ERROR: prometheusRule.enabled rendered no PrometheusRule"; exit 1; }
+                grep -q "ironcache.availability" <<< "$rendered" \
+                  || { echo "ERROR: PrometheusRule has no rule groups (alerts file not embedded?)"; exit 1; }
+                grep -q "sampleLimit: 50000" <<< "$rendered" \
+                  || { echo "ERROR: ServiceMonitor sampleLimit passthrough did not render"; exit 1; }
                 ;;
               *grafanaDashboard.enabled=true*)
                 # Assert the dashboard ConfigMap rendered AND carries the sidecar discovery label
