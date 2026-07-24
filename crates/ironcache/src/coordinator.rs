@@ -416,8 +416,10 @@ pub async fn run_drain_loop(
                     Some(work) => {
                         // Run the unit(s) + fire the per-request blocking-wake (PROD-9) + keyspace-
                         // publish (PROD-8) side effects. A `Batch` (#674) runs each request in order
-                        // with the same per-request side effects, one reply Vec back.
-                        process_shard_work(&ctx, &inbox, shard_index, work).await;
+                        // with the same per-request side effects, one reply Vec back. `spawn_save=true`:
+                        // an `__ICSAVE` runs OFF the drain loop (the #676 HOL-block fix) so this loop
+                        // keeps draining cross-shard hops during the save.
+                        process_shard_work(&ctx, &inbox, shard_index, work, true).await;
                     }
                     // All senders dropped (the process is already tearing down): stop the loop. Not a
                     // flag-driven stop, so no save is attempted here.
@@ -489,7 +491,10 @@ pub async fn run_drain_loop(
                             // Same processing as the steady-state arm (Single or #674 Batch): run +
                             // reply + per-request side effects. The post-shutdown window still
                             // services live cross-shard work (the save fan-out reaching this shard).
-                            process_shard_work(&ctx, &inbox, shard_index, work).await;
+                            // `spawn_save=false`: the save-on-exit `__ICSAVE` runs INLINE here so it
+                            // COMPLETES before this window returns and the shard tears down -- a detached
+                            // spawn would be cancelled at the idle gap, failing save-on-exit (review HIGH).
+                            process_shard_work(&ctx, &inbox, shard_index, work, false).await;
                         }
                         None => return,
                     }
@@ -606,9 +611,42 @@ async fn process_shard_work(
     inbox: &Inbox,
     shard_index: usize,
     work: ShardWork,
+    spawn_save: bool,
 ) {
     match work {
         ShardWork::Single { request, db, reply } => {
+            // #676 HOL-BLOCK FIX (STEADY STATE only, `spawn_save`): `__ICSAVE` runs the whole per-shard
+            // dump (freeze + await the off-core persist thread). Awaiting it INLINE here PARKED this
+            // shard's drain loop for the ENTIRE save wall-time, so every cross-shard HOP queued to this
+            // shard stalled ~the save duration (measured: during-save p99.9 ~= save wall-time; ~7/8 of
+            // commands are hops in the default round-robin-accept config, and `fan_out_save` parks EVERY
+            // sibling at once). SPAWN the save off the drain loop (`spawn_on_shard` = spawn_local -> SAME
+            // shard thread + thread-locals) so the loop returns to `rx.recv()` and keeps draining hops
+            // while the save runs concurrently. The freeze (the point-in-time cut) still runs
+            // synchronously at the top of `save_shard_local`; the `reply` oneshot is MOVED into the task
+            // so the home core's gather still receives this shard's manifest entry. SaveGuard
+            // serialization + the manifest-last commit are unaffected: the home awaits EVERY per-shard
+            // reply before committing, and the next save cannot start until this reply frees the guard,
+            // so a shard never has two saves in flight. A save produces no keyspace events and wakes no
+            // blocking waiter, so those side effects are N/A on this path.
+            //
+            // NOT on the graceful-SHUTDOWN drain window (`spawn_save == false`): there the save MUST run
+            // INLINE so it completes before the shard thread tears down. A detached spawn would be
+            // cancelled when the shutdown window returns at its ~120ms idle gap (the JoinHandle is
+            // dropped, the LocalSet torn down), SILENTLY FAILING save-on-exit for any per-shard dump
+            // over ~120ms and losing writes since the last snapshot (2-lens review HIGH). Shutdown is
+            // not latency-sensitive (the listener is closed; there are no live client hops to protect),
+            // so inlining there costs nothing and restores the full drain-grace protection.
+            if spawn_save && crate::serve::ascii_upper(request.command()) == crate::persist::ICSAVE
+            {
+                use ironcache_runtime::Runtime;
+                let ctx = ctx.clone();
+                ironcache_runtime::TokioRuntime::new().spawn_on_shard(async move {
+                    let r = run_local_save(&ctx, &request).await;
+                    let _ = reply.send(r);
+                });
+                return;
+            }
             let r = run_drained_unit(ctx, &request, db).await;
             let _ = reply.send(r);
             // BLOCKING WAKE (PROD-9) + KEYSPACE NOTIFICATIONS (PROD-8): a cross-shard write that ran

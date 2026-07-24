@@ -430,3 +430,87 @@ fn sigterm_graceful_save_on_exit_then_restart_reloads() {
     assert!(status2.success());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #676 HOL-BLOCK-FIX REGRESSION GUARD: SIGTERM save-on-exit must NOT drop a REMOTE (sibling) shard's
+/// partition. The fix runs `__ICSAVE` OFF the drain loop in STEADY STATE (so the loop keeps serving
+/// cross-shard hops during a save), but INLINE on the graceful-shutdown window -- a detached spawn
+/// there would be cancelled when the shutdown window returns at its ~120ms idle gap, silently failing
+/// the final save for any per-shard dump over ~120ms and losing writes since the last snapshot. The
+/// pre-fix single-key sigterm test can't see this (a 1-key dump is microseconds). This populates BOTH
+/// of the (`--shards 2`) shards with a real ~10MB keyspace so shard 1's dump is non-trivial, SIGTERMs,
+/// and asserts the restart reloads the FULL keyspace -- a dropped remote partition shows as DBSIZE < n.
+#[test]
+fn sigterm_save_on_exit_preserves_remote_shard_partition() {
+    let dir = temp_data_dir("sigterm-multishard");
+    let port = free_port();
+    let mut child = spawn_binary(port, Some(&dir), 3600); // --shards 2 + save policy on.
+    let n = 10_000usize;
+    let val = "x".repeat(1024); // ~10MB total -> ~5MB per shard, a non-trivial sibling dump.
+    {
+        let mut s = connect_blocking(port);
+        for k in 0..n {
+            let key = format!("k:{k}");
+            assert_eq!(
+                send_cmd(&mut s, &["SET", &key, &val]),
+                b"+OK\r\n",
+                "populate SET {key}"
+            );
+        }
+        assert_eq!(
+            send_cmd(&mut s, &["DBSIZE"]),
+            format!(":{n}\r\n").into_bytes(),
+            "all {n} keys populated across both shards"
+        );
+        drop(s);
+    }
+
+    // SIGTERM -> graceful save-on-exit (fans `__ICSAVE` to the sibling shard) -> exit 0.
+    let pid = child.id() as i32;
+    // SAFETY: kill(2) with our own spawned child's pid + SIGTERM.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let mut exited = None;
+    for _ in 0..800 {
+        if let Ok(Some(status)) = child.try_wait() {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let status = exited.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("child did not exit after SIGTERM");
+    });
+    assert!(
+        status.success(),
+        "SIGTERM graceful stop exits 0, got {status:?}"
+    );
+    assert!(
+        dir.join("dump.manifest").exists(),
+        "save-on-exit committed a manifest"
+    );
+
+    // Restart: the FULL keyspace must reload -- BOTH shards, not just the home shard. A remote
+    // partition dropped by a cancelled save-on-exit (the regression) shows as DBSIZE < n here.
+    let port2 = free_port();
+    let child2 = spawn_binary(port2, Some(&dir), 3600);
+    let mut s2 = connect_blocking(port2);
+    assert_eq!(
+        send_cmd(&mut s2, &["DBSIZE"]),
+        format!(":{n}\r\n").into_bytes(),
+        "restart reloaded the FULL keyspace (no remote-shard partition dropped on save-on-exit)"
+    );
+    // Spot-check keys spread across the keyspace (both shards) are present (EXISTS -> small reply).
+    for k in (0..n).step_by(997) {
+        let key = format!("k:{k}");
+        assert_eq!(
+            send_cmd(&mut s2, &["EXISTS", &key]),
+            b":1\r\n",
+            "sample key {key} reloaded"
+        );
+    }
+    let status2 = shutdown_and_wait(child2, &mut s2, &["SHUTDOWN", "NOSAVE"]);
+    assert!(status2.success());
+    std::fs::remove_dir_all(&dir).ok();
+}
