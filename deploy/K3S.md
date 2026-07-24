@@ -39,7 +39,7 @@ identity. Do **not**:
 
 For real HA on k3s, use **>= 3 nodes** with `cluster.enabled: true` **and** a
 non-local-path StorageClass (Longhorn/CSI) so PVCs survive a node loss. See
-`deploy/SCALING.md` and `deploy/UPGRADE.md`.
+`deploy/SCALING.md` and `docs/UPGRADE.md`.
 
 On a single node, save-on-exit + adequate `terminationGracePeriodSeconds` is the only
 thing between a drain and data loss (no peer to re-replicate from) -- keep a save
