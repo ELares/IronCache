@@ -87,7 +87,11 @@ explicit clusterSecret.value or clusterSecret.existingSecret (source-controlled,
 {{- $name := printf "%s-secret" (include "ironcache.fullname" .) -}}
 {{- $prior := lookup "v1" "Secret" .Release.Namespace $name -}}
 {{- $existing := "" -}}
-{{- if $prior -}}
+{{- /* Guard `.data`: an externally pre-created Secret at this name (a GitOps / external-secrets
+       placeholder) can be a truthy object with a NIL `data`, and `index nil ...` PANICS the whole
+       render -- `| default` does not rescue it (index fails first). `and $prior $prior.data` renders
+       a fresh random for a data-less prior instead of exploding. */ -}}
+{{- if and $prior $prior.data -}}
 {{- $existing = (index $prior.data "cluster_secret" | default "") -}}
 {{- end -}}
 {{- if $existing -}}
