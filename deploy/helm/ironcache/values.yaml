@@ -399,6 +399,25 @@ console:
     pullPolicy: IfNotPresent
   # The single HTTP port serving /livez + /readyz + /metrics + the UI + /api/*.
   httpPort: 9180
+  # Optional Ingress for the CONSOLE UI (plain HTTP). It does NOT and cannot front the cache:
+  # RESP is L4/TCP, so use the client Service / NodePort / LoadBalancer / a Traefik
+  # IngressRouteTCP for that (see deploy/K3S.md). Put real authn in front of this -- the console
+  # exposes an operator UI + API.
+  ingress:
+    enabled: false
+    # e.g. "traefik" on stock k3s, "nginx" elsewhere. Empty = the cluster's default IngressClass.
+    className: ""
+    # Controller-specific annotations (auth middleware, cert-manager issuer, ...).
+    annotations: {}
+    # Each entry: {host: <fqdn>, paths: [{path: /, pathType: Prefix}]}. `host` may be omitted
+    # for a catch-all rule; path defaults to "/" and pathType to "Prefix".
+    hosts:
+      - host: ironcache-console.local
+        paths:
+          - path: /
+            pathType: Prefix
+    # Verbatim Ingress TLS blocks, e.g. [{secretName: console-tls, hosts: [ironcache-console.local]}].
+    tls: []
   service:
     type: ClusterIP
   # Seed nodes the console polls. Point at the cache client Service DNS, e.g.

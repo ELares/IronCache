@@ -728,6 +728,34 @@
               "items": {}
             }
           }
+        },
+        "ingress": {
+          "type": "object",
+          "description": "Optional Ingress for the console UI (plain HTTP). Cannot front the cache: RESP is L4.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render the console Ingress (requires console.enabled)."
+            },
+            "className": {
+              "type": "string",
+              "description": "IngressClass name, e.g. traefik on k3s. Empty = the cluster default."
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Controller-specific annotations, passed through verbatim."
+            },
+            "hosts": {
+              "type": "array",
+              "description": "Rules: [{host, paths:[{path,pathType}]}]. host optional (catch-all).",
+              "items": {}
+            },
+            "tls": {
+              "type": "array",
+              "description": "Ingress TLS blocks, passed through verbatim.",
+              "items": {}
+            }
+          }
         }
       }
     }

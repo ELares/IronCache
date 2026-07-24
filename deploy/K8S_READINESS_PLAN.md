@@ -61,11 +61,8 @@ not stale text). The chart is production-safe for **fixed-size** clusters.
   beta/default-on only from **1.30**, not 1.29), but `ct` and an **upgrade**-path test are still
   missing. The chart is now 0.3.0.
 - **Genuinely remaining** (each also flagged in the Section 2 table):
-  1. **P2-3 finish** -- the upgrade-path e2e (install -> `helm upgrade` -> re-test), the case that
-     catches charts which lint clean but fail to *upgrade*. In flight (#763).
-  2. **P2-7** a console-UI Ingress template, and **P2-8** the doc-only clarifications (incl.
-     pinning the busybox init image by digest).
-  3. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
+  1. **P2-8** the doc-only clarifications (incl. pinning the busybox init image by digest).
+  2. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
      #392 upgrade driver cover fixed-size clusters.
 
 ---
@@ -113,10 +110,10 @@ not stale text). The chart is production-safe for **fixed-size** clusters.
 | Prometheus alerts + Grafana dashboard | **DONE** | Dashboard auto-provisioned as a sidecar-discoverable ConfigMap (#758); alert rules shipped as a `PrometheusRule` from the same in-chart file a plain Prometheus can load (`metrics.prometheusRule.enabled`). |
 | Cache-pods NetworkPolicy | **DONE** | Opt-in policy locking cluster-bus/repl to peers; client + metrics ports stay open by design (the metrics port serves the kubelet probes) (#748). Inert on flannel/k3s-default. |
 | `values.schema.json` | **DONE** | draft-07: types, enums, port bounds, conditional-requires, and top-level `additionalProperties:false`; doc-only for the non-encodable rules. Negative tests in CI (#756). |
-| `helm test` + `ct` (kind/k3d install) | **PARTIAL** | `helm test` PING hook + a kind **install** e2e (#759) -- which caught a real shipped preStop bug on its first run. Still missing: `ct` and, more importantly, an **upgrade** path test (the plan's P2-3 asks for install AND upgrade). |
+| `helm test` + `ct` (kind/k3d install) | **DONE (via kind; `ct` not used)** | `helm test` PING hook + a kind e2e covering INSTALL and UPGRADE (#759, #763): install -> `helm test` -> `helm upgrade` (rolls the pod) -> `helm test` again, plus a live cluster-secret-preservation gate for #747 (the `lookup` branch deploy-lint can never reach). `ct` itself is not used -- the kind job covers what P2-3 asked for. #759's first run caught a real shipped preStop bug. |
 | OCI chart publish + signing | **DONE** | Packaged + pushed to `ghcr.io/<owner>/charts` and keyless cosign-signed by digest on a release tag, with a clobber guard (#760). |
 | `appVersion` / default `image.tag` pinned | **DONE** | `appVersion: 0.1.0` drives the tag (`image.tag | default .Chart.AppVersion`); raw manifests pinned too (#755). |
-| Ingress template (console UI) | **MISSING** | Still no Ingress template (plan P2-7). RESP is L4 so the TCP path is documented in `deploy/K3S.md`, but the console UI has no templated Ingress. |
+| Ingress template (console UI) | **DONE** | `console.ingress.*` renders an Ingress for the console UI only (requires `console.enabled`). RESP is L4, so the cache's TCP path stays documented in `deploy/K3S.md`. |
 | k3s guidance (local-path/Traefik/servicelb/air-gap) | **DONE** | `deploy/K3S.md` + the `values-k3s.yaml` single-node overlay (#757). |
 
 ---
