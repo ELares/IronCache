@@ -48,8 +48,12 @@ jobs:
             --set replicas=1 --set cluster.enabled=false \
             --wait --timeout 5m
           kubectl -n ic-test get statefulset,pod
-          # `helm test` creates the PING Pod, waits for it, and fails if it exits non-zero.
-          helm test ic -n ic-test --logs
+          # `helm test` creates the PING Pod, waits for it, and fails the command if it exits
+          # non-zero. NOT `--logs`: the test hook's `hook-succeeded` delete policy removes the Pod
+          # on success, and `helm test --logs` then races it ("pods not found") -- a false failure
+          # even though the PING passed. The Diagnostics-on-failure step below dumps logs when a
+          # real failure leaves the Pod in place (hook-succeeded does not delete a FAILED Pod).
+          helm test ic -n ic-test
       - name: Diagnostics on failure
         if: failure()
         run: |
