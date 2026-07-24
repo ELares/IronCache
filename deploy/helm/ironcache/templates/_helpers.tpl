@@ -73,3 +73,26 @@ app.kubernetes.io/component: console
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- end -}}
+
+{{/*
+The AUTO-GENERATED cluster_secret, made STABLE across `helm upgrade`: reuse the value already
+stored in THIS release's Secret (via `lookup`) instead of minting a fresh random on every render,
+so a bare `helm upgrade` does NOT rotate the peer secret and split the cluster. A fresh random is
+minted only on the FIRST install (no prior Secret). IMPORTANT: `lookup` returns empty under
+`helm template` / `--dry-run` / a GitOps templater without live cluster access, so THOSE paths
+regenerate every time -- for GitOps (Argo/Flux) or any reproducible pipeline you MUST set an
+explicit clusterSecret.value or clusterSecret.existingSecret (source-controlled, never rotates).
+*/}}
+{{- define "ironcache.clusterSecretAuto" -}}
+{{- $name := printf "%s-secret" (include "ironcache.fullname" .) -}}
+{{- $prior := lookup "v1" "Secret" .Release.Namespace $name -}}
+{{- $existing := "" -}}
+{{- if $prior -}}
+{{- $existing = (index $prior.data "cluster_secret" | default "") -}}
+{{- end -}}
+{{- if $existing -}}
+{{- $existing | b64dec -}}
+{{- else -}}
+{{- randAlphaNum 40 -}}
+{{- end -}}
+{{- end -}}

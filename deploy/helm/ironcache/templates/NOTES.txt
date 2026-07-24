@@ -22,8 +22,11 @@ Raft cluster mode is ON ({{ int .Values.replicas }} nodes, 16384 slots split eve
 {{- if not .Values.clusterSecret.value }}
 
 WARNING: clusterSecret.value is empty -- a RANDOM secret was generated on install.
-A future `helm upgrade` would regenerate it and split the cluster. Set a stable
-clusterSecret.value (or clusterSecret.existingSecret) for production.
+It is now PRESERVED across `helm upgrade` (the chart looks up the existing Secret), so
+a bare upgrade no longer splits the cluster. BUT under GitOps (Argo/Flux) or any
+`helm template`/`--dry-run` pipeline the lookup is blind and the value REGENERATES every
+sync -- so for GitOps and reproducible/production installs you MUST set an explicit stable
+clusterSecret.value (or clusterSecret.existingSecret). Generate one: `openssl rand -hex 20`.
 {{- end }}
 {{- end }}
 {{- if not .Values.clusterTls.enabled }}
