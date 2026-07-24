@@ -103,7 +103,8 @@ spec:
         # ordinal) into /run/ironcache/ironcache.toml, which the main container
         # then passes to --config. Keeps the runtime image distroless/shell-free.
         - name: stamp-identity
-          image: "{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}"
+          {{- /* digest wins when set (supply-chain pin); note the `@` form, not `:`. */}}
+          image: "{{ .Values.initImage.repository }}{{ if .Values.initImage.digest }}@{{ .Values.initImage.digest }}{{ else }}:{{ .Values.initImage.tag }}{{ end }}"
           imagePullPolicy: {{ .Values.initImage.pullPolicy }}
           command: ["/bin/sh", "/scripts/stamp-identity.sh"]
           securityContext:

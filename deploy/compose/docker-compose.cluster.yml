@@ -29,7 +29,7 @@ name: ironcache-cluster
 
 services:
   ironcache-1:
-    image: ghcr.io/elares/ironcache:latest
+    image: ghcr.io/elares/ironcache:${IRONCACHE_VERSION:-0.1.0}
     hostname: ironcache-1
     command:
       - server
@@ -60,7 +60,7 @@ services:
     restart: unless-stopped
 
   ironcache-2:
-    image: ghcr.io/elares/ironcache:latest
+    image: ghcr.io/elares/ironcache:${IRONCACHE_VERSION:-0.1.0}
     hostname: ironcache-2
     command:
       - server
@@ -85,7 +85,7 @@ services:
     restart: unless-stopped
 
   ironcache-3:
-    image: ghcr.io/elares/ironcache:latest
+    image: ghcr.io/elares/ironcache:${IRONCACHE_VERSION:-0.1.0}
     hostname: ironcache-3
     command:
       - server

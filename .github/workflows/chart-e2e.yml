@@ -27,14 +27,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Create a kind cluster
-        uses: helm/kind-action@v1.10.0
+        uses: helm/kind-action@0025e74a8c7512023d06dc019c617aa3cf561fde # v1.10.0
         with:
           # Pin the k8s version to 1.30 so the run is deterministic AND exercises the native
           # SleepAction preStop path (beta/default-on from 1.30; the chart gates it on >=1.30).
           # The action's default is 1.29, where SleepAction is alpha-off -- a moving, wrong target.
           version: v0.23.0
           node_image: kindest/node:v1.30.0
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: ${{ env.HELM_VERSION }}
       - name: Install (standalone) + wait + helm test
