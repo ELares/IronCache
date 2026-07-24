@@ -176,13 +176,39 @@ pub fn default_shards() -> usize {
 /// a little sooner. Operators tune it by setting `maxmemory` explicitly (which disables derivation).
 pub const MAXMEMORY_AUTO_FRACTION: f64 = 0.70;
 
+/// Below this auto-derived `maxmemory` (a tiny pod), boot WARNs about near-constant eviction. 32 MiB
+/// is a low bar under which a cache is barely useful.
+const TINY_DERIVED_MAXMEMORY_WARN: u64 = 32 * 1024 * 1024;
+
+/// The maxmemory auto-derivation fraction, from `IRONCACHE_MAXMEMORY_AUTO_FRACTION` or the
+/// [`MAXMEMORY_AUTO_FRACTION`] default. Per the tunability tenet this headroom tradeoff (workloads
+/// vary in jemalloc fragmentation + save-transient) is a knob, not a baked-in constant -- but a
+/// boot-only OS-seam env knob (it only matters at boot when the ceiling is derived), NOT a
+/// `CONFIG SET`. Parsed leniently: a value outside `(0.0, 1.0]` or unparseable falls back to the
+/// default, because a bad tuning knob must NEVER disable the OOM guard.
+#[must_use]
+fn maxmemory_auto_fraction_from_env() -> f64 {
+    match std::env::var("IRONCACHE_MAXMEMORY_AUTO_FRACTION") {
+        Ok(s) => match s.trim().parse::<f64>() {
+            Ok(f) if f.is_finite() && f > 0.0 && f <= 1.0 => f,
+            _ => MAXMEMORY_AUTO_FRACTION,
+        },
+        Err(_) => MAXMEMORY_AUTO_FRACTION,
+    }
+}
+
 /// The container's cgroup MEMORY limit in bytes, or `None` when unlimited / unknown / non-Linux.
 /// Reads cgroup v2 (`/sys/fs/cgroup/memory.max`) then falls back to v1
 /// (`/sys/fs/cgroup/memory/memory.limit_in_bytes`). A literal `max` (v2) or the kernel "no limit"
 /// sentinel (v1, a near-`u64::MAX` page-aligned value) is treated as UNLIMITED -> `None`, so a pod
 /// with NO memory limit never auto-caps `maxmemory` to node capacity (the Downward-API footgun this
-/// deliberately reads the cgroup directly to avoid). Mirrors the `#[cfg(linux)]` + graceful-`None`
-/// shape of [`crate::`]'s peers (e.g. the RAM read in `ironcache`'s handoff guard).
+/// deliberately reads the cgroup directly to avoid).
+///
+/// Assumes the modern k8s/containerd/CRI-O `cgroupns=private` default, where the container's own
+/// cgroup appears at the `/sys/fs/cgroup` root. On a non-private cgroup namespace (or on the bare
+/// host) this reads the root/unlimited value and returns `None` -- a SAFE degradation to the prior
+/// unlimited behavior, never a mis-derived cap. Every read/parse is fallible-then-`None`, so a
+/// missing / unreadable / malformed file is treated as unlimited.
 #[must_use]
 pub fn cgroup_memory_limit_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -245,15 +271,24 @@ pub fn derive_maxmemory_from_cgroup(
     }
     match cgroup_limit {
         Some(limit) => {
-            let f = fraction.clamp(f64::MIN_POSITIVE, 1.0);
-            // limit * f, saturating into u64 (limit < 2^62 here, so no overflow).
+            // A non-finite / non-positive fraction falls back to the safe default rather than
+            // yielding a degenerate result (misuse-proofing this `pub` API; production passes the
+            // const 0.70). Anything above 1.0 is capped to the whole limit.
+            let f = if fraction.is_finite() && fraction > 0.0 {
+                fraction.min(1.0)
+            } else {
+                MAXMEMORY_AUTO_FRACTION
+            };
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 clippy::cast_precision_loss
             )]
             let derived = ((limit as f64) * f) as u64;
-            derived.max(1) // never derive a literal 0 (which would read as "unlimited" again).
+            // Never 0 (a literal 0 would re-read as "unlimited"); never ABOVE the limit (f64's
+            // 53-bit mantissa can round `limit as f64` up near 2^62, so a fraction of 1.0 could
+            // otherwise return limit+1 and defeat the guard).
+            derived.clamp(1, limit)
         }
         None => 0, // unlimited / unknown -> unchanged.
     }
@@ -1146,23 +1181,57 @@ impl Config {
     /// documented `maxmemory = 0` default -- never silently auto-cap. Logged at INFO when it fires so
     /// the effective ceiling is visible in the operator's log. Idempotent (a non-zero `maxmemory`,
     /// including one this method just set, short-circuits).
+    ///
+    /// Applied ONCE at boot: a VPA in-place memory resize that changes the limit at runtime would
+    /// leave the derived ceiling stale (a documented follow-up; the runtime `CONFIG SET maxmemory`
+    /// is the manual escape until then).
     pub fn apply_cgroup_memory_guard(&mut self) {
         if self.maxmemory != 0 {
             return; // an explicit ceiling wins (and makes re-application a no-op).
         }
+        let fraction = maxmemory_auto_fraction_from_env();
         let limit = cgroup_memory_limit_bytes();
-        let derived = derive_maxmemory_from_cgroup(self.maxmemory, limit, MAXMEMORY_AUTO_FRACTION);
-        if derived != 0 {
+        let derived = derive_maxmemory_from_cgroup(self.maxmemory, limit, fraction);
+        if derived == 0 {
+            // No cgroup limit detected (bare host / non-Linux / non-private cgroupns / a pod with no
+            // memory limit): maxmemory stays UNLIMITED. Surface it -- the common k8s footgun is
+            // forgetting `resources.limits.memory`, which silently leaves the cache unbounded.
             tracing::info!(
-                cgroup_memory_limit_bytes = limit.unwrap_or(0),
-                derived_maxmemory_bytes = derived,
-                fraction = MAXMEMORY_AUTO_FRACTION,
-                maxmemory_policy = %self.maxmemory_policy,
-                "maxmemory was unset under a cgroup memory limit; auto-capped to guard against \
-                 OOMKill (set IRONCACHE_MAXMEMORY explicitly to override)"
+                "maxmemory is unset and no cgroup memory limit was detected; running with UNLIMITED \
+                 maxmemory (set resources.limits.memory on Kubernetes, or IRONCACHE_MAXMEMORY, to \
+                 bound it)"
             );
-            self.maxmemory = derived;
+            return;
         }
+        // A very small derived ceiling (a tiny pod) means near-constant eviction; warn so it is not
+        // mistaken for a healthy config. 32 MiB is a low bar below which a cache is barely useful.
+        if derived < TINY_DERIVED_MAXMEMORY_WARN {
+            tracing::warn!(
+                derived_maxmemory_bytes = derived,
+                cgroup_memory_limit_bytes = limit.unwrap_or(0),
+                "auto-derived maxmemory is very small; expect heavy eviction (raise \
+                 resources.limits.memory or set IRONCACHE_MAXMEMORY)"
+            );
+        }
+        // With `noeviction`, a derived ceiling REJECTS writes under pressure instead of evicting --
+        // warn, since the default (allkeys-lru) is what makes this guard actually protective.
+        if self.maxmemory_policy == "noeviction" {
+            tracing::warn!(
+                "maxmemory auto-derived but maxmemory-policy is `noeviction`: writes will be \
+                 REJECTED under memory pressure rather than evicted (set an evicting policy such as \
+                 allkeys-lru to get the OOM guard's intended behavior)"
+            );
+        }
+        tracing::info!(
+            cgroup_memory_limit_bytes = limit.unwrap_or(0),
+            derived_maxmemory_bytes = derived,
+            fraction,
+            maxmemory_policy = %self.maxmemory_policy,
+            "maxmemory was unset under a cgroup memory limit; auto-capped to guard against OOMKill \
+             (set IRONCACHE_MAXMEMORY explicitly to override, or IRONCACHE_MAXMEMORY_AUTO_FRACTION \
+             to tune the headroom)"
+        );
+        self.maxmemory = derived;
     }
 
     /// Validate cross-field invariants after resolution.
@@ -4696,6 +4765,27 @@ mod tests {
         assert_eq!(derive_maxmemory_from_cgroup(0, Some(1000), 2.0), 1000);
         // A tiny limit never rounds to a literal 0 (which would re-read as "unlimited").
         assert_eq!(derive_maxmemory_from_cgroup(0, Some(1), 0.70), 1);
+    }
+
+    #[test]
+    fn maxmemory_guard_is_misuse_proof_on_the_fraction() {
+        // A near-2^62 limit with fraction 1.0 must never EXCEED the limit (f64 mantissa rounding).
+        let big = (1u64 << 62) - 1;
+        assert!(derive_maxmemory_from_cgroup(0, Some(big), 1.0) <= big);
+        // Non-finite / non-positive fractions fall back to the safe default (never disable the guard).
+        let base = derive_maxmemory_from_cgroup(0, Some(1_000_000_000), MAXMEMORY_AUTO_FRACTION);
+        assert_eq!(
+            derive_maxmemory_from_cgroup(0, Some(1_000_000_000), f64::NAN),
+            base
+        );
+        assert_eq!(
+            derive_maxmemory_from_cgroup(0, Some(1_000_000_000), 0.0),
+            base
+        );
+        assert_eq!(
+            derive_maxmemory_from_cgroup(0, Some(1_000_000_000), -0.5),
+            base
+        );
     }
 
     #[test]
