@@ -29,6 +29,36 @@ Bottom line: **the data-plane and cluster mechanisms are production-grade; the g
 
 ---
 
+## 1a. Implementation status (P0 + P1 COMPLETE)
+
+The P0 and the full P1 tier below have SHIPPED. The inline `MISSING`/`PARTIAL` markers in the
+tables that follow describe the pre-work baseline and are kept for context; this block is the
+current truth. The chart is now production-safe for **fixed-size** clusters; only P2 packaging
+polish and the day-2-scaling Operator remain.
+
+- **P0 (merged):** maxmemory auto-derived from the cgroup limit (OOMKill guard, #743);
+  startupProbe + native `SleepAction` preStop + drain-on-`/readyz` graceful lifecycle (#745).
+- **P1 (merged, 13/13):** StatefulSet hardening -- PVC-retention `Retain`, topologySpread,
+  updateStrategy/partition, minReadySeconds, revisionHistoryLimit, `automountServiceAccountToken:
+  false`, fsGroupChangePolicy (#746); cluster-secret rotation guard across `helm upgrade` (#747);
+  cache-pods NetworkPolicy -- peer-only bus/repl (#748); `SCALING.md` runbook + forbid-HPA/VPA
+  (#749); console SA-token parity + PSS enforce-label guidance + QoS/memory docs (#750);
+  `UPGRADE.md` "Kubernetes rolling upgrades" -- the failover-before-drain gap (#751); `BACKUP.md`
+  backup/restore/DR runbook (#752); a save-on-exit comment correctness fix (#753).
+- **Two plan claims CORRECTED by code fact-checks during implementation** (both were wrong in the
+  draft and are fixed in-place below): (1) a `helm upgrade`/pod-roll does **not** silently revert
+  or corrupt a runtime reshard -- the Raft log wins on restart (turnkey bootstrap is fresh-only
+  gated; a conflicting topology refuses to boot); the ConfigMap-divergence risk is real but
+  narrower (stale source-of-truth / fresh-re-provision fallback / boot refusal). (2) `CLUSTER
+  REBALANCE APPLY` IS implemented (arms the slot copies) -- only the auto ownership-flip is the
+  tracked follow-up; scale-in remains manual per-slot because APPLY spreads evenly and cannot
+  drain a node.
+- **Remaining (P2 polish, non-blocking):** `values.schema.json`, `helm test` + `ct` on kind/k3d,
+  OCI chart publish + sign, `appVersion`/`image.tag` off `latest`, Grafana auto-provision, and a
+  k3s values overlay (local-path / ARM / Traefik / servicelb / air-gapped).
+
+---
+
 ## 2. Convention Checklist → Status Table
 
 | Convention | Status | Note |
