@@ -85,45 +85,51 @@ jobs:
               | kubeconform -strict -summary -verbose \
                   -ignore-missing-schemas \
                   -kubernetes-version "${KUBE_VERSION}"
+            # Content guards below use `grep <<< "$rendered"` here-strings, NOT
+            # `printf ... | grep -q`: under `set -o pipefail`, `grep -q` closes the pipe on
+            # its first match, and for a LARGE render (e.g. the embedded Grafana dashboard)
+            # the still-writing printf then takes SIGPIPE, whose non-zero status pipefail
+            # propagates -- turning a SUCCESSFUL match into a false failure. A here-string
+            # has no upstream writer to break.
             case "$extra" in
               *console.enabled=true*)
                 # Guard against a broken `console.enabled` gate silently rendering
                 # nothing (kubeconform is happy with zero console objects, so assert
                 # the console Deployment/Service actually appeared).
-                printf '%s\n' "$rendered" | grep -q "ic-ironcache-console" \
+                grep -q "ic-ironcache-console" <<< "$rendered" \
                   || { echo "ERROR: console.enabled=true rendered no console resources"; exit 1; }
                 ;;
               *clusterTls.enabled=true*)
                 # #660: with clusterTls on and an empty ca, the Secret must still emit cluster.ca
                 # (defaulted to the cert), or the StatefulSet mounts a missing key and the pod
                 # fails at start. Assert the key is present in the rendered Secret.
-                printf '%s\n' "$rendered" | grep -q "cluster.ca:" \
+                grep -q "cluster.ca:" <<< "$rendered" \
                   || { echo "ERROR: clusterTls.enabled rendered no cluster.ca Secret key"; exit 1; }
                 ;;
               *networkPolicy.enabled=true*)
                 # Assert the NetworkPolicy actually rendered AND carries the peer-only bus/repl
                 # rule (client+10000 / client+20000). A silently-empty gate would pass kubeconform
                 # (zero NetworkPolicies is valid) while shipping no isolation at all.
-                printf '%s\n' "$rendered" | grep -q "kind: NetworkPolicy" \
+                grep -q "kind: NetworkPolicy" <<< "$rendered" \
                   || { echo "ERROR: networkPolicy.enabled=true rendered no NetworkPolicy"; exit 1; }
-                printf '%s\n' "$rendered" | grep -q "port: 16379" \
+                grep -q "port: 16379" <<< "$rendered" \
                   || { echo "ERROR: NetworkPolicy missing the cluster-bus (client+10000) rule"; exit 1; }
                 ;;
               *values-k3s.yaml*)
                 # The k3s overlay is the single-node standalone posture: no PDB (replicas=1
                 # gate) and exactly one replica. Guards the edge posture from silent regression.
-                if printf '%s\n' "$rendered" | grep -q "kind: PodDisruptionBudget"; then
+                if grep -q "kind: PodDisruptionBudget" <<< "$rendered"; then
                   echo "ERROR: k3s overlay rendered a PDB (expected none at replicas=1)"; exit 1
                 fi
-                printf '%s\n' "$rendered" | grep -qE "^  replicas: 1$" \
+                grep -qE "^  replicas: 1$" <<< "$rendered" \
                   || { echo "ERROR: k3s overlay did not render replicas: 1"; exit 1; }
                 ;;
               *grafanaDashboard.enabled=true*)
                 # Assert the dashboard ConfigMap rendered AND carries the sidecar discovery label
                 # (a silently-empty gate would ship no dashboard while kubeconform stays happy).
-                printf '%s\n' "$rendered" | grep -q "ic-ironcache-grafana-dashboard" \
+                grep -q "ic-ironcache-grafana-dashboard" <<< "$rendered" \
                   || { echo "ERROR: grafanaDashboard.enabled rendered no dashboard ConfigMap"; exit 1; }
-                printf '%s\n' "$rendered" | grep -qE "grafana_dashboard: \"1\"" \
+                grep -qE "grafana_dashboard: \"1\"" <<< "$rendered" \
                   || { echo "ERROR: dashboard ConfigMap missing the grafana_dashboard sidecar label"; exit 1; }
                 ;;
             esac

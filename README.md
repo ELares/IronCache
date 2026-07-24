@@ -211,7 +211,7 @@ full contract.
   stateless dashboard server that polls the nodes as a scoped ACL user and never
   sits on the data path. The HA deployment runbook is
   [`deploy/CONSOLE_DEPLOY.md`](deploy/CONSOLE_DEPLOY.md).
-- A shipped **Grafana dashboard** (`deploy/grafana/ironcache-dashboard.json`) and
+- A shipped **Grafana dashboard** (`deploy/helm/ironcache/dashboards/ironcache-dashboard.json`) and
   **Prometheus alert rules** (`deploy/prometheus/ironcache-alerts.yml`) over the
   `/metrics` series cataloged in [`docs/METRICS.md`](docs/METRICS.md).
 - **CalVer rolling releases** on every push to `main` plus formal `v*` releases:
