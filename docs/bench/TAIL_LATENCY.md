@@ -171,7 +171,62 @@ cheap stopgap that cuts that tail (~3-4x) while the ms-class isolation fix is bu
   **ms-class** isolation of a decoupled save. The durable fix is the epoch-cut copy-on-write snapshot
   on a dedicated persist thread (#576 PR-B); the throttle buys the tail-cut cheaply until it lands.
 
-## Measured record (c7g Graviton3, 2026-07-23)
+## Measured record: CURRENT (c7g Graviton3, post-#742)
+
+**The during-save tail is CLOSED.** The hundreds-of-ms tails recorded in the superseded
+section below were NOT the cost of the save at all -- they were a **cross-shard-hop
+head-of-line block**: `__ICSAVE` ran INLINE in each sibling shard's drain loop, parking it
+for the whole save wall-time, and with the default round-robin accept ~7/8 of commands are
+cross-shard hops, so every sibling loop stalled for ~the save window. PR #742 spawns
+`__ICSAVE` off the drain loop so the loop keeps draining hops during the save.
+
+Same config as the pre-fix run (8 server cores + a pinned persist core, tmpfs, 1M keys,
+`BGSAVE` every 3s), OVERALL open-loop op latency:
+
+| | p99 | p99.9 |
+| --- | --- | --- |
+| no-save baseline | 12 ms | 21 ms |
+| during base save (pre-#742) | ~640 ms | **~794 ms** |
+| **during base save (post-#742)** | **12 ms** | **30 ms** |
+
+**during-save p99.9: 794 ms -> 30 ms (~26x)**, with p99 unchanged at 12 ms and the p99.9
+within 9 ms of the no-save baseline -- the save is now essentially invisible to the datapath.
+
+Against the same pinned competitors (tmpfs, 1M keys, during-save p99.9):
+
+| Server | during-save p99.9 |
+| --- | --- |
+| Dragonfly 1.39.0 | 19 ms |
+| **IronCache (post-#742)** | **30 ms** |
+| Valkey 8.1.1 | 510 ms |
+| Redis 7.0.15 | 719 ms |
+
+IronCache moved from **worst in class** (794 ms) to **Dragonfly's class** (30 ms vs 19 ms),
+and roughly 17x/24x ahead of Valkey/Redis. The #665 loss-3 during-save tail is closed.
+
+**How it was found (a measure-don't-infer case study).** Three root-cause attempts: (1)
+copy-on-write -- disproven by a 0%-write ablation; (2) encode-read bandwidth -- a pacer was
+built (#740) and the c7g bench REFUTED it (pacing barely moved the save wall-time because the
+encode is a small fraction of it), so it was reverted (#741); (3) the HOL block -- confirmed
+by a decisive 1-shard-vs-8-shard ablation, where the *bigger* 1-shard save stalled ~60x
+*less* than the smaller 8-shard save, which is the opposite of any bandwidth theory. A 2-lens
+review then caught a HIGH on the fix itself (a detached spawn on the graceful-shutdown path is
+cancelled at the ~120 ms drain-window idle gap, dropping save-on-exit), fixed by keeping the
+save inline on shutdown only, with a teeth-verified regression test.
+
+---
+
+## Superseded: PRE-#742 measured record (c7g Graviton3, 2026-07-23)
+
+> **These numbers are HISTORICAL and no longer describe IronCache.** They were taken ~4.5
+> hours before PR #742 merged. Every IronCache tail below is dominated by the head-of-line
+> block described above, so the analysis in this section ATTRIBUTES TO SAVE COST what was
+> actually a scheduling defect -- in particular the dataset-scaling table and its "~4.3 ms of
+> datapath stall per MB" conclusion measure how long the HOL block lasted (which does track
+> save wall-time, hence dataset size), NOT an inherent persistence cost. The competitor
+> numbers in this section remain valid. Kept for provenance and because the *save wall-time*
+> characterization (deltas cut incremental save cost; a base save is O(resident data)) is
+> still accurate.
 
 First full cross-competitor run on a 16-vCPU Graviton3 `c7g.4xlarge`: IronCache
 release build vs Redis 7.0.15, Valkey 8.1.1, and Dragonfly 1.39.0. Pinning was the
@@ -225,14 +280,14 @@ p99.9, because a cold run still needs ONE base save and that base stall alone se
 p99.9. The deltas' p99.9 win grows over a LONG steady-state window where base saves
 amortize; a cold 20s window overweights the single mandatory base.
 
-**Honest verdict.** IronCache's during-save p99.9 is on par with Redis, worse than
-Valkey, and ~40x worse than Dragonfly at 1M keys. Dragonfly's async io_uring snapshot
-adds almost nothing to its tail (19 ms with a save vs its own sub-ms baseline) -- that
-is the architecture to beat. Deltas (#676) are a real but partial lever: they fix the
-INCREMENTAL save cost, not the periodic base-save datapath stall. Closing the gap to
-ms-class needs the base save decoupled from serving (a versioned, non-blocking snapshot
-writer that never quiesces a serving shard), which is a larger structural change than
-the delta path and is the open Phase 2/3 question on #676.
+**Verdict AS OF THIS PRE-#742 RUN (superseded -- see the current record above).** At the
+time this read: IronCache's during-save p99.9 is on par with Redis, worse than Valkey, and
+~40x worse than Dragonfly at 1M keys, and closing the gap looked like it needed the base save
+structurally decoupled from serving. **That conclusion was wrong about the cause.** The gap
+was a head-of-line block in the drain loop, not the base-save datapath cost, and PR #742
+closed it to 30 ms without any structural snapshot rewrite. What remains accurate here: the
+deltas (#676) fix the INCREMENTAL save cost, and a base save is still O(resident data) in
+WALL-TIME -- it just no longer stalls the datapath while it runs.
 
 ## Reproducing on real hardware
 
