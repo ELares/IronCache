@@ -42,6 +42,10 @@ cluster:
   raftSnapshotThreshold: 1024
 
 # --- Persistence (durable snapshot + Raft log under data_dir) -----------------
+# NOTE: a PVC is NOT a backup. For backup/restore/DR (VolumeSnapshot/Velero, the
+# app-level snapshot-file export for local-path, and the restore runbook) see
+# deploy/BACKUP.md -- an off-node backup is MANDATORY on single-node k3s local-path
+# (PVC loss = total data loss; no peer to re-replicate from).
 persistence:
   # data_dir is the SINGLE enable switch for durable persistence AND the durable
   # Raft log. Strongly recommended for any cluster (the Raft log must survive a
