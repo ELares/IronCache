@@ -207,9 +207,17 @@ it must NOT be used to protect the tail. The actual fix is the per-slot Arc-COW 
   slot table is an `Arc<HashTable>`; a save `Arc`-clones each slot into a frozen `Send` view read IN
   PLACE off-core by a dedicated persist thread, with NO O(N) serving-side copy (a write to a frozen
   slot copies just that slot). Measured on c7g: concurrent-snapshot p99.9 dropped from 3.5s to ~291ms
-  (11.5x). The residual gap to ms-class (Redis/Dragonfly ~15ms) is a FUNDAMENTAL memory-bandwidth-
-  headroom tradeoff of the high-throughput multi-core datapath (see CONFIG.md "Dedicated persist core"
-  and #589), reachable only by reducing the save's data footprint (incremental/compressed snapshots),
+  (11.5x). That ~291ms is HISTORICAL -- it is the #588 Arc-COW change alone; the during-save tail was
+  later taken to ~30ms by PR #742 (see docs/bench/TAIL_LATENCY.md for the current record).
+  **SUPERSEDED:** the residual gap to ms-class was long believed to be a FUNDAMENTAL
+  memory-bandwidth-headroom tradeoff of the multi-core datapath, reachable only by shrinking the
+  save's data footprint. That was DISPROVEN by measurement (#676): a pacer built on the bandwidth
+  theory was refuted on c7g and reverted (#740/#741), and a 1-shard-vs-8-shard ablation showed the
+  BIGGER 1-shard save stalling ~60x LESS -- the opposite of any bandwidth story. The real cause was a
+  cross-shard-hop head-of-line block (`__ICSAVE` running inline in each sibling shard's drain loop);
+  PR #742 spawns it off the loop and the during-save p99.9 went 794ms -> 30ms, into Dragonfly's class.
+  The historical framing is kept below for provenance (see CONFIG.md "Dedicated persist core" and
+  #589), but reducing the save footprint (incremental/compressed snapshots) is an optimization,
   which is deferred. The durable-save tail is COMPETITIVE (sub-second), not category-leading.
 
 ## Open questions

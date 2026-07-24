@@ -563,10 +563,12 @@ but one cell (the 128B pipeline-64 SET is a within-noise tie), on the shipped
 binary, with a reproducible artifact behind every number. Baseline p99.9 latency
 **ties** Dragonfly (measured identical at a matched load). Two rows honestly go the other
 way: **pipeline 1** (no pipelining) throughput, where Dragonfly's leaner
-per-command path wins about 30%, and the **during-snapshot tail** (IronCache's
-291ms durable-save p99.9 vs Dragonfly's ~15ms), a known limitation at a
-memory-bandwidth floor that only incremental snapshots can move (tracked, not yet
-built). Memory is a wash decided by keycount: IronCache flat-and-predictable,
+per-command path wins about 30%, and -- historically -- the **during-snapshot
+tail**. That tail is now CLOSED: it was a cross-shard-hop head-of-line block in the
+drain loop, not a memory-bandwidth floor, and PR #742 took the during-save p99.9
+from 794ms to **30ms** on c7g (Dragonfly 19ms, Valkey 510ms, Redis 719ms at the same
+config), i.e. from worst-in-class into Dragonfly's class. See
+`docs/bench/TAIL_LATENCY.md`. Memory is a wash decided by keycount: IronCache flat-and-predictable,
 Dragonfly lower in a narrow short-key window and much higher in others. Versus
 **Redis 8**, IronCache's thread-per-core write path parallelizes SET across all
 shards where Redis serializes every write on its single main thread (regardless of
