@@ -312,11 +312,11 @@ startupProbe:
 # Service endpoint deprograms (kube-proxy stops routing NEW clients here) BEFORE the
 # process is drained -- avoiding client-visible resets on every rolling update. Uses the
 # native SleepAction (alpha 1.29, beta/default-on 1.30, GA 1.34); the distroless image is
-# SHELL-FREE, so an exec `sleep` hook would silently fail. The chart auto-gates this block
-# on the cluster version (semverCompare >= 1.29), so on OLDER clusters it is simply omitted
-# and the server's readiness-fail-on-drain takes over (/readyz returns 503 the moment drain
-# starts) -- no broken install. Set 0 to disable it explicitly. Keep it comfortably under
-# terminationGracePeriodSeconds.
+# SHELL-FREE, so an exec `sleep` hook would silently fail. The chart auto-gates this block on
+# the cluster version (semverCompare >= 1.30, since 1.29 is alpha-off and the API server would
+# reject the `sleep` handler there), so on OLDER clusters it is simply omitted and the server's
+# readiness-fail-on-drain takes over (/readyz returns 503 the moment drain starts) -- no broken
+# install. Set 0 to disable it explicitly. Keep it comfortably under terminationGracePeriodSeconds.
 preStop:
   sleepSeconds: 10
 

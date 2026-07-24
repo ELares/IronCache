@@ -169,6 +169,22 @@ jobs:
           echo "OK (accepted): fullnameOverride"
           echo "::endgroup::"
 
+      - name: preStop SleepAction version gate (>=1.30 only)
+        run: |
+          set -euo pipefail
+          # SleepAction is alpha-off in 1.29 and only beta/default-on from 1.30. The chart MUST
+          # omit the preStop `sleep` handler below 1.30 (an empty preStop is an INVALID pod that
+          # the API server rejects -- a real install break, caught live once by chart-e2e on a
+          # 1.29 kind node). Guard the gate boundary so it cannot regress.
+          r129="$(helm template ic deploy/helm/ironcache --kube-version 1.29.0)"
+          r130="$(helm template ic deploy/helm/ironcache --kube-version 1.30.0)"
+          if grep -q 'sleep:' <<< "$r129"; then
+            echo "ERROR: preStop sleep rendered on k8s 1.29 (alpha-off) -- would create an invalid pod"; exit 1
+          fi
+          grep -q 'sleep:' <<< "$r130" \
+            || { echo "ERROR: preStop sleep NOT rendered on k8s 1.30 (should be beta/default-on)"; exit 1; }
+          echo "OK: preStop omitted on 1.29, rendered on 1.30"
+
   k8s:
     name: kubeconform (raw manifests)
     runs-on: ubuntu-latest
