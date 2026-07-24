@@ -5,6 +5,14 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "nameOverride": {
+      "type": "string",
+      "description": "Override the chart name in resource names (the standard Helm fullname helper reads this; not in the default values.yaml but honored by _helpers.tpl)."
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "description": "Override the fully-qualified release name (the StatefulSet/Service base name). Used to run two releases in one namespace; honored by _helpers.tpl."
+    },
     "image": {
       "type": "object",
       "description": "Cache server container image.",

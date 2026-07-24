@@ -122,7 +122,9 @@ jobs:
             if helm template ic deploy/helm/ironcache "$@" >/dev/null 2>/tmp/schema-err; then
               echo "ERROR: schema did NOT reject an invalid value ($desc) -- helm template succeeded"; exit 1
             fi
-            grep -qiE 'schema|Additional property|Invalid type|Must be|length must be' /tmp/schema-err \
+            # Match a SCHEMA-specific message (not the generic "the schema(s)" boilerplate that any
+            # helm error might mention) so a non-schema template failure is not mistaken for a pass.
+            grep -qiE 'Additional property|Invalid type|Must be|length must be|does not match pattern|must be one of' /tmp/schema-err \
               || { echo "ERROR: '$desc' failed for a NON-schema reason:"; cat /tmp/schema-err; exit 1; }
             echo "OK (rejected): $desc"
             echo "::endgroup::"
@@ -132,6 +134,13 @@ jobs:
           bad_case "auth.enabled without a secret" --set auth.enabled=true
           bad_case "bad service.type enum"         --set service.type=Bogus
           bad_case "clusterTls.enabled no cert"    --set cluster.enabled=true --set clusterTls.enabled=true
+          # Positive guard: fullnameOverride is read by _helpers.tpl but absent from values.yaml,
+          # so additionalProperties:false must still ACCEPT it (regression guard for that trap).
+          echo "::group::accept: fullnameOverride"
+          helm template ic deploy/helm/ironcache --set fullnameOverride=ic-alt >/dev/null \
+            || { echo "ERROR: schema wrongly REJECTED a valid fullnameOverride"; exit 1; }
+          echo "OK (accepted): fullnameOverride"
+          echo "::endgroup::"
 
   k8s:
     name: kubeconform (raw manifests)
