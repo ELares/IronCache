@@ -134,8 +134,12 @@ resources:
     memory: "512Mi"
   limits:
     # No CPU limit by default (avoid CFS throttling of the per-core runtime); set
-    # one if your platform requires it. Memory limit should sit comfortably ABOVE
-    # the configured maxmemory so eviction, not the OOM killer, reclaims memory.
+    # one if your platform requires it. A MEMORY LIMIT IS REQUIRED for OOM safety:
+    # when maxmemory is left unset (the default below), IronCache AUTO-DERIVES it from
+    # this cgroup limit (~70%) at boot, so the cache EVICTS under pressure (its default
+    # allkeys-lru policy) instead of being OOMKilled (exit 137 -> data loss). The ~30%
+    # headroom covers jemalloc overhead + the during-save copy-on-write transient.
+    # Set maxmemory explicitly in extraConfig to override the derivation.
     memory: "2Gi"
 
 # Extra IronCache config: any maxmemory / maxmemory_policy / timeout overrides
@@ -144,7 +148,11 @@ resources:
 # output_buffer_limit, databases, shards; see KNOWN_TOML_KEYS in
 # crates/ironcache-config/src/lib.rs). The TOML parse is STRICT: a hyphen spelling
 # like maxmemory-policy fails the boot. Log level is not a TOML key; use logLevel
-# below (the --log-level arg). Example:
+# below (the --log-level arg).
+#
+# maxmemory: LEAVE UNSET for OOM safety -- it auto-derives from resources.limits.memory
+# (~70%) at boot (see the resources note above). Only set it explicitly to pin a
+# specific ceiling (which disables the auto-derivation). Example of an explicit pin:
 #   extraConfig: |
 #     maxmemory = 1610612736
 #     maxmemory_policy = "allkeys-lru"

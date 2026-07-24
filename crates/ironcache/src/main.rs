@@ -256,6 +256,12 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     // LOUD warning. This makes a low `ulimit -n` a clean bounded ceiling at boot
     // rather than an `EMFILE` mid-traffic. Boot / OS-seam code, outside ADR-0003.
     fd_budget::apply_fd_budget(&mut cfg);
+    // K8s/k3s OOMKill GUARD (P0-1): if `maxmemory` was left unset and this process runs under a
+    // finite cgroup MEMORY limit, cap it at a fraction of the limit so the cache EVICTS under
+    // pressure instead of being OOMKilled (exit 137 -> data loss). No-op when `maxmemory` is set
+    // explicitly or there is no cgroup limit (non-container / non-Linux). Boot / OS-seam, outside
+    // ADR-0003 (like `apply_fd_budget` above). Logged at INFO when it fires.
+    cfg.apply_cgroup_memory_guard();
     // CLUSTER-BUS SECURITY (#557): if a clustered mode is configured WITHOUT a cluster_secret and
     // with cluster_tls off, the inter-node RAFTMSG bus + replication stream run plaintext and
     // unauthenticated, so any peer reaching the bus port could join consensus or siphon the
@@ -624,7 +630,10 @@ fn cmd_bench() {
 fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
     // Self-check: resolve and validate the effective config, report it. With no
     // data directory yet (PR-1 is ephemeral), the check is config-only.
-    let cfg = load_config(cli)?;
+    let mut cfg = load_config(cli)?;
+    // Apply the K8s/k3s OOMKill guard so `check` reports the EFFECTIVE maxmemory the server will
+    // boot with (an auto-derived cap under a cgroup memory limit), not the pre-derivation `0`.
+    cfg.apply_cgroup_memory_guard();
     println!("ironcache check: configuration OK");
     println!("  bind        = {}:{}", cfg.bind, cfg.port);
     println!("  shards      = {}", cfg.shards);
@@ -757,7 +766,10 @@ fn print_allocator_check() {
 
 fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
     // Print the effective configuration (CLI_BINARY.md `config` reads the config).
-    let cfg = load_config(cli)?;
+    let mut cfg = load_config(cli)?;
+    // Report the EFFECTIVE maxmemory (an auto-derived cgroup cap when unset), matching what the
+    // server boots with -- consistent with `check` and INFO.
+    cfg.apply_cgroup_memory_guard();
     println!("# effective ironcache configuration");
     println!("bind = \"{}\"", cfg.bind);
     println!("port = {}", cfg.port);
