@@ -7,7 +7,8 @@
 //!     raft-mode the control-plane role/term/commit/voters),
 //!   * `GET /livez`   -> `200 OK` once the process is up (a Kubernetes liveness probe), and
 //!   * `GET /readyz`  -> `200 OK` when load-on-boot has finished AND (in raft-mode) a leader is
-//!     recognized, else `503` with a short reason (a readiness probe).
+//!     recognized AND the node is not draining, else `503` with a short reason (a readiness probe;
+//!     a draining node fails readiness so k8s deprograms its endpoint before shutdown).
 //!
 //! ## Why hand-rolled instead of a web framework
 //!
@@ -98,6 +99,11 @@ pub struct MetricsState {
     /// nothing (no per-enqueue/dequeue atomic). `None` only in the degenerate unit-test state with no
     /// coordinator wired, in which case the gauge renders an all-zero slice sized to the shard count.
     inbox: Option<crate::coordinator::Inbox>,
+    /// The graceful-shutdown flag (#543): `Some` on a real boot. When it is set, `/readyz` returns
+    /// 503 (draining) so k8s deprograms this pod's Service endpoint the MOMENT shutdown begins --
+    /// belt-and-suspenders with the chart's preStop lame-duck, and the fallback where the native
+    /// `SleepAction` preStop is unavailable (k8s < 1.29). `None` in the degenerate unit-test state.
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 /// The boot-anchored clock for uptime. One [`SystemEnv`] whose monotonic `origin` is captured at
@@ -210,6 +216,7 @@ impl MetricsState {
         persist: Option<Arc<crate::persist::PersistState>>,
         topology: crate::topology::TopologyHandle,
         inbox: Option<crate::coordinator::Inbox>,
+        shutdown: Option<Arc<AtomicBool>>,
     ) -> Self {
         MetricsState {
             registry,
@@ -222,6 +229,7 @@ impl MetricsState {
             persist,
             topology,
             inbox,
+            shutdown,
         }
     }
 
@@ -296,6 +304,15 @@ impl MetricsState {
     /// (raft-mode) a leader is recognized; otherwise `Err(reason)` with a short cause string the
     /// `/readyz` body reports.
     fn readiness(&self) -> Result<(), &'static str> {
+        // Draining (P0-5): fail readiness the instant graceful shutdown begins so k8s stops routing
+        // NEW clients here BEFORE the drain -- deprogramming the Service endpoint. Checked FIRST so a
+        // draining node is never reported ready regardless of load / leader state. Belt-and-suspenders
+        // with the chart's preStop lame-duck (and the fallback when SleepAction is unavailable).
+        if let Some(shutdown) = &self.shutdown {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("draining");
+            }
+        }
         if !self.ready.load_done() {
             return Err("load-on-boot incomplete");
         }
@@ -619,8 +636,44 @@ mod tests {
             None,
             crate::topology::TopologyHandle::standalone("test-node-id", 6379, 2),
             None,
+            None, // no shutdown flag in the default test state
         );
         (state, registry, live, ready)
+    }
+
+    #[test]
+    fn readyz_returns_503_while_draining() {
+        // A booted, loaded, non-raft node with a shutdown flag: ready until drain begins.
+        let registry = MetricsRegistry::new(1);
+        let live = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new(ReadyState::with_shards(0)); // load-on-boot already done
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let state = MetricsState::new(
+            registry,
+            Arc::clone(&live),
+            Arc::clone(&ready),
+            1,
+            Arc::new(|| 0),
+            None, // no raft -> the leader gate is skipped
+            None,
+            crate::topology::TopologyHandle::standalone("test-node-id", 6379, 1),
+            None,
+            Some(Arc::clone(&shutdown)),
+        );
+        // Not draining + load done -> READY (200).
+        let resp = String::from_utf8(state.respond("GET", "/readyz")).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "ready when not draining: {resp}"
+        );
+        // Drain begins -> /readyz flips to 503 `draining` so k8s deprograms this endpoint.
+        shutdown.store(true, Ordering::SeqCst);
+        let resp = String::from_utf8(state.respond("GET", "/readyz")).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "503 while draining: {resp}"
+        );
+        assert!(resp.contains("draining"), "reason names draining: {resp}");
     }
 
     #[test]
@@ -730,6 +783,7 @@ mod tests {
             None,
             None,
             topo,
+            None,
             None,
         );
         let text = String::from_utf8(state.respond("GET", "/metrics")).unwrap();

@@ -56,6 +56,8 @@ pub fn run_server_with_metrics_for_test(port: u16, shards: usize, metrics_port: 
         handles.topology.clone(),
         // The coordinator inbox, so `/metrics` samples the per-shard inbox-depth gauge (#556).
         Some(handles.inbox.clone()),
+        // No drain-readiness simulation in the test harness.
+        None,
     );
     let addr = format!("127.0.0.1:{metrics_port}");
     metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");
@@ -668,6 +670,7 @@ pub fn run_shard_owners_node_with_metrics_for_test(
             handles.persist.clone(),
             handles.topology.clone(),
             Some(handles.inbox.clone()),
+            None,
         );
         let addr = format!("127.0.0.1:{metrics_port}");
         metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");

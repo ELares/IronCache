@@ -199,8 +199,33 @@ containerSecurityContext:
       - ALL
 
 # StatefulSet rolling-update + termination tuning. terminationGracePeriodSeconds
-# must cover the graceful drain + save-on-exit.
+# must cover preStop.sleepSeconds + the connection drain + the save-on-exit; if it is
+# too small the kubelet SIGKILLs mid-save and truncates the snapshot. Size it (and the
+# startupProbe budget below) from your worst-case dataset: roughly
+# preStopSleep + drain(~5s) + (snapshot_bytes / save_throughput) + margin. Raise to
+# 120-180s for datasets over ~5GB or slow storage.
 terminationGracePeriodSeconds: 60
+
+# --- Graceful lifecycle (P0 hardening) ----------------------------------------
+# Startup probe: a large snapshot RELOAD on boot can take far longer than the liveness
+# budget, which would CrashLoopBackOff a healthy node mid-load. The startupProbe hits
+# /readyz and SUSPENDS liveness+readiness until load-on-boot completes. Size
+# failureThreshold * periodSeconds to the worst-case reload time (default 60*10 = 10 min;
+# raise failureThreshold for multi-GB datasets or slow/edge storage).
+startupProbe:
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 60
+
+# preStop lame-duck: after the pod is marked for deletion, sleep this many seconds so the
+# Service endpoint deprograms (kube-proxy stops routing NEW clients here) BEFORE the
+# process is drained -- avoiding client-visible resets on every rolling update. Uses the
+# native SleepAction (Kubernetes 1.29+, GA 1.30); the distroless image is SHELL-FREE, so
+# an exec `sleep` hook would silently fail. 0 disables it -- on k8s < 1.29 set 0 and rely
+# on the server's readiness-fail-on-drain (/readyz returns 503 the moment drain starts).
+# Keep it comfortably under terminationGracePeriodSeconds.
+preStop:
+  sleepSeconds: 10
 
 # Optional init container image (BusyBox) used to stamp the per-pod
 # cluster_announce_id from the StatefulSet ordinal. Has a shell; never reaches the
