@@ -1,0 +1,830 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IronCache Helm chart values",
+  "description": "Schema for deploy/helm/ironcache/values.yaml. Validated by Helm on every template/install; must accept the shipped defaults unchanged. Type/enum/port checks are enforced; cross-field arithmetic and semantic rules (odd replicas, quorum-safe PDB, non-noeviction policy) are documentation-only.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "image": {
+      "type": "object",
+      "description": "Cache server container image.",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Image repository. Default ghcr.io/elares/ironcache."
+        },
+        "tag": {
+          "type": "string",
+          "description": "Image tag. Empty string defaults to the chart appVersion (recommended). Avoid 'latest' in prod. Registry tag has no leading 'v'."
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ],
+          "description": "Image pull policy."
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "description": "Free-form list of localObjectReference {name: ...} for pulling from a private registry.",
+      "items": {}
+    },
+    "replicas": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of IronCache nodes. For a Raft cluster prefer ODD (3, 5, 7) so majority quorum is unambiguous (odd is not schema-enforceable). 1 = standalone."
+    },
+    "cluster": {
+      "type": "object",
+      "description": "Raft-governed clustering.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Turn on Raft clustering. When false the chart deploys independent standalone nodes (only sensible with replicas=1)."
+        },
+        "minReplicasToWrite": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "min_replicas_to_write write-side durability guardrail. 0 = disabled. Keep 0 with this chart: the static topology has no replicas, so >=1 fails writes with -NOREPLICAS."
+        },
+        "raftSnapshotThreshold": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Raft-log compaction threshold (entries above the last snapshot)."
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "description": "Durable snapshot + Raft log under data_dir.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the PVC for durable persistence and the durable Raft log. When false the pod uses an emptyDir (data lost on reschedule) -- strongly discouraged for cluster.enabled=true, since the Raft log must survive a restart."
+        },
+        "mountPath": {
+          "type": "string",
+          "description": "PVC mount path; equals data_dir."
+        },
+        "size": {
+          "type": "string",
+          "description": "PVC size as a Kubernetes quantity, e.g. 10Gi."
+        },
+        "storageClassName": {
+          "type": "string",
+          "description": "StorageClass name. Empty string leaves the cluster default; set an SSD class in prod."
+        },
+        "accessModes": {
+          "type": "array",
+          "description": "PVC access modes.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "ReadWriteOnce",
+              "ReadOnlyMany",
+              "ReadWriteMany",
+              "ReadWriteOncePod"
+            ]
+          }
+        },
+        "saveIntervalSecs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Periodic background save interval. 0 DISABLES the save policy AND the SIGTERM save-on-exit (a graceful stop then exits without writing). Keep > 0 for durability across rolling restarts."
+        },
+        "saveMinChanges": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Minimum keyspace writes since the last save before a periodic save fires."
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "description": "Client AUTH (requirepass). Strongly recommended in production.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable client AUTH. When true you must supply auth.password OR auth.existingSecret."
+        },
+        "password": {
+          "type": "string",
+          "description": "Inline password (chart creates the Secret). Prefer existingSecret in prod so the secret is not in Helm release history."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Reference an existing Secret instead of creating one. The key must be 'requirepass'."
+        }
+      }
+    },
+    "clusterSecret": {
+      "type": "object",
+      "description": "Shared intra-cluster secret (cluster_secret) presented in the peer handshake on the bus + replication links.",
+      "properties": {
+        "value": {
+          "type": "string",
+          "description": "The cluster secret. Empty auto-generates on first install and is preserved across helm upgrade via a Secret lookup. Under GitOps / helm template / --dry-run the lookup is blind and would regenerate every sync, so set an explicit value (or existingSecret) for GitOps/reproducible installs. Do NOT force this when cluster.enabled -- forcing it breaks the normal install path."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Reference an existing Secret holding the cluster secret."
+        }
+      }
+    },
+    "clusterTls": {
+      "type": "object",
+      "description": "Encrypt node-to-node bus + replication links (cluster_tls=on).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable cluster TLS. When true you must supply (cert AND key) OR existingSecret; ca is NOT required (#660)."
+        },
+        "cert": {
+          "type": "string",
+          "description": "PEM cert."
+        },
+        "key": {
+          "type": "string",
+          "description": "PEM private key."
+        },
+        "ca": {
+          "type": "string",
+          "description": "Peer-verification CA PEM. Empty = the self-signed cluster cert is used as its own CA (the chart writes cluster.ca = cert), so ca is never mandatory (#660)."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Reference an existing Secret with keys cluster.crt / cluster.key / cluster.ca."
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "description": "Put the public client RESP listener on TLS (tls=on). Separate from clusterTls.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable client TLS. When true you must supply (cert AND key) OR existingSecret."
+        },
+        "cert": {
+          "type": "string",
+          "description": "PEM cert."
+        },
+        "key": {
+          "type": "string",
+          "description": "PEM private key."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Reference an existing Secret with the client TLS material."
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "description": "Client Service ports.",
+      "properties": {
+        "clientPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 45535,
+          "description": "Client RESP port. The cluster-bus (port+10000) and replication (port+20000) ports derive from this and must fit u16, so the max is 45535."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer",
+            "ExternalName"
+          ],
+          "description": "Client Service type. ClusterIP is correct for in-cluster clients; a single LB is not cluster-aware with Raft MOVED routing."
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "HTTP endpoint serving /metrics + /livez + /readyz (the --metrics-addr port).",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Metrics/probe HTTP port."
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "description": "Prometheus Operator ServiceMonitor (requires the CRD).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Create a ServiceMonitor."
+            },
+            "interval": {
+              "type": "string",
+              "description": "Scrape interval as a Prometheus duration, e.g. 30s."
+            }
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "description": "NetworkPolicy for the cache StatefulSet (distinct from console.networkPolicy). Needs a NetworkPolicy-aware CNI; inert (fails open) on flannel / k3s default.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the cache NetworkPolicy."
+        },
+        "allowDNS": {
+          "type": "boolean",
+          "description": "Allow DNS egress. REQUIRED for peer discovery in cluster mode; disabling it with egress enforced silently prevents cluster formation."
+        },
+        "clientIngressFrom": {
+          "type": "array",
+          "description": "Free-form NetworkPolicyPeer allowlist for the client RESP port (empty = open to all).",
+          "items": {}
+        },
+        "metricsIngressFrom": {
+          "type": "array",
+          "description": "Free-form NetworkPolicyPeer allowlist for the metrics/probe port. Leave empty unless you have verified the CNI still admits kubelet probes.",
+          "items": {}
+        },
+        "extraEgress": {
+          "type": "array",
+          "description": "Free-form extra egress rules appended verbatim.",
+          "items": {}
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "description": "Cache container resource requests/limits. Free-form quantity maps (arbitrary resource keys allowed).",
+      "properties": {
+        "requests": {
+          "type": "object",
+          "description": "Resource requests. RAISE the memory request toward the memory limit so the node reserves the true footprint and the cache is not a first-to-evict candidate."
+        },
+        "limits": {
+          "type": "object",
+          "description": "Resource limits. A MEMORY limit is strongly recommended (maxmemory auto-derives ~70% from it for OOM safety); NOT required -- without it the cache runs unbounded (a loud boot log says so). No cpu limit by default (avoids CFS throttling)."
+        }
+      }
+    },
+    "extraConfig": {
+      "type": "string",
+      "description": "Extra IronCache TOML appended verbatim (maxmemory / maxmemory_policy / timeout etc). REAL TOML keys, underscore spelling; the parse is STRICT (a hyphen spelling like maxmemory-policy fails boot). Leave maxmemory unset for OOM-safe auto-derivation. Content is opaque to this schema (not enforceable here); a noeviction policy defeats the OOM guard (runtime warns)."
+    },
+    "logLevel": {
+      "type": "string",
+      "pattern": "^(?i)(error|warn|warning|info|debug|verbose|trace)$",
+      "description": "Log level passed as --log-level. The valid values are error, warn (=warning), info, debug (=verbose), trace; the binary lowercases the input, so any case is accepted. A case-insensitive pattern (not a lowercase enum) so a valid mixed-case value like 'WARN' is not wrongly rejected, while a typo still fails."
+    },
+    "podAntiAffinity": {
+      "type": "object",
+      "description": "Spread pods across nodes so a single node failure cannot take down a quorum.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "soft",
+            "hard"
+          ],
+          "description": "soft = preferred (best-effort spread); hard = required (one pod per node, needs >= replicas nodes)."
+        },
+        "topologyKey": {
+          "type": "string",
+          "description": "Node topology key for the anti-affinity spread."
+        }
+      }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "description": "Free-form node selector (string->string map). Kept permissive."
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Free-form toleration list. Kept permissive.",
+      "items": {}
+    },
+    "pdb": {
+      "type": "object",
+      "description": "PodDisruptionBudget for the cache StatefulSet.",
+      "properties": {
+        "maxUnavailable": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "description": "Max pods a voluntary disruption may take at once (integer or a percentage string like '25%'). Never set so high that a drain can break majority quorum vs replicas."
+        }
+      }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "description": "Pod-level security context (built for the PSS restricted profile).",
+      "properties": {
+        "runAsNonRoot": {
+          "type": "boolean",
+          "description": "Require the container to run as a non-root user."
+        },
+        "runAsUser": {
+          "type": "integer",
+          "description": "UID to run as (image runs as 65532)."
+        },
+        "runAsGroup": {
+          "type": "integer",
+          "description": "GID to run as."
+        },
+        "fsGroup": {
+          "type": "integer",
+          "description": "Supplemental group owning the PVC so the nonroot user can write it."
+        },
+        "fsGroupChangePolicy": {
+          "type": "string",
+          "enum": [
+            "OnRootMismatch",
+            "Always"
+          ],
+          "description": "When to chown the volume for fsGroup. OnRootMismatch avoids a slow recursive chown on every mount of a large data_dir."
+        },
+        "seccompProfile": {
+          "type": "object",
+          "description": "Seccomp profile.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "RuntimeDefault",
+                "Localhost",
+                "Unconfined"
+              ],
+              "description": "Seccomp profile type."
+            }
+          }
+        }
+      }
+    },
+    "containerSecurityContext": {
+      "type": "object",
+      "description": "Container-level security context (built for the PSS restricted profile).",
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "type": "boolean",
+          "description": "Whether the process can gain more privileges than its parent."
+        },
+        "readOnlyRootFilesystem": {
+          "type": "boolean",
+          "description": "Mount the container root filesystem read-only."
+        },
+        "capabilities": {
+          "type": "object",
+          "description": "Linux capabilities.",
+          "properties": {
+            "drop": {
+              "type": "array",
+              "description": "Capabilities to drop (default ['ALL']).",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Graceful termination window. Must exceed preStop.sleepSeconds + connection drain + save-on-exit or the kubelet SIGKILLs mid-save and truncates the snapshot (arithmetic relation not schema-enforceable). Raise to 120-180 for datasets over ~5GB or slow storage."
+    },
+    "startupProbe": {
+      "type": "object",
+      "description": "Startup probe: suspends liveness/readiness until load-on-boot (and, in Raft mode, leader election) completes.",
+      "properties": {
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Probe period."
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Probe timeout."
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Failure threshold. Startup budget = failureThreshold * periodSeconds; size to the worst-case reload/election time."
+        }
+      }
+    },
+    "preStop": {
+      "type": "object",
+      "description": "preStop lame-duck sleep so the Service endpoint deprograms before drain. Uses the native SleepAction (auto-gated on cluster >= 1.29; omitted on older clusters).",
+      "properties": {
+        "sleepSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lame-duck sleep seconds. 0 disables. Keep comfortably under terminationGracePeriodSeconds."
+        }
+      }
+    },
+    "updateStrategy": {
+      "type": "object",
+      "description": "StatefulSet RollingUpdate controls.",
+      "properties": {
+        "partition": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Canary lever: freeze ordinals < partition, verify, then patch to 0 to roll the rest. 0 = roll everything."
+        }
+      }
+    },
+    "minReadySeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How long a pod must stay ready before the rollout advances to the next ordinal (the rollout soak lever; a flapping pod cannot march the rollout through the cluster)."
+    },
+    "revisionHistoryLimit": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Retained ControllerRevision history (etcd hygiene)."
+    },
+    "topologySpread": {
+      "type": "object",
+      "description": "Optional topologySpreadConstraints so quorum survives a ZONE outage. Enable on multi-AZ; leave off on single-zone / k3s edge.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable zone spread."
+        },
+        "maxSkew": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum permitted skew across topology domains."
+        },
+        "topologyKey": {
+          "type": "string",
+          "description": "Topology key to spread across (default the zone label)."
+        },
+        "whenUnsatisfiable": {
+          "type": "string",
+          "enum": [
+            "DoNotSchedule",
+            "ScheduleAnyway"
+          ],
+          "description": "Behavior when the constraint cannot be satisfied. ScheduleAnyway keeps a constrained cluster schedulable (best-effort)."
+        }
+      }
+    },
+    "initImage": {
+      "type": "object",
+      "description": "Init container image (BusyBox) that stamps the per-pod cluster_announce_id from the StatefulSet ordinal.",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Init image repository."
+        },
+        "tag": {
+          "type": "string",
+          "description": "Init image tag."
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ],
+          "description": "Init image pull policy."
+        }
+      }
+    },
+    "console": {
+      "type": "object",
+      "description": "The IronCache monitoring/management console: a separate, stateless Deployment. Disabled by default.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the console Deployment."
+        },
+        "replicas": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Stateless console replicas. 2+ gives HA (and a PDB)."
+        },
+        "image": {
+          "type": "object",
+          "description": "Console container image.",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "Console image repository."
+            },
+            "tag": {
+              "type": "string",
+              "description": "Console image tag. Empty defaults to the chart appVersion (published in lockstep with the cache)."
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "description": "Console image pull policy."
+            }
+          }
+        },
+        "httpPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Single HTTP port serving /livez + /readyz + /metrics + the UI + /api/*."
+        },
+        "service": {
+          "type": "object",
+          "description": "Console Service.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "ClusterIP",
+                "NodePort",
+                "LoadBalancer",
+                "ExternalName"
+              ],
+              "description": "Console Service type."
+            }
+          }
+        },
+        "seeds": {
+          "type": "array",
+          "description": "Free-form list of host:port seed strings the console polls (point at the cache client Service DNS). When console.enabled, set this or /readyz never goes ready (optional in the template, so not required).",
+          "items": {}
+        },
+        "prometheusUrl": {
+          "type": "string",
+          "description": "Shared Prometheus URL for the HA-consistent history backend. Empty falls back to per-replica embedded history (each replica shows a different trend window)."
+        },
+        "nodeUser": {
+          "type": "string",
+          "description": "Least-privilege ACL user the console dials nodes as."
+        },
+        "nodePasswordSecret": {
+          "type": "object",
+          "description": "Node-dial password source (mounted as a file; never inline).",
+          "properties": {
+            "existingSecret": {
+              "type": "string",
+              "description": "Existing Secret name holding the node password."
+            },
+            "key": {
+              "type": "string",
+              "description": "Key within the Secret."
+            }
+          }
+        },
+        "tokensSecret": {
+          "type": "object",
+          "description": "API RBAC tokens (read + admin). Configuring a token flips the console into enforce mode.",
+          "properties": {
+            "existingSecret": {
+              "type": "string",
+              "description": "Existing Secret name holding the tokens."
+            },
+            "readTokenKey": {
+              "type": "string",
+              "description": "Key for the read token."
+            },
+            "adminTokenKey": {
+              "type": "string",
+              "description": "Key for the admin token."
+            }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Console container resource requests/limits. Free-form quantity maps.",
+          "properties": {
+            "requests": {
+              "type": "object",
+              "description": "Console resource requests."
+            },
+            "limits": {
+              "type": "object",
+              "description": "Console resource limits."
+            }
+          }
+        },
+        "pdb": {
+          "type": "object",
+          "description": "Console PodDisruptionBudget (rendered for 2+ replicas).",
+          "properties": {
+            "maxUnavailable": {
+              "type": [
+                "integer",
+                "string"
+              ],
+              "description": "Max console pods unavailable during a voluntary disruption (integer or percentage string)."
+            }
+          }
+        },
+        "networkPolicy": {
+          "type": "object",
+          "description": "Console NetworkPolicy (SSRF-containment, #369). Defaults ON (unlike the top-level networkPolicy). Needs a NetworkPolicy-aware CNI (inert / fails-open otherwise).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the console NetworkPolicy (default true)."
+            },
+            "allowDNS": {
+              "type": "boolean",
+              "description": "Allow DNS egress. Keep on: the console resolves the cache Service DNS and the history-backend host by name."
+            },
+            "ingressFrom": {
+              "type": "array",
+              "description": "Free-form NetworkPolicyPeer allowlist for the console HTTP port (empty = open on that port).",
+              "items": {}
+            },
+            "prometheusEgress": {
+              "type": "array",
+              "description": "Free-form egress peer(s) matching console.prometheusUrl. Left empty, history queries are blocked (fail closed).",
+              "items": {}
+            },
+            "extraEgress": {
+              "type": "array",
+              "description": "Free-form extra egress rules appended verbatim.",
+              "items": {}
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "auth": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "auth"
+        ]
+      },
+      "then": {
+        "properties": {
+          "auth": {
+            "anyOf": [
+              {
+                "properties": {
+                  "password": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "password"
+                ]
+              },
+              {
+                "properties": {
+                  "existingSecret": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "existingSecret"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "clusterTls": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "clusterTls"
+        ]
+      },
+      "then": {
+        "properties": {
+          "clusterTls": {
+            "anyOf": [
+              {
+                "required": [
+                  "cert",
+                  "key"
+                ],
+                "properties": {
+                  "cert": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "key": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
+                "required": [
+                  "existingSecret"
+                ],
+                "properties": {
+                  "existingSecret": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "tls": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "tls"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tls": {
+            "anyOf": [
+              {
+                "required": [
+                  "cert",
+                  "key"
+                ],
+                "properties": {
+                  "cert": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "key": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
+                "required": [
+                  "existingSecret"
+                ],
+                "properties": {
+                  "existingSecret": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

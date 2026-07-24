@@ -109,6 +109,30 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: values.schema.json rejects invalid values (negative tests)
+        run: |
+          set -euo pipefail
+          # Helm auto-validates values against values.schema.json on `helm template`, so the
+          # positive value-sets above already exercise the schema. These NEGATIVE tests guard
+          # the schema's REJECTION power: if a future edit drops a rule, `helm template` would
+          # start ACCEPTING the bad value and this step fails. Each case MUST make helm exit non-zero.
+          bad_case() {
+            local desc="$1"; shift
+            echo "::group::reject: $desc"
+            if helm template ic deploy/helm/ironcache "$@" >/dev/null 2>/tmp/schema-err; then
+              echo "ERROR: schema did NOT reject an invalid value ($desc) -- helm template succeeded"; exit 1
+            fi
+            grep -qiE 'schema|Additional property|Invalid type|Must be|length must be' /tmp/schema-err \
+              || { echo "ERROR: '$desc' failed for a NON-schema reason:"; cat /tmp/schema-err; exit 1; }
+            echo "OK (rejected): $desc"
+            echo "::endgroup::"
+          }
+          bad_case "top-level typo key"            --set replias=3
+          bad_case "replicas below minimum"        --set replicas=0
+          bad_case "auth.enabled without a secret" --set auth.enabled=true
+          bad_case "bad service.type enum"         --set service.type=Bogus
+          bad_case "clusterTls.enabled no cert"    --set cluster.enabled=true --set clusterTls.enabled=true
+
   k8s:
     name: kubeconform (raw manifests)
     runs-on: ubuntu-latest
