@@ -234,6 +234,43 @@
             "interval": {
               "type": "string",
               "description": "Scrape interval as a Prometheus duration, e.g. 30s."
+            },
+            "additionalLabels": {
+              "type": "object",
+              "description": "Extra labels, e.g. to satisfy the Operator's serviceMonitorSelector (kube-prometheus-stack often selects on release=<name>)."
+            },
+            "scrapeTimeout": {
+              "type": "string",
+              "description": "Per-scrape timeout as a Prometheus duration (must be <= interval). Empty = Prometheus default."
+            },
+            "sampleLimit": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max samples accepted per scrape; 0 = unlimited. Guards against a cardinality regression."
+            },
+            "relabelings": {
+              "type": "array",
+              "description": "relabel_configs applied to the target, passed through verbatim.",
+              "items": {}
+            },
+            "metricRelabelings": {
+              "type": "array",
+              "description": "metric_relabel_configs applied to each scraped sample, passed through verbatim.",
+              "items": {}
+            }
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "description": "Ship the alerting rules as a Prometheus Operator PrometheusRule (requires the CRD).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render the PrometheusRule (off by default)."
+            },
+            "additionalLabels": {
+              "type": "object",
+              "description": "Extra labels so the Operator's ruleSelector adopts the rules (commonly release=<kube-prometheus-stack release>)."
             }
           }
         },

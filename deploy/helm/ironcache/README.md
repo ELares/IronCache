@@ -59,14 +59,14 @@ See `values.yaml` for the full commented surface. The ones that matter first:
 | Value | Default | Notes |
 | --- | --- | --- |
 | `replicas` | `3` | Keep ODD (3, 5, 7) for an unambiguous Raft majority. `1` = standalone. |
-| `image.tag` | `"latest"` | Pin an immutable tag in production, e.g. `"0.1.0"`. The registry tag has NO leading `v` (the image CI strips it); `"v0.1.0"` does not exist and fails the pull. |
+| `image.tag` | `""` | Empty = the chart `appVersion` (an immutable pinned release) -- the recommended default. Set only to override. The registry tag has NO leading `v` (the image CI strips it); `"v0.1.0"` does not exist and fails the pull. |
 | `cluster.enabled` | `true` | `false` deploys `replicas` INDEPENDENT standalone nodes (only sensible with `replicas=1`). |
 | `persistence.enabled` | `true` | `data_dir` on a PVC (`persistence.size`, `persistence.storageClassName`); the Raft log must survive a pod restart. `false` = emptyDir, data lost on reschedule. |
 | `persistence.saveIntervalSecs` / `saveMinChanges` | `900` / `1` | The background-save cadence that bounds the RPO. |
 | `auth.enabled` | `false` | Client AUTH (`requirepass`) via a chart Secret (`auth.password`) or `auth.existingSecret` (key `requirepass`). STRONGLY recommended. |
-| `clusterSecret.value` / `existingSecret` | `""` | The shared bus/replication handshake secret. Auto-generated per install when both are empty; NOTES.txt warns that a bare `helm upgrade` then ROTATES it. |
+| `clusterSecret.value` / `existingSecret` | `""` | The shared bus/replication handshake secret. Auto-generated on first install and PRESERVED across `helm upgrade` (#747). Under GitOps / `helm template` / `--dry-run` the lookup is blind and it WOULD regenerate, so set an explicit value there. |
 | `clusterTls.enabled` | `false` | Encrypts the node-to-node bus + replication links. Without it the cluster secret travels in cleartext on the pod network. |
-| `clusterTls.ca` | `""` | REQUIRED with a chart-managed Secret: the StatefulSet always mounts the `cluster.ca` key and sets `IRONCACHE_CLUSTER_CA_PATH`, but `templates/secret.yaml` only writes that key when `clusterTls.ca` is set, so leaving it empty fails the pod at volume mount. For a self-signed cluster cert, set `ca` to the cert PEM itself. Tracked as #660. |
+| `clusterTls.ca` | `""` | Optional since #660: when empty the chart writes `cluster.ca` = the cert, so a self-signed cluster cert acts as its own CA. Set it only for a distinct external-PKI trust chain. |
 | `tls.enabled` | `false` | TLS on the PUBLIC client RESP listener (separate from `clusterTls`). |
 | `metrics.port` | `9121` | The chart passes `--metrics-addr 0.0.0.0:<port>`; probes and Prometheus scrape here. `metrics.serviceMonitor.enabled` renders a ServiceMonitor (needs the Prometheus Operator CRD). |
 | `console.enabled` | `false` | The stateless monitoring/management console; see `deploy/CONSOLE_DEPLOY.md` for the HA + security walkthrough. |
@@ -77,8 +77,11 @@ Every node serves `/metrics` + `/livez` + `/readyz` on `metrics.port`; the
 starter Grafana dashboard ships in the chart at
 `dashboards/ironcache-dashboard.json` (set `metrics.grafanaDashboard.enabled=true`
 to auto-provision it as a sidecar-discoverable ConfigMap, or import it manually),
-and the Prometheus alert rules in `deploy/prometheus/ironcache-alerts.yml` (see
+and the Prometheus alert rules in `alerts/ironcache-alerts.yml` (set
+`metrics.prometheusRule.enabled=true` to ship them as a PrometheusRule; see
 `docs/METRICS.md`).
 
-The chart is CI-gated by `helm lint` + `helm template | kubeconform` for the
-default and console-enabled value sets (`.github/workflows/deploy-lint.yml`).
+The chart is CI-gated by `helm lint` + `helm template | kubeconform` across a matrix of
+value sets plus `values.schema.json` negative tests (`.github/workflows/deploy-lint.yml`),
+and by a live `helm install` + `helm upgrade` + `helm test` on a kind cluster
+(`.github/workflows/chart-e2e.yml`).

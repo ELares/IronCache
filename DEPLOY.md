@@ -563,7 +563,8 @@ Full catalog of every `ironcache_*` series and the key `INFO` fields is in
 chart at
 [`deploy/helm/ironcache/dashboards/`](deploy/helm/ironcache/dashboards/) (set
 `metrics.grafanaDashboard.enabled=true` to auto-provision it) and the Prometheus
-alert rules in [`deploy/prometheus/`](deploy/prometheus/).
+alert rules in [`deploy/helm/ironcache/alerts/`](deploy/helm/ironcache/alerts/) (set
+`metrics.prometheusRule.enabled=true` to ship them as a PrometheusRule).
 
 When something is wrong at 3am, [`docs/RUNBOOK.md`](docs/RUNBOOK.md) is the
 symptom-to-action index: every operator-visible error string, log line, and probe

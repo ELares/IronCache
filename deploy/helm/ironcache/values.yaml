@@ -141,6 +141,27 @@ metrics:
   serviceMonitor:
     enabled: false
     interval: 30s
+    # Extra labels, in case the Operator's serviceMonitorSelector requires one
+    # (kube-prometheus-stack commonly selects on `release: <its release name>`).
+    additionalLabels: {}
+    # Per-scrape timeout (must be <= interval). Empty = the Prometheus default.
+    scrapeTimeout: ""
+    # Cap the samples ingested per scrape; 0/unset = unlimited. A blast-radius guard
+    # against a cardinality regression on a large cluster.
+    sampleLimit: 0
+    # relabel_configs (applied to the TARGET) and metric_relabel_configs (applied to each
+    # SAMPLE) -- passed through verbatim. metricRelabelings is the lever for dropping
+    # high-cardinality series before they reach storage, e.g. undersampling per-shard series.
+    relabelings: []
+    metricRelabelings: []
+  # Ship the IronCache alerting rules as a Prometheus Operator PrometheusRule (requires the
+  # CRD). The rule bodies come from alerts/ironcache-alerts.yml in the chart -- the same file
+  # a plain Prometheus can load via `rule_files:` -- so there is one source of truth.
+  prometheusRule:
+    enabled: false
+    # The Operator only adopts rules its `ruleSelector` matches; if your alerts never appear,
+    # set the selector label here, e.g. additionalLabels: {release: kube-prometheus-stack}.
+    additionalLabels: {}
   # Auto-provision the IronCache Grafana dashboard as a sidecar-discoverable ConfigMap.
   # The Grafana dashboard sidecar (kube-prometheus-stack / the grafana chart) loads any
   # ConfigMap carrying `label: labelValue` into Grafana. Requires that sidecar enabled +

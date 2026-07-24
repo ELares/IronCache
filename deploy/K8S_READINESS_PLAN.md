@@ -61,14 +61,11 @@ not stale text). The chart is production-safe for **fixed-size** clusters.
   beta/default-on only from **1.30**, not 1.29), but `ct` and an **upgrade**-path test are still
   missing. The chart is now 0.3.0.
 - **Genuinely remaining** (each also flagged in the Section 2 table):
-  1. **P2-3 finish** -- an upgrade-path e2e (install -> `helm upgrade` -> re-test), the case that
-     catches charts which lint clean but fail to *upgrade*. Highest value of the leftovers.
-  2. **Alert rules are not templated** -- the dashboard is auto-provisioned but
-     `deploy/prometheus/ironcache-alerts.yml` has no `PrometheusRule` template (an asymmetry
-     introduced by #758).
-  3. **P2-6** ServiceMonitor `relabelings`/`sampleLimit` passthrough; **P2-7** console-UI Ingress
-     template; **P2-8** doc-only clarifications (incl. pinning the busybox init image by digest).
-  4. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
+  1. **P2-3 finish** -- the upgrade-path e2e (install -> `helm upgrade` -> re-test), the case that
+     catches charts which lint clean but fail to *upgrade*. In flight (#763).
+  2. **P2-7** a console-UI Ingress template, and **P2-8** the doc-only clarifications (incl.
+     pinning the busybox init image by digest).
+  3. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
      #392 upgrade driver cover fixed-size clusters.
 
 ---
@@ -113,7 +110,7 @@ not stale text). The chart is production-safe for **fixed-size** clusters.
 | No HPA / VPA-caution documented | **DONE** | `deploy/SCALING.md` forbids HPA outright and restricts VPA to Off/Initial (#749). |
 | Backup / restore / DR (snapshot, VolumeSnapshot, PITR) | **DONE (docs-first, by decision)** | `deploy/BACKUP.md`: the artifact (whole `data_dir`), RPO/RTO, CSI VolumeSnapshot/Velero, the app-level sidecar copy for local-path, per-key DUMP, and a restore runbook (#752). No always-on CronJob is shipped on purpose (RWO + shell-free image + no native object-store = env-specific). |
 | ServiceMonitor (CRD-gated) | **DONE** | Rendered only when enabled; correct for CRD-less k3s. |
-| Prometheus alerts + Grafana dashboard | **PARTIAL** | Dashboard is now auto-provisioned as a sidecar-discoverable ConfigMap (#758); the **alert rules are still a bare file** (`deploy/prometheus/ironcache-alerts.yml`) with no `PrometheusRule` template -- the remaining asymmetry. |
+| Prometheus alerts + Grafana dashboard | **DONE** | Dashboard auto-provisioned as a sidecar-discoverable ConfigMap (#758); alert rules shipped as a `PrometheusRule` from the same in-chart file a plain Prometheus can load (`metrics.prometheusRule.enabled`). |
 | Cache-pods NetworkPolicy | **DONE** | Opt-in policy locking cluster-bus/repl to peers; client + metrics ports stay open by design (the metrics port serves the kubelet probes) (#748). Inert on flannel/k3s-default. |
 | `values.schema.json` | **DONE** | draft-07: types, enums, port bounds, conditional-requires, and top-level `additionalProperties:false`; doc-only for the non-encodable rules. Negative tests in CI (#756). |
 | `helm test` + `ct` (kind/k3d install) | **PARTIAL** | `helm test` PING hook + a kind **install** e2e (#759) -- which caught a real shipped preStop bug on its first run. Still missing: `ct` and, more importantly, an **upgrade** path test (the plan's P2-3 asks for install AND upgrade). |
