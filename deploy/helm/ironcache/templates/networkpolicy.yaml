@@ -46,7 +46,10 @@ spec:
       from:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+    {{- if .Values.cluster.enabled }}
     # Cluster-bus (RAFTMSG) + replication: PEERS ONLY -- pods of THIS StatefulSet. The core control.
+    # Only rendered in cluster mode; a standalone node (cluster.enabled=false) exposes no bus/repl
+    # ports, so the rule would reference ports nothing listens on.
     - from:
         - podSelector:
             matchLabels:
@@ -56,6 +59,7 @@ spec:
           port: {{ $busPort }}
         - protocol: TCP
           port: {{ $replPort }}
+    {{- end }}
   egress:
     {{- if .Values.networkPolicy.allowDNS }}
     # DNS: resolve the headless-Service peer records.
@@ -65,8 +69,9 @@ spec:
         - protocol: TCP
           port: 53
     {{- end }}
+    {{- if .Values.cluster.enabled }}
     # Peer bus + replication dials (the raft mesh + the replica -> primary stream) to THIS
-    # StatefulSet's pods only.
+    # StatefulSet's pods only. Cluster mode only (see the matching ingress rule above).
     - to:
         - podSelector:
             matchLabels:
@@ -76,6 +81,7 @@ spec:
           port: {{ $busPort }}
         - protocol: TCP
           port: {{ $replPort }}
+    {{- end }}
     {{- with .Values.networkPolicy.extraEgress }}
     # Any extra allowed egress peers (verbatim), e.g. an off-cluster backup target.
     {{- toYaml . | nindent 4 }}

@@ -143,7 +143,9 @@ metrics:
 # INERT (fails open) on flannel / the k3s default. Off by default.
 networkPolicy:
   enabled: false
-  # Allow DNS egress (needed to resolve the headless-Service peer records).
+  # Allow DNS egress. REQUIRED for peer discovery in cluster mode -- peers resolve by
+  # headless-Service DNS, so disabling this with egress enforced makes the cluster
+  # silently never form. Do not disable unless replicas=1 / cluster.enabled=false.
   allowDNS: true
   # Optional `from` allowlist for the client RESP port (empty = open to all).
   # e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: apps}}}]

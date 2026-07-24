@@ -67,7 +67,11 @@ jobs:
           # IRONCACHE_CLUSTER_CA_PATH at it, so the Secret must emit cluster.ca (defaulted to the
           # cert). #660 shipped that; this variant guards the regression.
           cluster_tls_set="--set cluster.enabled=true --set clusterTls.enabled=true --set clusterTls.cert=DUMMYCERT --set clusterTls.key=DUMMYKEY"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "--set networkPolicy.enabled=true --set cluster.enabled=true --set replicas=3"; do
+          # The networkPolicy variant PINS service.clientPort=6379 so the guard's literal bus
+          # port (16379 = clientPort+10000) is deliberate and cannot go stale if the values.yaml
+          # DEFAULT clientPort ever changes.
+          np_set="--set networkPolicy.enabled=true --set cluster.enabled=true --set replicas=3 --set service.clientPort=6379"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
