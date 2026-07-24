@@ -11,9 +11,11 @@ nothing here is aspirational.
 
 Companion artifacts:
 
-- `deploy/grafana/ironcache-dashboard.json` -- a starter Grafana dashboard built
-  on these series (p99/p99.9, ops/sec, hit ratio, evictions, connections, memory,
-  per-shard hot-shard detection, replication, persistence).
+- `deploy/helm/ironcache/dashboards/ironcache-dashboard.json` -- a starter Grafana
+  dashboard built on these series (p99/p99.9, ops/sec, hit ratio, evictions,
+  connections, memory, per-shard hot-shard detection, replication, persistence).
+  Set `metrics.grafanaDashboard.enabled=true` to auto-provision it as a
+  sidecar-discoverable ConfigMap.
 - `deploy/prometheus/ironcache-alerts.yml` -- starter Prometheus alerting rules.
 
 ## The ops endpoint

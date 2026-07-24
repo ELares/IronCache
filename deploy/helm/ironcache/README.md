@@ -61,9 +61,11 @@ See `values.yaml` for the full commented surface. The ones that matter first:
 ## Observability
 
 Every node serves `/metrics` + `/livez` + `/readyz` on `metrics.port`; the
-starter Grafana dashboard and Prometheus alert rules ship in
-`deploy/grafana/ironcache-dashboard.json` and
-`deploy/prometheus/ironcache-alerts.yml` (see `docs/METRICS.md`).
+starter Grafana dashboard ships in the chart at
+`dashboards/ironcache-dashboard.json` (set `metrics.grafanaDashboard.enabled=true`
+to auto-provision it as a sidecar-discoverable ConfigMap, or import it manually),
+and the Prometheus alert rules in `deploy/prometheus/ironcache-alerts.yml` (see
+`docs/METRICS.md`).
 
 The chart is CI-gated by `helm lint` + `helm template | kubeconform` for the
 default and console-enabled value sets (`.github/workflows/deploy-lint.yml`).

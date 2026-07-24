@@ -1,0 +1,25 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if .Values.metrics.grafanaDashboard.enabled }}
+# The IronCache Grafana dashboard as a sidecar-discoverable ConfigMap. The Grafana
+# dashboard sidecar (kube-prometheus-stack / the grafana chart) watches for ConfigMaps
+# carrying the label below and loads them into Grafana automatically -- no manual import.
+# Requires that sidecar to be enabled AND watching this namespace (or all namespaces).
+# Off by default. The dashboard JSON lives at dashboards/ironcache-dashboard.json in the
+# chart (also usable for a manual import).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ironcache.fullname" . }}-grafana-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+    {{ .Values.metrics.grafanaDashboard.label }}: {{ .Values.metrics.grafanaDashboard.labelValue | quote }}
+  {{- with .Values.metrics.grafanaDashboard.folder }}
+  annotations:
+    # Place the dashboard in a named Grafana folder (sidecar `grafana_folder` annotation).
+    grafana_folder: {{ . | quote }}
+  {{- end }}
+data:
+  ironcache-dashboard.json: |-
+{{ .Files.Get "dashboards/ironcache-dashboard.json" | indent 4 }}
+{{- end }}

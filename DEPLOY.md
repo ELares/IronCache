@@ -559,9 +559,11 @@ The endpoint is ON by default at `127.0.0.1:9091` (override with `--metrics-addr
   raft gauges). Scrape it directly, or enable the chart's `metrics.serviceMonitor`.
 
 Full catalog of every `ironcache_*` series and the key `INFO` fields is in
-[`docs/METRICS.md`](docs/METRICS.md); a starter Grafana dashboard and Prometheus
-alert rules ship in [`deploy/grafana/`](deploy/grafana/) and
-[`deploy/prometheus/`](deploy/prometheus/).
+[`docs/METRICS.md`](docs/METRICS.md); a starter Grafana dashboard ships in the
+chart at
+[`deploy/helm/ironcache/dashboards/`](deploy/helm/ironcache/dashboards/) (set
+`metrics.grafanaDashboard.enabled=true` to auto-provision it) and the Prometheus
+alert rules in [`deploy/prometheus/`](deploy/prometheus/).
 
 When something is wrong at 3am, [`docs/RUNBOOK.md`](docs/RUNBOOK.md) is the
 symptom-to-action index: every operator-visible error string, log line, and probe
