@@ -132,6 +132,29 @@ metrics:
     enabled: false
     interval: 30s
 
+# --- NetworkPolicy (cache pods) -----------------------------------------------
+# A NetworkPolicy for the CACHE StatefulSet (distinct from console.networkPolicy).
+# Its core value: the inter-node cluster-bus (clientPort+10000, RAFTMSG) and
+# replication (clientPort+20000) ports become reachable ONLY from other pods of
+# THIS StatefulSet -- so no foreign pod can join consensus or siphon replication.
+# The client RESP port and the metrics/probe port stay OPEN by default (clients
+# are diverse; the metrics port also serves the kubelet probes -- restricting it
+# would block them and kill the pod). Needs a NetworkPolicy-aware CNI to enforce;
+# INERT (fails open) on flannel / the k3s default. Off by default.
+networkPolicy:
+  enabled: false
+  # Allow DNS egress (needed to resolve the headless-Service peer records).
+  allowDNS: true
+  # Optional `from` allowlist for the client RESP port (empty = open to all).
+  # e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: apps}}}]
+  clientIngressFrom: []
+  # Optional `from` allowlist for the metrics/probe port. LEAVE EMPTY unless you
+  # have verified your CNI still admits the kubelet probe traffic when this is set
+  # -- an over-tight rule here blocks liveness/readiness and the pod is killed.
+  metricsIngressFrom: []
+  # Extra egress peers appended verbatim (e.g. an off-cluster backup/DR target).
+  extraEgress: []
+
 # --- Resources ----------------------------------------------------------------
 resources:
   requests:

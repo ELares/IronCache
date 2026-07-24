@@ -1,0 +1,83 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $clientPort := int .Values.service.clientPort -}}
+{{- $busPort := add $clientPort 10000 -}}
+{{- $replPort := add $clientPort 20000 -}}
+{{- $metricsPort := int .Values.metrics.port -}}
+# NetworkPolicy for the cache pods (P1-3). The KEY control it adds: the inter-node CLUSTER-BUS
+# (client+10000, RAFTMSG) and REPLICATION (client+20000) ports are reachable ONLY from OTHER pods of
+# this same StatefulSet -- so a foreign-namespace pod on the pod network cannot join consensus, forge
+# RAFTMSG, or siphon the replication stream (which were wide open before). The client RESP port and
+# the metrics/probe port stay OPEN (clients are diverse; the metrics port also serves the kubelet
+# liveness/readiness/startup probes -- restricting it would BLOCK the probes and kill the pod), each
+# lockable via *IngressFrom. Egress is pinned to DNS + peer bus/repl (a cache dials out only to its
+# peers). Enforcement needs a NetworkPolicy-aware CNI (Calico/Cilium); on flannel/k3s-default it is
+# INERT (fails open), so treat it as defense-in-depth. Off by default (networkPolicy.enabled).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ironcache.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ironcache.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Client RESP: open by default (clients are diverse); lock down via clientIngressFrom.
+    - ports:
+        - protocol: TCP
+          port: {{ $clientPort }}
+      {{- with .Values.networkPolicy.clientIngressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    # Metrics + probes: MUST stay open enough for the kubelet probes (node -> pod) to reach it, so
+    # by default no `from` restriction (the endpoint is read-only observability). Lock down to
+    # scrapers via metricsIngressFrom ONLY if your CNI still admits the kubelet probe traffic.
+    - ports:
+        - protocol: TCP
+          port: {{ $metricsPort }}
+      {{- with .Values.networkPolicy.metricsIngressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    # Cluster-bus (RAFTMSG) + replication: PEERS ONLY -- pods of THIS StatefulSet. The core control.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "ironcache.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $busPort }}
+        - protocol: TCP
+          port: {{ $replPort }}
+  egress:
+    {{- if .Values.networkPolicy.allowDNS }}
+    # DNS: resolve the headless-Service peer records.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    # Peer bus + replication dials (the raft mesh + the replica -> primary stream) to THIS
+    # StatefulSet's pods only.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ironcache.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $busPort }}
+        - protocol: TCP
+          port: {{ $replPort }}
+    {{- with .Values.networkPolicy.extraEgress }}
+    # Any extra allowed egress peers (verbatim), e.g. an off-cluster backup target.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
