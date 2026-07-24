@@ -171,11 +171,13 @@ networkPolicy:
 #     no burst-above-request region to be reclaimed from; it can still be OOM-killed at its own
 #     limit, but allkeys-lru eviction at the derived maxmemory keeps it away from that) requires
 #     requests == limits for BOTH cpu AND memory on every container. Memory is easy (set request
-#     == limit). CPU is the catch: a cpu LIMIT
-#     re-introduces CFS throttling of the per-core runtime, so if you want Guaranteed QoS set
-#     an INTEGER cpu limit == request sized to the pod's actual cores (e.g. cpu: "4"), never a
-#     fractional millicore limit. If you cannot accept a cpu limit, stay Burstable and instead
-#     lean on note 1 (memory request == limit) for eviction protection.
+#     == limit). CPU is the catch: ANY cpu LIMIT imposes a CFS quota that can throttle the
+#     per-core runtime under the kubelet's DEFAULT (`none`) CPU-manager policy. To get
+#     Guaranteed QoS WITHOUT throttling you need BOTH an INTEGER cpu limit == request sized to
+#     the pod's cores (e.g. cpu: "4") AND the node kubelet running the `static` CPU-manager
+#     policy, which then pins exclusive cores and exempts the pod from CFS throttling. If you
+#     cannot guarantee the static policy (or do not want a cpu limit), stay Burstable and lean
+#     on note 1 (memory request == limit) for eviction protection instead.
 resources:
   requests:
     cpu: "500m"
