@@ -34,8 +34,9 @@ copy of that directory. It contains:
 | `dump-shard-<n>.icss` | Per-shard base snapshot (one file per shard) | Binary "ICSS" format, CRC-32 per file |
 | `dump-shard-<n>-delta-<k>.icsd` | Incremental delta snapshots | Only when `snapshot_deltas` is enabled |
 | `dump.manifest` | The commit point | Written + fsync'd **LAST**; names the committed shard/delta files |
-| `ironcache-raft-<port>.log` | The durable raft log (cluster mode) | Carries writes committed **after** the last snapshot cut |
+| `ironcache-raft-<port>.log` | The durable raft log (cluster mode) | `<port>` = the raft BUS port (clientPort+10000). Carries committed cluster MEMBERSHIP + slot-ownership config, NOT key writes |
 | `ironcache-raft-<port>.log.snap` | The raft log's snapshot sidecar | Co-located with the log under `data_dir` |
+| `ironcache-raft-<port>.log.cfg` | The committed cluster-membership baseline | Restore-relevant: omit it and a node falls back to the STATIC topology voter set (can restore stale membership) |
 
 Two properties that make this safe to copy:
 
@@ -51,10 +52,13 @@ Two properties that make this safe to copy:
 
 Two properties to respect:
 
-- **Snapshot alone is stale for a cluster.** In raft mode the log keeps
-  accumulating writes after the snapshot is cut, so a consistent restore needs the
-  snapshot files **and** the raft log together. Back up the **whole `data_dir`**,
-  not just the `.icss` files.
+- **The snapshot holds the DATA; the raft state holds the MEMBERSHIP.** The `.icss`
+  snapshot is the durable keyspace (as of the last save). The raft log + its
+  `.log.snap`/`.log.cfg` sidecars hold the committed cluster membership and slot
+  ownership -- **not** post-snapshot key writes (SET/DEL are not journaled to the
+  raft log). So a restored cluster node needs BOTH: the snapshot to reload its
+  data, and the raft state to rejoin with the correct topology. Back up the **whole
+  `data_dir`**, not just the `.icss` files.
 - **Not a global point-in-time.** Shards dump at slightly different instants (no
   cross-shard lock -- a deliberate cache tradeoff). Each shard is
   self-consistent; the set is "fuzzy" across shards. Fine for a cache; do not
@@ -65,14 +69,15 @@ Two properties to respect:
 ## 2. RPO and RTO
 
 - **RPO (how much you can lose).** A file-copy backup is only as fresh as the last
-  SAVE it captured. The chart's default periodic policy is `saveIntervalSecs: 900`
-  (a save every 15 min if >= `saveMinChanges` writes happened), so a naive daily
-  copy of the periodic snapshot has an RPO up to 15 min *plus* the backup interval.
-  Tighten it by issuing an explicit `SAVE` (or `BGSAVE`) immediately before each
-  copy, and/or shortening `saveIntervalSecs`. In cluster mode, copying the raft log
-  too captures writes committed after the last snapshot, improving the effective
-  RPO -- but the log is only replayable against a matching snapshot base, so always
-  copy them together.
+  SAVE it captured -- the durable keyspace is the snapshot, and post-snapshot key
+  writes are **not** journaled to the raft log, so the raft log does not improve
+  DATA RPO. The chart's default periodic policy is `saveIntervalSecs: 900` (a save
+  every 15 min if >= `saveMinChanges` writes happened), so a naive daily copy of
+  the periodic snapshot has an RPO up to 15 min *plus* the backup interval. Tighten
+  it by issuing an explicit `SAVE` (or `BGSAVE`) immediately before each copy,
+  and/or shortening `saveIntervalSecs`. (Surviving a *node* loss with less data
+  loss is a separate, availability concern -- synchronous replication to a peer via
+  `cluster.minReplicasToWrite` -- not a backup-RPO lever.)
 - **RTO (how long to come back).** On restore the node reloads the snapshot on
   boot; time scales with dataset size and storage throughput. Size the
   `startupProbe` budget (`failureThreshold * periodSeconds`, default 10 min) to
@@ -209,9 +214,12 @@ IronCache snapshot manifest version.
    whatever is in `data_dir` at startup.
 2. **Place the artifact.** Put the backed-up files back under `data_dir`
    (`/var/lib/ironcache`): `dump.manifest`, its `dump-shard-*.icss` (+ any
-   `*.icsd`), and -- for a cluster node -- the `ironcache-raft-<port>.log` (+
-   `.log.snap`). From a CSI `VolumeSnapshot`, restore by creating the PVC
-   `dataSource` from the snapshot instead.
+   `*.icsd`), and -- for a cluster node -- the raft state
+   `ironcache-raft-<port>.log` **and its `.log.snap` and `.log.cfg` sidecars** (the
+   `.cfg` is the committed-membership baseline; omit it and the node falls back to
+   the static topology voter set, which can restore stale membership). From a CSI
+   `VolumeSnapshot`, restore by creating the PVC `dataSource` from the snapshot
+   instead.
 3. **Keep the port consistent (cluster).** The raft log filename embeds the raft
    port (`ironcache-raft-<port>.log`). Restore onto a node configured with the same
    port, or the log will not be found and the node starts from the snapshot only
@@ -231,12 +239,16 @@ IronCache snapshot manifest version.
 
 The manifest carries a format version. A base-only snapshot is v1; enabling
 `snapshot_deltas` writes a v2 manifest that a pre-delta binary does **not**
-understand. On purpose, an older binary refuses to boot on a newer manifest
-(fail-loud) rather than silently starting empty. **Restore onto a binary version
->= the one that took the backup.** If you must move data to an older version, use
-the logical `DUMP`/`RESTORE` path (section 5), which is manifest-version
-independent. Keep your backups tagged with the IronCache version that produced
-them.
+understand. It always logs this **loudly**, but what happens next is a setting: by
+DEFAULT (`refuse_empty_start_on_version_mismatch = false`, which the chart does not
+override) the older binary boots with an **empty keyspace** -- and a subsequent
+save can then **overwrite your newer dump, losing everything**. Set
+`refuse_empty_start_on_version_mismatch = true` (via `extraConfig`) to make it
+fail-CLOSED (refuse to boot) instead -- strongly recommended for any node whose
+data you care about. Either way: **restore onto a binary version >= the one that
+took the backup.** If you must move data to an older version, use the logical
+`DUMP`/`RESTORE` path (section 5), which is manifest-version independent. Keep your
+backups tagged with the IronCache version that produced them.
 
 ---
 
