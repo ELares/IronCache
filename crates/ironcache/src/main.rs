@@ -348,6 +348,10 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
             handles.topology.clone(),
             // The coordinator inbox, so `/metrics` samples the per-shard inbox-depth gauge (#556).
             Some(handles.inbox.clone()),
+            // The graceful-shutdown flag (P0-5): `/readyz` returns 503 the moment drain begins so
+            // k8s deprograms this pod's endpoint before SIGTERM drains it. `shutdown_flag()` clones
+            // the Arc, so `set` remains usable afterward.
+            Some(set.shutdown_flag()),
         );
         metrics_http::spawn_metrics_server(metrics_addr, state)
             .context("starting the metrics endpoint")?;

@@ -72,7 +72,7 @@ jobs:
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
             # shellcheck disable=SC2086
-            rendered="$(helm template ic deploy/helm/ironcache $extra)"
+            rendered="$(helm template ic deploy/helm/ironcache --kube-version "${KUBE_VERSION}" $extra)"
             printf '%s\n' "$rendered" \
               | kubeconform -strict -summary -verbose \
                   -ignore-missing-schemas \

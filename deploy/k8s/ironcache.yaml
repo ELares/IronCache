@@ -247,11 +247,20 @@ spec:
               containerPort: 26379
             - name: metrics
               containerPort: 9121
+          # Startup: gates liveness+readiness until load-on-boot finishes, so a slow
+          # snapshot reload does not trip liveness (60*10s = 10 min budget; raise for
+          # multi-GB datasets).
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /livez
               port: metrics
-            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
@@ -259,10 +268,15 @@ spec:
             httpGet:
               path: /readyz
               port: metrics
-            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
+          # preStop lame-duck (native SleepAction, k8s 1.29+): endpoint deprograms before
+          # drain. The distroless image is shell-free, so exec `sleep` is NOT usable.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
           resources:
             requests:
               cpu: "500m"

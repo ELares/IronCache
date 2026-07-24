@@ -137,25 +137,50 @@ spec:
             {{- end }}
             - name: metrics
               containerPort: {{ $metricsPort }}
-          # Liveness: the process is up and serving (/livez flips at end of boot).
+          # Startup: gates liveness + readiness until load-on-boot completes, so a slow
+          # (multi-GB) snapshot RELOAD does not trip the liveness budget and CrashLoopBackOff
+          # a healthy node mid-load. Hits /readyz (the same load-complete signal). Size
+          # failureThreshold * periodSeconds to the worst-case reload time (values.startupProbe).
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: {{ .Values.startupProbe.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds | default 3 }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold | default 60 }}
+          # Liveness: the process is up and serving (/livez flips at end of boot). No
+          # initialDelaySeconds -- the startupProbe above already covers the boot/reload window.
           livenessProbe:
             httpGet:
               path: /livez
               port: metrics
-            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
-          # Readiness: every shard finished load-on-boot AND (in raft mode) a leader
-          # is known. Gates traffic + the rolling update on a genuinely ready node.
+          # Readiness: every shard finished load-on-boot AND (in raft mode) a leader is
+          # known AND the node is not draining. Gates traffic + the rolling update on a
+          # genuinely ready node.
           readinessProbe:
             httpGet:
               path: /readyz
               port: metrics
-            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
+          {{- if and (gt (int .Values.preStop.sleepSeconds) 0) (semverCompare ">=1.29-0" .Capabilities.KubeVersion.Version) }}
+          # preStop lame-duck (native SleepAction, beta/default-on in k8s 1.29+): let the
+          # Service endpoint deprogram before the process drains, so a rolling update does not
+          # reset in-flight clients. The distroless image is shell-free, so exec `sleep` is NOT
+          # usable here. Gated on the cluster version so the chart SELF-PROTECTS on k8s < 1.29
+          # (where the API server rejects the unknown `sleep` field) -- there it silently
+          # degrades to the server's /readyz-returns-503-on-drain fallback. Under `helm template`
+          # (no live cluster) .Capabilities.KubeVersion is the Helm built-in version, so this
+          # still renders + is kubeconform-validated in CI.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.preStop.sleepSeconds }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
