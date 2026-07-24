@@ -23,7 +23,7 @@ name: ironcache-console
 
 # The common console replica config (both replicas are identical).
 x-console: &console
-  image: ghcr.io/elares/ironcache-console:latest
+  image: ghcr.io/elares/ironcache-console:${IRONCACHE_VERSION:-0.1.0}
   command: [run]
   environment:
     IRONCACHE_CONSOLE_HTTP_ADDR: 0.0.0.0:9180

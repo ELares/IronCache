@@ -567,6 +567,10 @@
             "Never"
           ],
           "description": "Init image pull policy."
+        },
+        "digest": {
+          "type": "string",
+          "description": "Optional image digest (sha256:...) for the init image; when set it WINS over tag and renders repo@digest. Empty by default so air-gapped pre-loaded images still work."
         }
       }
     },

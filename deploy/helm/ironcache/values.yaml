@@ -57,7 +57,12 @@ persistence:
   # The PVC mount path == data_dir.
   mountPath: /var/lib/ironcache
   size: 10Gi
-  # storageClassName: "" leaves the cluster default; set an SSD class in prod.
+  # storageClassName: "" leaves the cluster default; set an SSD class in prod. NOTE the PV
+  # RECLAIM POLICY comes from the StorageClass, not this chart: for production use a class whose
+  # reclaimPolicy is `Retain`, so deleting the PVC does not also destroy the underlying volume
+  # (the chart's persistentVolumeClaimRetentionPolicy protects the PVC; the StorageClass protects
+  # the PV behind it). Also: labels/annotations on a volumeClaimTemplate are applied at PVC
+  # CREATION only -- editing them later does NOT propagate to already-created PVCs.
   storageClassName: ""
   accessModes:
     - ReadWriteOnce
@@ -289,6 +294,9 @@ pdb:
 # compatible with `restricted` because it needs no in-image binary.
 #
 # The image already runs as nonroot (uid 65532); fsGroup makes the PVC writable by it.
+# runAsUser/runAsGroup MUST match the image's baked-in UID/GID (65532). Changing them to an id
+# the image does not own makes the process unable to read its own files (and, with fsGroup left
+# behind, the PVC too) -- change these only if you also rebuild the image.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
@@ -302,6 +310,9 @@ podSecurityContext:
     type: RuntimeDefault
 containerSecurityContext:
   allowPrivilegeEscalation: false
+  # readOnlyRootFilesystem applies to `/` ONLY. The pod still has the writable mounts it needs:
+  # the data PVC at persistence.mountPath and a small emptyDir at /run/ironcache that the init
+  # container writes the stamped config into. That combination is by design, not a leak.
   readOnlyRootFilesystem: true
   capabilities:
     drop:
@@ -378,6 +389,14 @@ topologySpread:
 initImage:
   repository: busybox
   tag: "1.36"
+  # SUPPLY-CHAIN HARDENING (opt-in): pin the init image by DIGEST instead of the mutable tag.
+  # When set it WINS over `tag` and renders `busybox@sha256:...`. The verified multi-arch
+  # (amd64 + arm64 + more) manifest-list digest for busybox:1.36 is:
+  #   sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+  # Left EMPTY by default deliberately: an AIR-GAPPED cluster pre-loads its own busybox tarball
+  # (see deploy/K3S.md), whose digest will differ, and a digest pin would then fail the pull.
+  # Set it wherever you control the registry.
+  digest: ""
   pullPolicy: IfNotPresent
 
 # --- Console (epic #352, issue #363) ------------------------------------------

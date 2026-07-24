@@ -60,9 +60,11 @@ not stale text). The chart is production-safe for **fixed-size** clusters.
   on its first run it caught + fixed a real shipped preStop-gate bug (SleepAction is
   beta/default-on only from **1.30**, not 1.29), but `ct` and an **upgrade**-path test are still
   missing. The chart is now 0.3.0.
-- **Genuinely remaining** (each also flagged in the Section 2 table):
-  1. **P2-8** the doc-only clarifications (incl. pinning the busybox init image by digest).
-  2. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
+- **P2 is now COMPLETE (P2-1..P2-8)**: P2-3 finished with the upgrade-path e2e (#763), P2-6 the
+  ServiceMonitor scrape knobs + the alert rules as a PrometheusRule (#764), P2-7 the console-UI
+  Ingress (#765), P2-8 the doc clarifications + the opt-in busybox digest pin.
+- **Genuinely remaining** (also flagged in the Section 2 table):
+  1. **The day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the chart + the
      #392 upgrade driver cover fixed-size clusters.
 
 ---
