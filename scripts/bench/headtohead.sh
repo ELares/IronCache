@@ -571,6 +571,30 @@ json_field() {
   fi
 }
 
+# json_num FILE KEY LABEL: like json_field, but REQUIRES a non-negative integer and dies with a
+# diagnosable message otherwise. This exists because the silent-default pattern below used to turn a
+# MISSING latency percentile into a plausible-looking `0`: `jq -r .missing_key` prints the STRING
+# "null", which passes a `[[ -n ... ]]` test, so the guard never fired and a run reported a 0us tail
+# (or a 0 moat ratio) as if it were real. On a paid bench host that is a silently wasted run, so a
+# missing/!numeric percentile must FAIL LOUD, naming the file and key, instead of being defaulted.
+json_num() {
+  local file="$1" key="$2" label="${3:-$2}" val
+  if [[ ! -s "${file}" ]]; then
+    echo "[h2h] FATAL: ${label}: results file missing or empty: ${file}" >&2
+    echo "[h2h]   the load generator produced no JSON -- check the loadgen invocation above." >&2
+    exit 1
+  fi
+  val="$(json_field "${file}" "${key}")"
+  if [[ -z "${val}" || "${val}" == "null" || ! "${val}" =~ ^[0-9]+$ ]]; then
+    echo "[h2h] FATAL: ${label}: '${key}' is missing or not a number in ${file} (got: '${val}')." >&2
+    echo "[h2h]   Refusing to report a defaulted 0 -- that silently invalidates the run." >&2
+    echo "[h2h]   File contents:" >&2
+    sed -n '1,20p' "${file}" >&2
+    exit 1
+  fi
+  printf '%s' "${val}"
+}
+
 # ratio_div A B: A / B to 4 dp via awk; "0" when B is 0/empty. Used for per-core and
 # the cross-server ratios.
 ratio_div() {
@@ -1080,15 +1104,13 @@ measure_server() {
     stop_snapshot_loop
     verify_snapshot_fired "${name}" "${snap_lastsave_before}" "${kind}"
   fi
+  # STRICT: the p99.9 IS the moat metric (#518/#574) and the #676 A/B verdict, so a missing or
+  # non-numeric percentile must abort the run rather than be defaulted to 0 (see json_num).
   local p50 p99 p999 p9999
-  p50="$(json_field "${open_json}" p50_us)"
-  p99="$(json_field "${open_json}" p99_us)"
-  p999="$(json_field "${open_json}" p999_us)"
-  p9999="$(json_field "${open_json}" p9999_us)"
-  [[ -n "${p50}" ]] || p50="0"
-  [[ -n "${p99}" ]] || p99="0"
-  [[ -n "${p999}" ]] || p999="0"
-  [[ -n "${p9999}" ]] || p9999="0"
+  p50="$(json_num "${open_json}" p50_us "${name} open-loop")"
+  p99="$(json_num "${open_json}" p99_us "${name} open-loop")"
+  p999="$(json_num "${open_json}" p999_us "${name} open-loop")"
+  p9999="$(json_num "${open_json}" p9999_us "${name} open-loop")"
 
   # (f) Stop the server cleanly and verify the port frees, then drop this server's private
   #     snapshot dir (SNAPSHOT mode).
