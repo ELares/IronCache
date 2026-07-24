@@ -6,9 +6,12 @@
 
 image:
   repository: ghcr.io/elares/ironcache
-  # Pin to an immutable version tag in production (e.g. "0.1.0" -- the registry
-  # tag has NO leading "v"; the image CI strips it), NOT "latest".
-  tag: "latest"
+  # Image tag. EMPTY ("") defaults to the chart's appVersion (Chart.yaml) -- the
+  # recommended single-source-of-truth: an immutable, pinned release. Set an explicit
+  # tag here ONLY to override appVersion (e.g. a hotfix build). Avoid "latest" in prod
+  # (mutable -> non-reproducible rollouts + surprise upgrades on pod reschedule). The
+  # registry tag has NO leading "v" (the image CI strips it from the v<version> git tag).
+  tag: ""
   pullPolicy: IfNotPresent
 # Image pull secrets for a private registry (GHCR private packages):
 imagePullSecrets: []
@@ -356,8 +359,10 @@ console:
   replicas: 2
   image:
     repository: ghcr.io/elares/ironcache-console
-    # Pin to an immutable version in production, NOT "latest".
-    tag: "latest"
+    # EMPTY ("") defaults to the chart appVersion (the console image is published in
+    # lockstep with the cache on the same v<version> tag). Override only for a hotfix;
+    # avoid "latest" in prod.
+    tag: ""
     pullPolicy: IfNotPresent
   # The single HTTP port serving /livez + /readyz + /metrics + the UI + /api/*.
   httpPort: 9180

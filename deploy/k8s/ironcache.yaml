@@ -226,7 +226,8 @@ spec:
               mountPath: /run/ironcache
       containers:
         - name: ironcache
-          image: ghcr.io/elares/ironcache:latest
+          # Pinned to an immutable release tag (not :latest) -- bump on upgrade.
+          image: ghcr.io/elares/ironcache:0.1.0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

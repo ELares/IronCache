@@ -9,10 +9,17 @@ description: >-
 type: application
 # The chart version. Bump on chart changes (independent of the app version).
 # 0.2.0: adds the optional stateless console Deployment (console.enabled, #363).
-version: 0.2.0
-# The default IronCache image tag this chart targets. Override via
-# image.tag in values.yaml. Quoted so a calendar version is not parsed as a float.
-appVersion: "latest"
+# 0.3.0: P0/P1 production hardening (cgroup maxmemory guard, startupProbe + preStop
+#        lifecycle, StatefulSet hardening, cluster-secret guard, cache NetworkPolicy,
+#        console SA-token parity) + pins appVersion off "latest" (the image tag now
+#        defaults to appVersion; see image.tag in values.yaml).
+version: 0.3.0
+# The IronCache app version this chart targets. Drives the default image tag: the
+# StatefulSet/console templates pull `<repo>:<appVersion>` unless image.tag overrides
+# it, so this is the single place to bump for a new release. Must be an IMMUTABLE
+# published tag (the image CI publishes `<version>` from a `v<version>` git tag), never
+# "latest". Quoted so a calendar version is not parsed as a float.
+appVersion: "0.1.0"
 home: https://github.com/ELares/IronCache
 sources:
   - https://github.com/ELares/IronCache
