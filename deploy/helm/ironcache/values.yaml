@@ -77,8 +77,13 @@ auth:
 clusterSecret:
   # The shared cluster secret (cluster_secret): every node presents it in a
   # constant-time peer handshake on the bus + repl links, so a stranger cannot join
-  # the bus / forge RAFTMSG / pull replication. STRONGLY recommended when
-  # cluster.enabled. Auto-generated if left empty and not using an existing Secret.
+  # the bus / forge RAFTMSG / pull replication. If left empty (and no existingSecret),
+  # it is auto-generated on the FIRST install and PRESERVED across `helm upgrade` (via a
+  # lookup of the existing Secret), so a bare upgrade no longer rotates it. BUT under
+  # GitOps (Argo/Flux) or any `helm template`/`--dry-run` pipeline the lookup is blind and
+  # the value regenerates every sync -- so for GitOps and reproducible/production installs
+  # you MUST set an explicit value here (or clusterSecret.existingSecret), which is
+  # source-controlled and never rotates. Generate one with e.g. `openssl rand -hex 20`.
   value: ""
   existingSecret: ""
 
