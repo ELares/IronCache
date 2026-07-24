@@ -67,7 +67,7 @@ jobs:
           # IRONCACHE_CLUSTER_CA_PATH at it, so the Secret must emit cluster.ca (defaulted to the
           # cert). #660 shipped that; this variant guards the regression.
           cluster_tls_set="--set cluster.enabled=true --set clusterTls.enabled=true --set clusterTls.cert=DUMMYCERT --set clusterTls.key=DUMMYKEY"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set"; do
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).

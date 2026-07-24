@@ -165,6 +165,17 @@ spec:
   serviceName: ironcache-headless
   replicas: 3
   podManagementPolicy: Parallel
+  # RollingUpdate: one at a time by descending ordinal, gated by the readinessProbe + minReadySeconds.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  minReadySeconds: 15
+  revisionHistoryLimit: 3
+  # DATA SAFETY: never auto-delete a data PVC (GA k8s 1.27; default is Retain regardless).
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       app.kubernetes.io/name: ironcache
@@ -174,11 +185,15 @@ spec:
         app.kubernetes.io/name: ironcache
     spec:
       terminationGracePeriodSeconds: 60
+      # Cache pods need no k8s API access -- restricted-PSS hardening.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        # Avoid a recursive chown of a large PVC on every mount (slow restarts).
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       affinity:

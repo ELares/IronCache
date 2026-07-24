@@ -19,6 +19,28 @@ spec:
   serviceName: {{ include "ironcache.headlessService" . }}
   replicas: {{ int .Values.replicas }}
   podManagementPolicy: Parallel
+  # Explicit RollingUpdate: pods roll ONE AT A TIME by descending ordinal, each gated by the
+  # readinessProbe (/readyz) + minReadySeconds. This -- NOT the PDB -- paces a safe in-place upgrade
+  # (a PDB only gates voluntary evictions, never a StatefulSet rollout). `partition` is the canary lever.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: {{ int .Values.updateStrategy.partition }}
+  # Soak: a pod must stay ready this long before the rollout advances to the next ordinal, so a
+  # flapping raft pod does not let the rollout march through the cluster.
+  minReadySeconds: {{ int .Values.minReadySeconds }}
+  # Bound retained ControllerRevisions (etcd hygiene; unbounded with manual partition patches).
+  revisionHistoryLimit: {{ int .Values.revisionHistoryLimit }}
+  {{- if semverCompare ">=1.27-0" .Capabilities.KubeVersion.Version }}
+  # DATA SAFETY: never auto-delete a data PVC. StatefulSet already defaults to Retain, but pin it
+  # explicitly so a future edit / a `whenScaled: Delete` misconfig can never turn a scale-in or a
+  # StatefulSet delete into permanent data loss for the removed ordinals. GA in k8s 1.27 (the chart
+  # gates on it so an older cluster -- where the default is already Retain -- is not sent an unknown
+  # field); on those clusters the default Retain applies unchanged.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  {{- end }}
   selector:
     matchLabels:
       {{- include "ironcache.selectorLabels" . | nindent 6 }}
@@ -35,6 +57,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      # The cache pods (+ the init container) need NO Kubernetes API access, so do not mount a
+      # ServiceAccount token -- standard restricted-PSS hardening (shrinks a compromised pod's reach).
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.nodeSelector }}
@@ -62,6 +87,17 @@ spec:
                     {{- include "ironcache.selectorLabels" . | nindent 20 }}
                 topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
           {{- end }}
+      {{- if .Values.topologySpread.enabled }}
+      # Zone spread (multi-AZ): keep quorum alive through a ZONE outage (podAntiAffinity above only
+      # spreads across NODES). Optional; enable on a multi-AZ cluster.
+      topologySpreadConstraints:
+        - maxSkew: {{ int .Values.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.topologySpread.topologyKey }}
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "ironcache.selectorLabels" . | nindent 14 }}
+      {{- end }}
       initContainers:
         # Stamp THIS pod's stable cluster_announce_id (from its StatefulSet
         # ordinal) into /run/ironcache/ironcache.toml, which the main container

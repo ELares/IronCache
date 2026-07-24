@@ -189,6 +189,10 @@ podSecurityContext:
   runAsUser: 65532
   runAsGroup: 65532
   fsGroup: 65532
+  # Only chown the PVC when its top-level ownership does not already match fsGroup, instead of a
+  # RECURSIVE chown of the whole volume on EVERY mount -- which on a large (multi-GB) data_dir makes
+  # every pod restart slow and eats into the startupProbe budget.
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 containerSecurityContext:
@@ -231,6 +235,29 @@ startupProbe:
 # terminationGracePeriodSeconds.
 preStop:
   sleepSeconds: 10
+
+# --- Rolling-update controls --------------------------------------------------
+# StatefulSet RollingUpdate: pods roll ONE AT A TIME by descending ordinal, each gated by the
+# readinessProbe + minReadySeconds. `partition` is a canary lever: freeze ordinals < partition,
+# verify, then patch it down to 0 to roll the rest. 0 = roll everything (the normal case).
+updateStrategy:
+  partition: 0
+# A "ready" pod must stay ready this long before the rollout advances to the next ordinal, so a
+# flapping raft pod does not let the rollout march through the whole cluster. This -- not the PDB --
+# is the rollout soak lever (a PDB only gates voluntary evictions, never a StatefulSet update).
+minReadySeconds: 15
+# Bound retained ControllerRevision history (etcd hygiene; unbounded with manual partition patches).
+revisionHistoryLimit: 3
+
+# --- Zone spread (multi-AZ) ---------------------------------------------------
+# OPTIONAL topologySpreadConstraints so quorum survives a ZONE outage (podAntiAffinity above only
+# spreads across NODES). Enable on a multi-AZ cluster; leave off on single-zone / k3s edge. Default
+# whenUnsatisfiable=ScheduleAnyway so a constrained cluster still schedules (best-effort spread).
+topologySpread:
+  enabled: false
+  maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: ScheduleAnyway
 
 # Optional init container image (BusyBox) used to stamp the per-pod
 # cluster_announce_id from the StatefulSet ordinal. Has a shell; never reaches the
