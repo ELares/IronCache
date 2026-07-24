@@ -211,7 +211,10 @@ terminationGracePeriodSeconds: 60
 # budget, which would CrashLoopBackOff a healthy node mid-load. The startupProbe hits
 # /readyz and SUSPENDS liveness+readiness until load-on-boot completes. Size
 # failureThreshold * periodSeconds to the worst-case reload time (default 60*10 = 10 min;
-# raise failureThreshold for multi-GB datasets or slow/edge storage).
+# raise failureThreshold for multi-GB datasets or slow/edge storage). IN RAFT MODE /readyz
+# also waits for a leader, so the budget must cover the worst-case leader-election time too
+# (relevant on a cold cluster-wide restart where every node blocks on its peers) -- raise
+# failureThreshold if a slow election could otherwise CrashLoop a healthy node.
 startupProbe:
   periodSeconds: 10
   timeoutSeconds: 3
@@ -220,10 +223,12 @@ startupProbe:
 # preStop lame-duck: after the pod is marked for deletion, sleep this many seconds so the
 # Service endpoint deprograms (kube-proxy stops routing NEW clients here) BEFORE the
 # process is drained -- avoiding client-visible resets on every rolling update. Uses the
-# native SleepAction (Kubernetes 1.29+, GA 1.30); the distroless image is SHELL-FREE, so
-# an exec `sleep` hook would silently fail. 0 disables it -- on k8s < 1.29 set 0 and rely
-# on the server's readiness-fail-on-drain (/readyz returns 503 the moment drain starts).
-# Keep it comfortably under terminationGracePeriodSeconds.
+# native SleepAction (alpha 1.29, beta/default-on 1.30, GA 1.34); the distroless image is
+# SHELL-FREE, so an exec `sleep` hook would silently fail. The chart auto-gates this block
+# on the cluster version (semverCompare >= 1.29), so on OLDER clusters it is simply omitted
+# and the server's readiness-fail-on-drain takes over (/readyz returns 503 the moment drain
+# starts) -- no broken install. Set 0 to disable it explicitly. Keep it comfortably under
+# terminationGracePeriodSeconds.
 preStop:
   sleepSeconds: 10
 

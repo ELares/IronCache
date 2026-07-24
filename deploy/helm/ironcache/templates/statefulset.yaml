@@ -167,10 +167,15 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
-          {{- if gt (int .Values.preStop.sleepSeconds) 0 }}
-          # preStop lame-duck (native SleepAction, k8s 1.29+): let the Service endpoint
-          # deprogram before the process drains, so a rolling update does not reset in-flight
-          # clients. The distroless image is shell-free, so exec `sleep` is NOT usable here.
+          {{- if and (gt (int .Values.preStop.sleepSeconds) 0) (semverCompare ">=1.29-0" .Capabilities.KubeVersion.Version) }}
+          # preStop lame-duck (native SleepAction, beta/default-on in k8s 1.29+): let the
+          # Service endpoint deprogram before the process drains, so a rolling update does not
+          # reset in-flight clients. The distroless image is shell-free, so exec `sleep` is NOT
+          # usable here. Gated on the cluster version so the chart SELF-PROTECTS on k8s < 1.29
+          # (where the API server rejects the unknown `sleep` field) -- there it silently
+          # degrades to the server's /readyz-returns-503-on-drain fallback. Under `helm template`
+          # (no live cluster) .Capabilities.KubeVersion is the Helm built-in version, so this
+          # still renders + is kubeconform-validated in CI.
           lifecycle:
             preStop:
               sleep:
