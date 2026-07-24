@@ -26,6 +26,10 @@ spec:
         {{- include "ironcache.console.labels" . | nindent 8 }}
     spec:
       terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      # The console dials the cache over RESP and scrapes Prometheus over HTTP; it needs no
+      # Kubernetes API access, so do not mount the ServiceAccount token (parity with the cache
+      # StatefulSet -- shrinks the attack surface of a compromised console replica).
+      automountServiceAccountToken: false
       securityContext:
         # No fsGroup: the console has no PVC and runs read-only-root.
         runAsNonRoot: true

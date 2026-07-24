@@ -158,6 +158,24 @@ networkPolicy:
   extraEgress: []
 
 # --- Resources ----------------------------------------------------------------
+# QoS + memory sizing. With these defaults the pod is BURSTABLE QoS (requests < limits,
+# a memory limit but no cpu limit). Two production tuning notes:
+#
+#  1. MEMORY REQUEST is a lower bound you should RAISE. The request (not the limit) is what
+#     the scheduler reserves and what ranks the pod for eviction under node memory pressure.
+#     512Mi is a floor for scheduling; a real cache working set is ~70% of the memory LIMIT
+#     (the auto-derived maxmemory). Set memory REQUEST at or near the memory LIMIT so the node
+#     reserves the true footprint and the cache is not a first-to-evict candidate.
+#
+#  2. GUARANTEED QoS (the strongest protection -- evicted LAST under node pressure, and with
+#     no burst-above-request region to be reclaimed from; it can still be OOM-killed at its own
+#     limit, but allkeys-lru eviction at the derived maxmemory keeps it away from that) requires
+#     requests == limits for BOTH cpu AND memory on every container. Memory is easy (set request
+#     == limit). CPU is the catch: a cpu LIMIT
+#     re-introduces CFS throttling of the per-core runtime, so if you want Guaranteed QoS set
+#     an INTEGER cpu limit == request sized to the pod's actual cores (e.g. cpu: "4"), never a
+#     fractional millicore limit. If you cannot accept a cpu limit, stay Burstable and instead
+#     lean on note 1 (memory request == limit) for eviction protection.
 resources:
   requests:
     cpu: "500m"
@@ -213,6 +231,18 @@ pdb:
   maxUnavailable: 1
 
 # --- Pod security -------------------------------------------------------------
+# Pod Security Standards (PSS): BOTH the cache StatefulSet and the console Deployment are
+# built to satisfy the `restricted` profile out of the box -- runAsNonRoot, seccompProfile
+# RuntimeDefault, allowPrivilegeEscalation=false, capabilities drop ALL, readOnlyRootFilesystem,
+# and no mounted ServiceAccount token. RECOMMENDED: enforce it at the namespace level so a
+# future regression is rejected by the API server, e.g.:
+#   kubectl label namespace <ns> \
+#     pod-security.kubernetes.io/enforce=restricted \
+#     pod-security.kubernetes.io/enforce-version=latest
+# (PSA is built into k8s 1.25+ and k3s.) If you loosen containerSecurityContext below, the
+# label will start REJECTING the pods -- that is the point. The preStop SleepAction (P0) is
+# compatible with `restricted` because it needs no in-image binary.
+#
 # The image already runs as nonroot (uid 65532); fsGroup makes the PVC writable by it.
 podSecurityContext:
   runAsNonRoot: true
