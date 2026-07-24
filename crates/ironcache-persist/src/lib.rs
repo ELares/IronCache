@@ -220,7 +220,8 @@ pub fn dump_frozen_slots_paced(
             }
             builder.push_entry(db, entry);
             // Pace on a BYTE accumulator (slots vary wildly in size, so per-slot would pace
-            // unevenly). `!= 0` guards the unpaced delegate + keeps `pct=100` fully callback-free.
+            // unevenly). `!= 0` makes the unpaced delegate (`pace_chunk_bytes == 0`) skip the callback
+            // entirely; a paced caller still invokes it per chunk even at pct=100 (the pacer no-ops).
             if pace_chunk_bytes != 0 && builder.body_len() - paced_at >= pace_chunk_bytes {
                 on_chunk();
                 paced_at = builder.body_len();

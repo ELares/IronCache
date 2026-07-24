@@ -892,6 +892,7 @@ fn a_failed_save_flips_rdb_last_bgsave_status_to_err() {
         home,
         0,
         1_700_000_000,
+        true, // #676: paced (the normal background-save path); knob defaults to 100 = no-op.
     ));
     assert!(res.is_err(), "the broken data dir fails the save: {res:?}");
     assert!(
