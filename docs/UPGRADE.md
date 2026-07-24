@@ -552,9 +552,12 @@ rollout deletes a primary pod, its slots are **unavailable for the duration of t
 graceful restart** -- SIGTERM save-on-exit, pod recreated with the new image, snapshot +
 raft-log reload from the **retained** PVC, then `/readyz` passes.
 
-- **RPO = 0.** The save-on-exit persists the working set and the PVC is retained across the
-  pod recreate (`persistentVolumeClaimRetentionPolicy`), so the node reloads exactly what it
-  had. No data is lost.
+- **RPO = 0** -- *provided a save policy is active* (it is by default: `persistence.enabled:
+  true` + `saveIntervalSecs: 900`). On that policy SIGTERM runs the save-on-exit, which
+  persists the working set, and the PVC is retained across the pod recreate
+  (`persistentVolumeClaimRetentionPolicy`), so the node reloads exactly what it had. If you
+  disable persistence or set `saveIntervalSecs: 0`, save-on-exit does not fire and a rolled
+  pod comes back cold -- the restart is no longer RPO=0.
 - **Availability: a per-node gap.** Each node's slots are down for its restart window. The
   readiness gate + one-at-a-time ordinal serialization confine it to one node at a time; size
   `startupProbe.failureThreshold * periodSeconds` and `terminationGracePeriodSeconds` to your
