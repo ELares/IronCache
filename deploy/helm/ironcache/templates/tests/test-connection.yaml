@@ -1,0 +1,40 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if not .Values.auth.enabled }}
+# `helm test` connectivity smoke check: PING the client Service using the image's built-in
+# RESP client (`ironcache cli`, PING-only, exits 0 on +PONG). Runs only on
+# `helm test <release>`, never on install (the helm.sh/hook: test annotation). Rendered only
+# when auth is off -- the PING subcommand has no password flag; with auth enabled, run your
+# own authenticated check. Uses the same distroless image (no shell needed).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "ironcache.fullname" . }}-test-connection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: ping
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+      command:
+        - /usr/local/bin/ironcache
+        - cli
+        - -h
+        - {{ include "ironcache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+        - -p
+        - {{ int .Values.service.clientPort | quote }}
+{{- end }}

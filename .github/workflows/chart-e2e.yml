@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Chart end-to-end gate: spin up a kind cluster, install the chart as a single STANDALONE
+# node, wait for it to become Ready, and run `helm test` -- the RESP PING connectivity smoke
+# check (templates/tests/test-connection.yaml) -- against the real published image. This
+# complements deploy-lint (which statically renders + kubeconform-validates the chart) with a
+# LIVE install proving the chart actually deploys and serves. Runs only when the chart changes.
+name: chart-e2e
+
+on:
+  pull_request:
+    paths:
+      - "deploy/helm/ironcache/**"
+      - ".github/workflows/chart-e2e.yml"
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: "v3.15.4"
+
+jobs:
+  install-test:
+    name: helm install + helm test (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create a kind cluster
+        uses: helm/kind-action@v1.10.0
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Install (standalone) + wait + helm test
+        run: |
+          set -euo pipefail
+          kubectl create namespace ic-test
+          # A single STANDALONE node: fast + deterministic (no 3-node quorum formation, which is
+          # slow/flaky in CI). This exercises install -> readiness (--wait) -> the RESP PING helm
+          # test against the real, public, multi-arch ghcr.io/elares/ironcache:<appVersion> image.
+          helm install ic deploy/helm/ironcache -n ic-test \
+            --set replicas=1 --set cluster.enabled=false \
+            --wait --timeout 5m
+          kubectl -n ic-test get statefulset,pod
+          # `helm test` creates the PING Pod, waits for it, and fails if it exits non-zero.
+          helm test ic -n ic-test --logs
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n ic-test get all || true
+          kubectl -n ic-test describe pod -l app.kubernetes.io/instance=ic || true
+          kubectl -n ic-test logs -l app.kubernetes.io/instance=ic --tail=200 || true
+          kubectl -n ic-test get events --sort-by=.lastTimestamp || true
