@@ -59,8 +59,11 @@ persistence:
   accessModes:
     - ReadWriteOnce
   # Periodic background save policy (#58): SAVE every `saveIntervalSecs` if at
-  # least `saveMinChanges` keyspace writes happened since the last save. 0 = only
-  # explicit SAVE/BGSAVE + save-on-shutdown persist. This bounds the RPO.
+  # least `saveMinChanges` keyspace writes happened since the last save. This bounds the RPO.
+  # 0 DISABLES the save policy: ONLY explicit SAVE/BGSAVE persist -- and with no save policy the
+  # SIGTERM save-on-exit is ALSO a no-op (Redis SHUTDOWN-save-iff-configured semantics), so a
+  # graceful pod stop exits WITHOUT writing. Keep > 0 for durability across rolling restarts; the
+  # default 900 is what makes the save-on-exit fire (see docs/UPGRADE.md, deploy/BACKUP.md).
   saveIntervalSecs: 900
   saveMinChanges: 1
 
