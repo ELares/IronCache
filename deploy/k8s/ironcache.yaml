@@ -287,8 +287,12 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
-          # preStop lame-duck (native SleepAction, k8s 1.29+): endpoint deprograms before
-          # drain. The distroless image is shell-free, so exec `sleep` is NOT usable.
+          # preStop lame-duck (native SleepAction): endpoint deprograms before drain. The
+          # distroless image is shell-free, so exec `sleep` is NOT usable. REQUIRES k8s >= 1.30
+          # (SleepAction is beta/default-on there; on 1.29 it is alpha-off and the API server
+          # rejects this handler -- DELETE this lifecycle block on older clusters). The Helm
+          # chart auto-gates this by cluster version; this static manifest cannot, so it is pinned
+          # to the >= 1.30 assumption.
           lifecycle:
             preStop:
               sleep:
