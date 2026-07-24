@@ -79,7 +79,9 @@ jobs:
           # alerts file) plus the ServiceMonitor scrape knobs. -ignore-missing-schemas skips the
           # CRDs themselves, so the guards below assert the CONTENT actually rendered.
           mon_set="--set metrics.prometheusRule.enabled=true --set metrics.serviceMonitor.enabled=true --set metrics.serviceMonitor.sampleLimit=50000"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set" "$gd_set" "$mon_set"; do
+          # The console-UI Ingress needs BOTH console.enabled and console.ingress.enabled.
+          ing_set="--set console.enabled=true --set console.ingress.enabled=true --set console.ingress.className=traefik"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set" "$gd_set" "$mon_set" "$ing_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
@@ -96,6 +98,14 @@ jobs:
             # propagates -- turning a SUCCESSFUL match into a false failure. A here-string
             # has no upstream writer to break.
             case "$extra" in
+              *console.ingress.enabled=true*)
+                # Assert the Ingress rendered AND targets the CONSOLE Service (never the cache --
+                # RESP is L4 and an HTTP Ingress cannot front it).
+                grep -q "kind: Ingress" <<< "$rendered" \
+                  || { echo "ERROR: console.ingress.enabled rendered no Ingress"; exit 1; }
+                grep -q "name: ic-ironcache-console" <<< "$rendered" \
+                  || { echo "ERROR: console Ingress does not target the console Service"; exit 1; }
+                ;;
               *console.enabled=true*)
                 # Guard against a broken `console.enabled` gate silently rendering
                 # nothing (kubeconform is happy with zero console objects, so assert
