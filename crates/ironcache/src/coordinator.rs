@@ -609,6 +609,29 @@ async fn process_shard_work(
 ) {
     match work {
         ShardWork::Single { request, db, reply } => {
+            // #676 HOL-BLOCK FIX: `__ICSAVE` runs the whole per-shard dump (freeze + await the
+            // off-core persist thread). Awaiting it INLINE here PARKED this shard's drain loop for the
+            // ENTIRE save wall-time, so every cross-shard HOP queued to this shard stalled ~the save
+            // duration (measured: during-save p99.9 ~= save wall-time; ~7/8 of commands are hops in the
+            // default round-robin-accept config, and `fan_out_save` parks EVERY sibling at once). SPAWN
+            // the save off the drain loop (`spawn_on_shard` = spawn_local -> SAME shard thread +
+            // thread-locals) so the loop returns to `rx.recv()` and keeps draining hops while the save
+            // runs concurrently. The freeze (the point-in-time cut) still runs synchronously at the top
+            // of `save_shard_local`; the `reply` oneshot is MOVED into the task so the home core's
+            // gather still receives this shard's manifest entry. SaveGuard serialization + the
+            // manifest-last commit are unaffected: the home awaits EVERY per-shard reply before
+            // committing, and the next save cannot start until this reply frees the guard, so a shard
+            // never has two saves in flight. A save produces no keyspace events and wakes no blocking
+            // waiter, so those side effects are N/A on this path.
+            if crate::serve::ascii_upper(request.command()) == crate::persist::ICSAVE {
+                use ironcache_runtime::Runtime;
+                let ctx = ctx.clone();
+                ironcache_runtime::TokioRuntime::new().spawn_on_shard(async move {
+                    let r = run_local_save(&ctx, &request).await;
+                    let _ = reply.send(r);
+                });
+                return;
+            }
             let r = run_drained_unit(ctx, &request, db).await;
             let _ = reply.send(r);
             // BLOCKING WAKE (PROD-9) + KEYSPACE NOTIFICATIONS (PROD-8): a cross-shard write that ran
