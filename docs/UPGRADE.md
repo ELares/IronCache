@@ -26,6 +26,7 @@ peer of `docs/RUNBOOK.md` (symptom-to-action) and `DEPLOY.md` (install / config)
 | One node, no persistence | none available (data is in-memory) | [Single node](#single-node-rolling-upgrade); accept the cold working set, or add persistence first |
 | One node + `data_dir` + `ironcache.socket` | socket-activation handoff | [Single node](#single-node-rolling-upgrade) -- zero refused connections, warm restart |
 | A raft cluster (`cluster_mode = raft`) with replicas | replica failover | [HA cluster](#ha-cluster-rolling-upgrade) -- ownership moves off the node before you touch it |
+| A Kubernetes StatefulSet (the Helm chart) | per-node availability gap (no-replica default), or out-of-band failover-freeze | [Kubernetes](#kubernetes-helm-rolling-upgrades) -- the native rollout has no failover-before-drain hook |
 
 `cluster_mode` and `data_dir` are config keys (`Config::cluster_mode` / `Config::data_dir`
 in `crates/ironcache-config/src/lib.rs`; TOML `cluster_mode = "raft"` / `data_dir = "..."`,
@@ -530,6 +531,80 @@ real raft cluster is load-sensitive (flaky as a hard CI gate). The split
   the adversarial no-freeze control (which must SHOW acked-write loss when the freeze is
   disabled) are a docker-harness follow-up that exercises the real RESP transport and the
   real binary swap end to end.
+
+---
+
+## Kubernetes (Helm) rolling upgrades
+
+A `helm upgrade` that changes `image.tag` triggers a **StatefulSet RollingUpdate**: the
+controller deletes and recreates pods one at a time, highest ordinal first, gated by the
+readiness probe + `minReadySeconds` (see `deploy/SCALING.md` for why the readiness gate --
+NOT the PodDisruptionBudget -- is what paces the roll). **The native rollout has no
+failover-before-drain hook**, so what an image bump costs a slot-owner depends entirely on
+whether that slot has an in-sync replica.
+
+### Case A -- the default chart (no per-slot replicas)
+
+Out of the box the chart's static topology assigns each of the `replicas` nodes a slot range
+as its **sole owner, with no replica** (`cluster.minReplicasToWrite: 0`; replicas are a
+runtime-only, opt-in thing -- Case B). So there is **nothing to fail over to**: when the
+rollout deletes a primary pod, its slots are **unavailable for the duration of that pod's
+graceful restart** -- SIGTERM save-on-exit, pod recreated with the new image, snapshot +
+raft-log reload from the **retained** PVC, then `/readyz` passes.
+
+- **RPO = 0.** The save-on-exit persists the working set and the PVC is retained across the
+  pod recreate (`persistentVolumeClaimRetentionPolicy`), so the node reloads exactly what it
+  had. No data is lost.
+- **Availability: a per-node gap.** Each node's slots are down for its restart window. The
+  readiness gate + one-at-a-time ordinal serialization confine it to one node at a time; size
+  `startupProbe.failureThreshold * periodSeconds` and `terminationGracePeriodSeconds` to your
+  worst-case reload so a healthy node is not CrashLooped or SIGKILLed mid-save.
+
+This is **safe** (no data loss) but **not zero-downtime** for the slots on the pod being
+rolled. For many caches that is acceptable; if it is not, use Case B.
+
+### Case B -- a replicated (HA) cluster
+
+If you have assigned in-sync replicas (`CLUSTER REPLICATE <node-id> <slot>...` puts a replica
+of a slot on another node -- see [HA cluster](#ha-cluster-rolling-upgrade)), a slot can fail
+over instead of going dark. But note **how** it fails over under a bare `helm upgrade`:
+
+- **Bare rollout = UNPLANNED failover.** Deleting a primary pod is an ungraceful owner loss
+  from the cluster's view: an in-sync replica self-proposes promotion only after
+  `failover_timeout_secs` of continuous downtime (default 5 s), so those slots see a brief
+  write-rejection blip + the down-timeout window. RPO is bounded by the replica's lag
+  (`replica_max_lag`, default 256) and is 0 for the graceful save-on-exit case, but the blip
+  is client-visible.
+- **Controlled failover = no blip, RPO = 0.** The `CLUSTER FAILOVER` fence moves ownership to
+  a caught-up replica *before* the old primary is touched, with no down-timeout window. That
+  is exactly what the `ironcache upgrade --cluster` driver orchestrates (pause writes -> drain
+  the candidate to lag 0 -> `CLUSTER FAILOVER` -> commit; fail-closed on drain timeout). See
+  [HA cluster rolling upgrade](#ha-cluster-rolling-upgrade).
+
+**The gap on Kubernetes:** the native StatefulSet rollout does not invoke the controlled
+fence, and the chart's `preStop` is a **lame-duck sleep only** (it deprograms the Service
+endpoint; it does not fail over slots). A pod's `preStop` also *cannot* safely run the fence
+itself: there is no self-failover command -- a controlled handoff has to identify the Raft
+leader, poll a candidate's lag to 0 cluster-wide, and `CLUSTER FAILOVER` the *candidate*, none
+of which a single terminating node can drive within its grace window. So for a zero-downtime
+upgrade of a replicated cluster you must run the controlled failover **out of band**:
+
+1. Before touching a primary, move its ownership to an upgraded, in-sync replica with the
+   `ironcache upgrade --cluster` driver or the [manual](#3-promote-a-replica-then-upgrade-the-old-owner)
+   `CLUSTER FAILOVER` sequence. On Kubernetes this means driving the roll from the driver
+   (e.g. an `--actuator-command` that recreates each pod in order) rather than a bare
+   `helm upgrade`, or performing the failover by hand and then letting the rollout proceed.
+2. Automating failover-before-drain on *every* pod deletion (so a bare `helm upgrade` becomes
+   safe) requires a controller reconciling cluster state -- it is out of scope for a
+   declarative chart and is part of the planned operator (see `deploy/K8S_READINESS_PLAN.md`).
+
+### RPO knob
+
+`cluster.minReplicasToWrite` (`min_replicas_to_write`) is 0 by default, so a write is
+acknowledged without waiting for any replica. With the default no-replica topology (Case A)
+it MUST stay 0 -- `>= 1` would fail every write `-NOREPLICAS`. Once you have assigned runtime
+replicas (Case B), raising it to `>= 1` makes an acknowledged write survive that many node
+losses (bounding RPO under an ungraceful failover), at a write-latency cost.
 
 ---
 
