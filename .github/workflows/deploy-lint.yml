@@ -71,7 +71,10 @@ jobs:
           # port (16379 = clientPort+10000) is deliberate and cannot go stale if the values.yaml
           # DEFAULT clientPort ever changes.
           np_set="--set networkPolicy.enabled=true --set cluster.enabled=true --set replicas=3 --set service.clientPort=6379"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set"; do
+          # The k3s overlay is a real values file; render THROUGH it so a schema violation or
+          # a bad key in values-k3s.yaml fails CI (helm auto-validates -f files against the schema).
+          k3s_set="-f deploy/helm/ironcache/values-k3s.yaml"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
@@ -104,6 +107,15 @@ jobs:
                   || { echo "ERROR: networkPolicy.enabled=true rendered no NetworkPolicy"; exit 1; }
                 printf '%s\n' "$rendered" | grep -q "port: 16379" \
                   || { echo "ERROR: NetworkPolicy missing the cluster-bus (client+10000) rule"; exit 1; }
+                ;;
+              *values-k3s.yaml*)
+                # The k3s overlay is the single-node standalone posture: no PDB (replicas=1
+                # gate) and exactly one replica. Guards the edge posture from silent regression.
+                if printf '%s\n' "$rendered" | grep -q "kind: PodDisruptionBudget"; then
+                  echo "ERROR: k3s overlay rendered a PDB (expected none at replicas=1)"; exit 1
+                fi
+                printf '%s\n' "$rendered" | grep -qE "^  replicas: 1$" \
+                  || { echo "ERROR: k3s overlay did not render replicas: 1"; exit 1; }
                 ;;
             esac
             echo "::endgroup::"

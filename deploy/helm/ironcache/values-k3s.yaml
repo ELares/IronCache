@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# k3s / edge / single-node overlay for the IronCache chart.
+#   helm install ic deploy/helm/ironcache -f deploy/helm/ironcache/values-k3s.yaml
+#
+# Targets the common k3s posture: ONE node, the local-path provisioner, a small
+# (often ARM) box. See deploy/K3S.md for the full guidance behind each choice.
+# The chart is already largely k3s-friendly (RWO PVCs, soft anti-affinity default,
+# CPU-quota-aware shard sizing, multi-arch amd64+arm64 distroless images,
+# CRD-gated ServiceMonitor); this overlay just sets the edge-appropriate defaults.
+
+# Single STANDALONE node. Do NOT run a 1-node "cluster" (triples memory, zero fault
+# tolerance) and do NOT run replicas: 2 (no quorum majority). For a real HA k3s
+# cluster use >= 3 nodes with cluster.enabled: true and a non-local-path StorageClass.
+replicas: 1
+cluster:
+  enabled: false
+
+persistence:
+  enabled: true
+  # k3s's default provisioner. Empty ("") also auto-selects it, but pin it explicitly
+  # so the intent is clear. CAVEATS (see K3S.md): local-path is hostPath-backed and
+  # NODE-LOCAL -- a pod rescheduled to another node CANNOT reattach this PVC, and
+  # local-path does NOT support volume expansion (you cannot grow it, only recreate).
+  # For durable multi-node storage point this at Longhorn or an external CSI instead.
+  storageClassName: "local-path"
+  # Smaller default for an edge box; raise for your dataset. It cannot be expanded
+  # later on local-path, so size with headroom.
+  size: 5Gi
+  # save-on-exit + adequate grace is the ONLY thing between a drain and data loss on a
+  # single node (no peer to re-replicate from), so keep a save policy on.
+  saveIntervalSecs: 900
+  saveMinChanges: 1
+
+# Pi-class footprint. The default 500m/512Mi requests are heavy for small nodes.
+# The MEMORY LIMIT is load-bearing: maxmemory auto-derives from it (~70%) so the
+# cache EVICTS (allkeys-lru) instead of OOMKilling itself and its co-tenants on a
+# shared edge node -- the single most important guard on k3s. Tune to your box.
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    # No CPU limit (shards auto-size to the CFS quota if k3s imposes one). Keep a
+    # memory limit so the OOM guard fires.
+    memory: "1Gi"
+
+# RESP is an L4 protocol; a Traefik HTTP Ingress does NOT front the cache. ClusterIP
+# is correct for in-cluster clients. For EXTERNAL RESP use a Traefik IngressRouteTCP
+# (needs the Traefik CRD -- absent under `k3s --disable traefik`), a NodePort, or the
+# built-in servicelb (klipper) LoadBalancer. A single LB is NOT Raft-cluster-aware
+# (nodes answer MOVED for un-owned slots), but that is moot here at replicas: 1.
+service:
+  type: ClusterIP
+
+# The Prometheus Operator CRD is usually absent on k3s, so leave ServiceMonitor off
+# (this is already the chart default; restated for clarity).
+metrics:
+  serviceMonitor:
+    enabled: false
+
+# NOTE (not a value): on k3s's default flannel CNI, NetworkPolicy is NOT enforced
+# (fails open) -- networkPolicy.enabled is inert unless you run Calico/Cilium or the
+# kube-router policy controller. Left at the chart default (off).
+#
+# NOTE (air-gapped): pre-load THREE images (pullPolicy stays IfNotPresent by default):
+#   ghcr.io/elares/ironcache, busybox:1.36 (the easy-to-miss init dependency), and
+#   optionally ghcr.io/elares/ironcache-console. Import with `k3s ctr images import`
+#   or drop tarballs in /var/lib/rancher/k3s/agent/images/.
+#
+# NOTE (backup is MANDATORY here): local-path PVC/node loss = TOTAL data loss (no peer
+# to re-replicate from). Set up an off-node backup before you store anything you care
+# about -- see deploy/BACKUP.md.
