@@ -467,21 +467,26 @@ pub fn decode_save_reply(value: &Value) -> Option<SaveReply> {
     }
 }
 
-/// Build the `__ICSAVE <save_unix_secs> <shard_index> <dir> [base_epoch delta_epoch]` request for
-/// one shard (#676). A BASE save emits the 4-arg form (byte-identical to the pre-delta request, so
-/// the default path is unchanged); a DELTA save APPENDS `base_epoch` + `delta_epoch` (arg[4]/arg[5]),
-/// whose PRESENCE is how [`crate::coordinator::save_shard_local`] recognizes a delta save.
+/// Build the `__ICSAVE <save_unix_secs> <shard_index> <dir> <paced> [base_epoch delta_epoch]` request
+/// for one shard (#676). `paced` (arg[4], `1`/`0`) is the #676 persist-read PACE flag: `1` for a
+/// background SAVE/BGSAVE (the read is paced by `save-backpressure-percent` to spare datapath
+/// bandwidth), `0` for a LATENCY-CRITICAL save (shutdown save-on-exit, upgrade handoff) that must run
+/// at full speed. A DELTA save APPENDS `base_epoch` + `delta_epoch` (arg[5]/arg[6]), whose PRESENCE
+/// is how [`crate::coordinator::save_shard_local`] recognizes a delta save. `__ICSAVE` is an
+/// intra-node fan-out (never persisted, never cross-version), so this arg shape is free to evolve.
 fn icsave_request(
     save_unix_secs: u64,
     shard: usize,
     dir: &std::path::Path,
     mode: ironcache_persist::SaveMode,
+    paced: bool,
 ) -> Request {
     let mut args = vec![
         bytes::Bytes::from_static(ICSAVE),
         bytes::Bytes::from(save_unix_secs.to_string()),
         bytes::Bytes::from(shard.to_string()),
         bytes::Bytes::copy_from_slice(dir.to_string_lossy().as_bytes()),
+        bytes::Bytes::from_static(if paced { b"1" } else { b"0" }),
     ];
     if let ironcache_persist::SaveMode::Delta {
         base_epoch,
@@ -521,12 +526,13 @@ pub async fn do_save_all(
     home: ShardId,
     db: u32,
     save_unix_secs: u64,
+    paced: bool,
 ) -> Result<(), String> {
     // Record the save OUTCOME so INFO `rdb_last_bgsave_status` is honest (#549): the success path
     // stamps OK inside `record_committed`; every FAILURE arm funnels through this ONE place, so a
     // failed save flips the status to `err` regardless of which arm failed (dir create, a shard
     // error, or the manifest write).
-    let outcome = save_all_attempt(persist, inbox, ctx, home, db, save_unix_secs).await;
+    let outcome = save_all_attempt(persist, inbox, ctx, home, db, save_unix_secs, paced).await;
     if outcome.is_err() {
         persist.record_save_failed();
     }
@@ -543,9 +549,21 @@ async fn save_all_attempt(
     home: ShardId,
     db: u32,
     save_unix_secs: u64,
+    paced: bool,
 ) -> Result<(), String> {
     let dir = persist.dir.clone();
-    save_all_to_dir(persist, inbox, ctx, home, db, save_unix_secs, &dir, true).await
+    save_all_to_dir(
+        persist,
+        inbox,
+        ctx,
+        home,
+        db,
+        save_unix_secs,
+        &dir,
+        true,
+        paced,
+    )
+    .await
 }
 
 /// The dir-generic cross-shard SAVE: fan an `__ICSAVE` out to EVERY shard (each dumps its OWN
@@ -632,6 +650,7 @@ async fn save_all_to_dir(
     save_unix_secs: u64,
     dir: &Path,
     durable: bool,
+    paced: bool,
 ) -> Result<(), String> {
     let n_shards = inbox.len();
     // Ensure the target directory exists (idempotent; a create failure fails the save cleanly).
@@ -659,7 +678,12 @@ async fn save_all_to_dir(
     // One `__ICSAVE` sub-request per shard, each carrying its own shard index + the whole-save mode
     // (a delta appends base_epoch/delta_epoch so every shard appends the SAME chain position).
     let subreqs: Vec<(usize, Request)> = (0..n_shards)
-        .map(|shard| (shard, icsave_request(save_unix_secs, shard, dir, mode)))
+        .map(|shard| {
+            (
+                shard,
+                icsave_request(save_unix_secs, shard, dir, mode, paced),
+            )
+        })
         .collect();
     // Fan out via the SAVE-specific fan-out (#571): the home shard's own dump runs INLINE on the
     // YIELDING `run_local_save` (awaits between snapshot chunks), which a synchronous `fan_out_split`
@@ -776,8 +800,20 @@ pub async fn do_handoff_save_all(
             // from a clean tmpfs dir (a leftover file the new manifest does not reference is ignored
             // on load, but clearing it keeps /dev/shm tidy and bounds the RAM footprint).
             let _ = std::fs::remove_dir_all(&dir);
-            let outcome =
-                save_all_to_dir(persist, inbox, ctx, home, db, save_unix_secs, &dir, false).await;
+            // #676: the handoff save is NOT paced (last `false`). Its whole purpose is to MINIMIZE the
+            // upgrade cutover window; pacing would stretch it ~100/pct, so it runs at full speed.
+            let outcome = save_all_to_dir(
+                persist,
+                inbox,
+                ctx,
+                home,
+                db,
+                save_unix_secs,
+                &dir,
+                false,
+                false,
+            )
+            .await;
             if outcome.is_err() {
                 persist.record_save_failed();
             }
@@ -789,8 +825,9 @@ pub async fn do_handoff_save_all(
                 "ironcache upgrade: staging the handoff snapshot on the durable data_dir (tmpfs \
                  unavailable, non-Linux, or the RAM-headroom guard declined tmpfs)"
             );
-            // The durable fallback IS a normal committed data_dir save.
-            do_save_all(persist, inbox, ctx, home, db, save_unix_secs).await
+            // The durable fallback IS a normal committed data_dir save, but still a HANDOFF: not
+            // paced (`false`), so the cutover window is not stretched by `save-backpressure-percent`.
+            do_save_all(persist, inbox, ctx, home, db, save_unix_secs, false).await
         }
     }
 }
@@ -925,7 +962,10 @@ pub async fn do_save_all_bounded(
     let rt = ironcache_runtime::TokioRuntime::new();
     tokio::select! {
         biased;
-        result = do_save_all(persist, inbox, ctx, home, db, save_unix_secs) => result,
+        // #676: the EXIT save is NOT paced (`paced=false`). It runs against this 5s bound and there is
+        // no live datapath left to protect, so a low `save-backpressure-percent` must NOT stretch it
+        // past the budget (that would abandon the save-on-exit and lose writes since the last commit).
+        result = do_save_all(persist, inbox, ctx, home, db, save_unix_secs, false) => result,
         () = rt.timer(timeout) => {
             // The timeout cancels the in-flight `do_save_all` (its own failure-recording never runs),
             // so record the failed outcome here so INFO `rdb_last_bgsave_status` reports `err` (#549).

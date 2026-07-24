@@ -1533,15 +1533,23 @@ const _: fn() = || {
 /// save) is ignored by load. `now` is read from THIS shard's Env clock (ADR-0003, the lazy-expiry
 /// basis); the save produces NO counter deltas.
 ///
-/// ## Save-backpressure throttle (#578): now INERT for the tail (the copy it throttled is gone)
+/// ## Save-backpressure throttle (#577/#676): re-targeted to pace the persist READ
 ///
-/// The `save-backpressure-percent` knob stays settable (CONFIG), but the freeze-based save does NO
-/// serving-side copy loop for it to throttle, so it no longer paces the datapath -- consistent with the
-/// #576 finding that throttling only STRETCHED (never bounded) the during-save tail. It is not read
-/// here.
-/// The parsed `__ICSAVE` request (#676): the shard index, the target snapshot dir, and the DELTA mode
-/// (`Some((base_epoch, delta_epoch))` for a delta save, `None` for a base save).
-type IcsaveParsed = (u32, std::path::PathBuf, Option<(u64, u64)>);
+/// The `save-backpressure-percent` knob (default 100 = off, byte-identical) now paces the BASE
+/// save's persist-thread READ, not the (removed) serving-side copy. MEASURED root cause on c7g: the
+/// base save's full-keyspace read+encode saturates shared DRAM bandwidth and STARVES the all-cores
+/// serving datapath (the during-save p99.9) -- ablation ruled out COW / slot-size / queueing. Below
+/// 100, [`encode_shard_save`] sleeps proportionally after each ~1 MiB encode chunk
+/// ([`ironcache_runtime::ChunkPacer`], `sleep = chunk_time * (100 - pct) / pct`, capped) so the read
+/// holds a ~pct% duty cycle and leaves bandwidth for serving. The earlier "throttle made it worse"
+/// finding was the OLD site (the serving copy at a 3s cadence); pacing the persist read at a
+/// realistic cadence (cadence >> stretched duration) is the lever. Read LIVE per chunk, base arm
+/// only (deltas read only the dirty fraction, not bandwidth-bound).
+/// The parsed `__ICSAVE` request (#676): the shard index, the target snapshot dir, the DELTA mode
+/// (`Some((base_epoch, delta_epoch))` for a delta save, `None` for a base save), and the PACE flag
+/// (`true` = a background save whose base-read is paced by `save-backpressure-percent`; `false` = a
+/// latency-critical shutdown/handoff save that runs at full speed).
+type IcsaveParsed = (u32, std::path::PathBuf, Option<(u64, u64)>, bool);
 
 /// Parse `__ICSAVE <save_unix_secs> <shard_index> <dir> [base_epoch delta_epoch]` (#676) into the
 /// shard index, the target dir, and the DELTA mode (the trailing epochs; their PRESENCE marks a delta
@@ -1571,9 +1579,16 @@ fn parse_icsave(request: &Request) -> Result<IcsaveParsed, Value> {
     #[allow(clippy::cast_possible_truncation)]
     let shard_index = shard_index as u32;
     let dir = std::path::PathBuf::from(String::from_utf8_lossy(dir_arg).into_owned());
-    // A DELTA save appends `base_epoch` (arg[4]) + `delta_epoch` (arg[5]); their ABSENCE is a BASE
-    // save (the default / pre-delta shape). Both-or-neither: a lone/unparseable epoch is malformed.
-    let delta_mode = match (request.args.get(4), request.args.get(5)) {
+    // arg[4] = the #676 PACE flag (`1`/`0`): `1` = a background SAVE/BGSAVE whose persist read is paced
+    // by `save-backpressure-percent`; `0` = a latency-critical save (shutdown/handoff) that runs at
+    // full speed. Always present in the current request shape.
+    let Some(paced_arg) = request.args.get(4) else {
+        return malformed("malformed __ICSAVE (missing pace flag)");
+    };
+    let paced = paced_arg.as_ref() == b"1";
+    // A DELTA save appends `base_epoch` (arg[5]) + `delta_epoch` (arg[6]); their ABSENCE is a BASE
+    // save. Both-or-neither: a lone/unparseable epoch is malformed.
+    let delta_mode = match (request.args.get(5), request.args.get(6)) {
         (Some(be), Some(de)) => {
             let (Some(base_epoch), Some(delta_epoch)) = (parse_u64(be), parse_u64(de)) else {
                 return malformed("malformed __ICSAVE delta epochs");
@@ -1583,7 +1598,7 @@ fn parse_icsave(request: &Request) -> Result<IcsaveParsed, Value> {
         (None, None) => None,
         _ => return malformed("malformed __ICSAVE delta args"),
     };
-    Ok((shard_index, dir, delta_mode))
+    Ok((shard_index, dir, delta_mode, paced))
 }
 
 /// Encode + atomically write ONE shard's save file for the decided mode (#676): the whole frozen
@@ -1591,6 +1606,14 @@ fn parse_icsave(request: &Request) -> Result<IcsaveParsed, Value> {
 /// value or a TOMBSTONE) as a DELTA `dump-shard-<n>-delta-<epoch>.icsd`. Returns the manifest reply the
 /// home core collects. Runs ON the persist thread (the caller wraps it in `catch_unwind`); touches
 /// only the frozen `Arc`s + the filesystem.
+/// Pacer chunk size (#676): the base-save read is paced after every ~1 MiB of encoded body. Small
+/// enough that a low `save-backpressure-percent` keeps a fine-grained duty cycle (the datapath sees
+/// frequent short bandwidth gaps, not one long burst); large enough that the per-chunk overhead is
+/// negligible against ~1 MiB of encode work. At the default (pct=100, or an unpaced save) the per-chunk
+/// callback is a true no-op -- one branch, NO clock read and NO sleep -- so the read runs full speed.
+const PACE_CHUNK_BYTES: usize = 1 << 20;
+
+#[allow(clippy::too_many_arguments)]
 fn encode_shard_save(
     delta_mode: Option<(u64, u64)>,
     frozen: &[ironcache_store::FrozenSlot],
@@ -1598,10 +1621,33 @@ fn encode_shard_save(
     shard_index: u32,
     now: UnixMillis,
     dir: &std::path::Path,
+    pace_cfg: &ironcache_config::RuntimeConfig,
+    paced: bool,
 ) -> std::io::Result<crate::persist::SaveReply> {
     match delta_mode {
         None => {
-            let dump = ironcache_persist::dump_frozen_slots(frozen, shard_index, now);
+            // BASE save: pace the full-keyspace read so it leaves DRAM-bandwidth headroom for the
+            // serving datapath (#676). Only a BACKGROUND save (`paced`) reads the live
+            // `save-backpressure-percent` knob per chunk (its documented contract, so a `CONFIG SET`
+            // mid-save applies; `100` default is a true no-op -> byte-identical). A LATENCY-CRITICAL
+            // save (shutdown save-on-exit / upgrade handoff, `paced == false`) pins pct=100 so the
+            // pacer never sleeps -- shutdown must fit its budget and a handoff must not stretch the
+            // cutover window. The DELTA arm is NEVER paced (it reads only the dirty fraction).
+            let mut chunk_pacer = ironcache_runtime::ChunkPacer::new();
+            let dump = ironcache_persist::dump_frozen_slots_paced(
+                frozen,
+                shard_index,
+                now,
+                PACE_CHUNK_BYTES,
+                || {
+                    let pct = if paced {
+                        pace_cfg.save_backpressure_percent()
+                    } else {
+                        100
+                    };
+                    chunk_pacer.pace(pct);
+                },
+            );
             ironcache_persist::write_shard_dump(&dump, shard_index, dir)
                 .map(crate::persist::SaveReply::Base)
         }
@@ -1620,8 +1666,10 @@ fn encode_shard_save(
     }
 }
 
+// Freeze + epoch-cut + dirty drain + persist-thread spawn + await, one cohesive save routine.
+#[allow(clippy::too_many_lines)]
 async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
-    let (shard_index, dir, delta_mode) = match parse_icsave(request) {
+    let (shard_index, dir, delta_mode, paced) = match parse_icsave(request) {
         Ok(parsed) => parsed,
         Err(e) => return e,
     };
@@ -1696,6 +1744,10 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     // closure so the pin is applied ON the persist thread (affinity is per-thread). Empty = the
     // default no-pin (float, byte-unchanged); a no-op on non-Linux (see `crate::affinity`).
     let persist_cpu_spec = ctx.boot.persist_cpu.clone();
+    // #676: the persist-read pacer reads `save-backpressure-percent` LIVE per chunk off this Arc
+    // (a relaxed load, off the per-command hot path), so a `CONFIG SET` mid-save applies. Cloning
+    // the Arc moves a shared handle into the persist thread; default 100 = the read is never paced.
+    let pace_cfg = ctx.runtime.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("ic-persist-{shard_index}"))
         .spawn(move || {
@@ -1724,6 +1776,8 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
                     shard_index,
                     now,
                     &dir_for_thread,
+                    &pace_cfg,
+                    paced,
                 )
             })) {
                 Ok(r) => r,
@@ -2215,8 +2269,11 @@ fn spawn_periodic_save(
             let Some(_guard) = persist.try_begin_save() else {
                 continue;
             };
-            // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003).
-            let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, 0, now_secs).await;
+            // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003). The
+            // periodic save runs while the server SERVES, so it IS paced (#676, `true`) -- the
+            // background-durability case the persist-read pacer exists to protect.
+            let _ =
+                crate::persist::do_save_all(&persist, &inbox, &ctx, home, 0, now_secs, true).await;
         }
     });
 }
@@ -2773,6 +2830,47 @@ mod tests {
     #[should_panic(expected = "at least one shard")]
     fn build_inboxes_rejects_zero() {
         let _ = build_inboxes(0);
+    }
+
+    #[test]
+    fn parse_icsave_reads_pace_flag_at_arg4_and_delta_epochs_after_it() {
+        let mk = |args: &[&str]| Request {
+            args: args
+                .iter()
+                .map(|a| bytes::Bytes::copy_from_slice(a.as_bytes()))
+                .collect(),
+        };
+        // BASE, PACED (a background SAVE/BGSAVE): 5 args, pace flag `1` at arg[4], no epochs.
+        let Ok((shard, dir, mode, paced)) =
+            parse_icsave(&mk(&["__ICSAVE", "1700000000", "3", "/tmp/x", "1"]))
+        else {
+            panic!("base paced should parse");
+        };
+        assert_eq!(shard, 3);
+        assert_eq!(dir, std::path::PathBuf::from("/tmp/x"));
+        assert_eq!(mode, None);
+        assert!(paced, "arg[4]=1 -> paced");
+
+        // BASE, UNPACED (shutdown / handoff): pace flag `0`.
+        let Ok((_, _, mode, paced)) = parse_icsave(&mk(&["__ICSAVE", "1", "0", "/d", "0"])) else {
+            panic!("base unpaced should parse");
+        };
+        assert_eq!(mode, None);
+        assert!(!paced, "arg[4]=0 -> unpaced");
+
+        // DELTA: base_epoch/delta_epoch live at arg[5]/arg[6], AFTER the pace flag.
+        let Ok((_, _, mode, paced)) =
+            parse_icsave(&mk(&["__ICSAVE", "1", "2", "/d", "1", "7", "9"]))
+        else {
+            panic!("delta should parse");
+        };
+        assert_eq!(mode, Some((7, 9)), "epochs read from arg[5]/arg[6]");
+        assert!(paced);
+
+        // Missing pace flag (the old 4-arg shape) is now malformed -- guards the arity change.
+        assert!(parse_icsave(&mk(&["__ICSAVE", "1", "2", "/d"])).is_err());
+        // A lone epoch (arg[5] without arg[6]) is malformed.
+        assert!(parse_icsave(&mk(&["__ICSAVE", "1", "2", "/d", "1", "7"])).is_err());
     }
 }
 
