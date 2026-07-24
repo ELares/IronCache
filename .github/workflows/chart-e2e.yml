@@ -54,6 +54,46 @@ jobs:
           # even though the PING passed. The Diagnostics-on-failure step below dumps logs when a
           # real failure leaves the Pod in place (hook-succeeded does not delete a FAILED Pod).
           helm test ic -n ic-test
+      - name: Upgrade + re-test (the rolling-update path)
+        run: |
+          set -euo pipefail
+          # P2-3's other half: a chart can lint clean and INSTALL fine yet fail to UPGRADE. Change
+          # values that hit BOTH roll mechanisms, so this is a real rolling update (readiness gate
+          # + minReadySeconds + the preStop lame-duck), not a no-op re-apply:
+          #   - extraConfig  -> rewrites the ConfigMap, flipping the `checksum/config` annotation
+          #                     (the chart's own config-change-rolls-pods mechanism), AND proves
+          #                     the node still BOOTS on the re-rendered TOML (the parse is strict);
+          #   - logLevel     -> changes a container arg directly in the pod template.
+          helm upgrade ic deploy/helm/ironcache -n ic-test \
+            --set replicas=1 --set cluster.enabled=false \
+            --set logLevel=debug --set extraConfig='timeout = 30' \
+            --wait --timeout 5m
+          kubectl -n ic-test rollout status statefulset/ic-ironcache --timeout=5m
+          # The node must still serve RESP after the roll.
+          helm test ic -n ic-test
+          echo "OK: upgrade rolled the pod and the cache still answers PING"
+      - name: Cluster-secret preserved across a bare `helm upgrade` (#747)
+        run: |
+          set -euo pipefail
+          # Regression gate for #747, and the ONLY place it can run: the guard is a `lookup` of the
+          # live Secret, which is always empty under `helm template`/--dry-run, so deploy-lint can
+          # never exercise this branch. A kind cluster can. Before #747 a bare upgrade regenerated
+          # the random cluster_secret -> peers reject each other -> split-brain.
+          kubectl create namespace ic-sec
+          # No --wait: this asserts a TEMPLATE/lookup invariant, not pod readiness (a 1-node raft
+          # node need not become Ready for the Secret to exist), which also keeps the job fast.
+          helm install ics deploy/helm/ironcache -n ic-sec \
+            --set replicas=1 --set cluster.enabled=true
+          before="$(kubectl -n ic-sec get secret ics-ironcache-secret -o jsonpath='{.data.cluster_secret}')"
+          [ -n "$before" ] || { echo "ERROR: no cluster_secret was generated on install"; exit 1; }
+          helm upgrade ics deploy/helm/ironcache -n ic-sec \
+            --set replicas=1 --set cluster.enabled=true
+          after="$(kubectl -n ic-sec get secret ics-ironcache-secret -o jsonpath='{.data.cluster_secret}')"
+          if [ "$before" != "$after" ]; then
+            echo "ERROR: cluster_secret ROTATED across a bare helm upgrade -- this splits a live cluster (#747 regressed)"
+            exit 1
+          fi
+          echo "OK: cluster_secret preserved across helm upgrade (lookup branch verified live)"
       - name: Diagnostics on failure
         if: failure()
         run: |
@@ -61,3 +101,6 @@ jobs:
           kubectl -n ic-test describe pod -l app.kubernetes.io/instance=ic || true
           kubectl -n ic-test logs -l app.kubernetes.io/instance=ic --tail=200 || true
           kubectl -n ic-test get events --sort-by=.lastTimestamp || true
+          # The cluster-secret namespace (only exists once that step has started).
+          kubectl -n ic-sec get all,secret 2>/dev/null || true
+          kubectl -n ic-sec get events --sort-by=.lastTimestamp 2>/dev/null || true
