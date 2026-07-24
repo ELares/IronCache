@@ -100,10 +100,7 @@ pub(crate) async fn handle_persist_command(
                 crate::persist::do_handoff_save_all(persist, inbox, ctx, home, conn.db, now_secs)
                     .await
             } else {
-                // #676: a foreground SAVE while the server is serving IS paced (`true`) -- this is the
-                // background-durability case the persist-read pacer exists to protect.
-                crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs, true)
-                    .await
+                crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await
             };
             match result {
                 Ok(()) => encode_into(out, &Value::ok(), conn.proto),
@@ -132,11 +129,8 @@ pub(crate) async fn handle_persist_command(
                 let rt = ironcache_runtime::TokioRuntime::new();
                 rt.spawn_on_shard(async move {
                     let _guard = guard; // dropped on task completion or cancellation -> releases.
-                    // #676: a background BGSAVE IS paced (`true`).
-                    let _ = crate::persist::do_save_all(
-                        &persist, &inbox, &ctx, home, db, now_secs, true,
-                    )
-                    .await;
+                    let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, db, now_secs)
+                        .await;
                 });
             }
             // Whether we won the latch or a save was already running, the Redis-faithful reply is

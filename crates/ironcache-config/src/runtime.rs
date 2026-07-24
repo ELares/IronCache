@@ -138,16 +138,15 @@ pub struct RuntimeConfig {
     /// ring drops the oldest past it). Runtime-settable via `CONFIG SET slowlog-max-len`. Seeded
     /// from [`crate::DEFAULT_SLOWLOG_MAX_LEN`].
     slowlog_max_len: AtomicU64,
-    /// The SAVE BACKPRESSURE percent (#577/#676, the concurrent-snapshot p99.9 lever): the fraction
-    /// of wall-time the BASE save's persist-thread READ is allowed to consume, in `1..=100`. `100`
-    /// (the default) means NO throttle -- the read runs at full speed, so the default deployment is
-    /// byte-identical. A value below 100 makes the persist read sleep proportionally after each
-    /// ~1 MiB encode chunk (`sleep = chunk_time * (100 - pct) / pct`, via the Runtime timer seam) so
-    /// the base save's full-keyspace read uses only about `pct`% of the wall-time, leaving DRAM
-    /// bandwidth for the all-cores serving datapath (the measured during-save starvation cause). The
-    /// read reads this LIVE per chunk (one relaxed load, off the per-command hot path), so a `CONFIG
-    /// SET save-backpressure-percent` takes effect even during an in-flight save. Applies to BASE
-    /// saves only (a delta reads just the dirty fraction, not bandwidth-bound). Node-level cold state
+    /// The SAVE BACKPRESSURE percent (#577, the concurrent-snapshot p99.9 stopgap): the fraction of
+    /// the serving core a `SAVE`/`BGSAVE` is allowed to consume, in `1..=100`. `100` (the default)
+    /// means NO throttle -- the save dumps at full speed exactly as before #577, so the default
+    /// deployment is byte-identical. A value below 100 makes the per-shard save loop sleep
+    /// proportionally after each dump chunk (`sleep = chunk_time * (100 - pct) / pct`, via the
+    /// Runtime timer seam) so the save uses only about `pct`% of the core and the datapath stays
+    /// above the offered load (the open-loop queue drains instead of building). The save loop reads
+    /// this LIVE per chunk (one relaxed load, off the per-command hot path), so a `CONFIG SET
+    /// save-backpressure-percent` takes effect even during an in-flight save. Node-level cold state
     /// seeded from [`crate::DEFAULT_SAVE_BACKPRESSURE_PERCENT`].
     save_backpressure_percent: AtomicU64,
     /// The `notify-keyspace-events` FLAG BITS (PROD-8 keyspace notifications), stored as the

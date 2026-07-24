@@ -941,12 +941,12 @@ pub const DEFAULT_SLOWLOG_LOG_SLOWER_THAN: i64 = 10_000;
 /// Default `slowlog-max-len` (Redis default 128, PROD-7): the maximum SLOWLOG entries retained.
 pub const DEFAULT_SLOWLOG_MAX_LEN: u64 = 128;
 
-/// Default `save-backpressure-percent` (#577/#676, the concurrent-snapshot p99.9 lever). `100` means
-/// NO throttle: the base save's persist read runs at full speed (byte-identical to the pre-throttle
-/// behavior), so the default deployment is unchanged. A value in `1..=100` makes the BASE save's
-/// persist-thread read sleep proportionally after each ~1 MiB encode chunk so it consumes only about
-/// that percent of the wall-time, leaving DRAM bandwidth for the all-cores serving datapath (the
-/// measured during-save starvation cause). Runtime-settable via `CONFIG SET save-backpressure-percent`.
+/// Default `save-backpressure-percent` (#577, the concurrent-snapshot p99.9 stopgap). `100` means
+/// NO throttle: a `SAVE`/`BGSAVE` dumps at full speed (byte-identical to the pre-#577 behavior), so
+/// the default deployment is unchanged. A value in `1..=100` makes the per-shard save loop sleep
+/// proportionally after each dump chunk so the save consumes only about that percent of the serving
+/// core, keeping the datapath throughput above the offered load (the open-loop queue drains instead
+/// of building). Runtime-settable via `CONFIG SET save-backpressure-percent`.
 pub const DEFAULT_SAVE_BACKPRESSURE_PERCENT: u64 = 100;
 
 /// Default HA-8 replication-lag bound (logical writes) for promotion eligibility + the
