@@ -68,7 +68,7 @@ spec:
       {{- end }}
       containers:
         - name: console
-          image: "{{ .Values.console.image.repository }}:{{ .Values.console.image.tag }}"
+          image: "{{ .Values.console.image.repository }}:{{ .Values.console.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.console.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}

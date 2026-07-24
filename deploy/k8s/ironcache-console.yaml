@@ -78,7 +78,8 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: console
-          image: ghcr.io/elares/ironcache-console:latest
+          # Pinned to an immutable release tag (not :latest) -- bump on upgrade.
+          image: ghcr.io/elares/ironcache-console:0.1.0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
