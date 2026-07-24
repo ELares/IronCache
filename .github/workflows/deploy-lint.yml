@@ -67,7 +67,11 @@ jobs:
           # IRONCACHE_CLUSTER_CA_PATH at it, so the Secret must emit cluster.ca (defaulted to the
           # cert). #660 shipped that; this variant guards the regression.
           cluster_tls_set="--set cluster.enabled=true --set clusterTls.enabled=true --set clusterTls.cert=DUMMYCERT --set clusterTls.key=DUMMYKEY"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true"; do
+          # The networkPolicy variant PINS service.clientPort=6379 so the guard's literal bus
+          # port (16379 = clientPort+10000) is deliberate and cannot go stale if the values.yaml
+          # DEFAULT clientPort ever changes.
+          np_set="--set networkPolicy.enabled=true --set cluster.enabled=true --set replicas=3 --set service.clientPort=6379"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
@@ -91,6 +95,15 @@ jobs:
                 # fails at start. Assert the key is present in the rendered Secret.
                 printf '%s\n' "$rendered" | grep -q "cluster.ca:" \
                   || { echo "ERROR: clusterTls.enabled rendered no cluster.ca Secret key"; exit 1; }
+                ;;
+              *networkPolicy.enabled=true*)
+                # Assert the NetworkPolicy actually rendered AND carries the peer-only bus/repl
+                # rule (client+10000 / client+20000). A silently-empty gate would pass kubeconform
+                # (zero NetworkPolicies is valid) while shipping no isolation at all.
+                printf '%s\n' "$rendered" | grep -q "kind: NetworkPolicy" \
+                  || { echo "ERROR: networkPolicy.enabled=true rendered no NetworkPolicy"; exit 1; }
+                printf '%s\n' "$rendered" | grep -q "port: 16379" \
+                  || { echo "ERROR: NetworkPolicy missing the cluster-bus (client+10000) rule"; exit 1; }
                 ;;
             esac
             echo "::endgroup::"
