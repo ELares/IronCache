@@ -74,7 +74,8 @@ jobs:
           # The k3s overlay is a real values file; render THROUGH it so a schema violation or
           # a bad key in values-k3s.yaml fails CI (helm auto-validates -f files against the schema).
           k3s_set="-f deploy/helm/ironcache/values-k3s.yaml"
-          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set"; do
+          gd_set="--set metrics.grafanaDashboard.enabled=true"
+          for extra in "" "--set console.enabled=true --set console.replicas=2" "$cluster_tls_set" "--set topologySpread.enabled=true" "$np_set" "$k3s_set" "$gd_set"; do
             echo "::group::helm template ${extra:-(defaults)}"
             # $extra must WORD-SPLIT into multiple `--set` flags, so it is
             # intentionally unquoted (SC2086 does not apply here).
@@ -116,6 +117,14 @@ jobs:
                 fi
                 printf '%s\n' "$rendered" | grep -qE "^  replicas: 1$" \
                   || { echo "ERROR: k3s overlay did not render replicas: 1"; exit 1; }
+                ;;
+              *grafanaDashboard.enabled=true*)
+                # Assert the dashboard ConfigMap rendered AND carries the sidecar discovery label
+                # (a silently-empty gate would ship no dashboard while kubeconform stays happy).
+                printf '%s\n' "$rendered" | grep -q "ic-ironcache-grafana-dashboard" \
+                  || { echo "ERROR: grafanaDashboard.enabled rendered no dashboard ConfigMap"; exit 1; }
+                printf '%s\n' "$rendered" | grep -qE "grafana_dashboard: \"1\"" \
+                  || { echo "ERROR: dashboard ConfigMap missing the grafana_dashboard sidecar label"; exit 1; }
                 ;;
             esac
             echo "::endgroup::"

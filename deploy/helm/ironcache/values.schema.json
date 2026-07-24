@@ -236,6 +236,28 @@
               "description": "Scrape interval as a Prometheus duration, e.g. 30s."
             }
           }
+        },
+        "grafanaDashboard": {
+          "type": "object",
+          "description": "Auto-provision the Grafana dashboard as a sidecar-discoverable ConfigMap.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render the dashboard ConfigMap (off by default)."
+            },
+            "label": {
+              "type": "string",
+              "description": "The label key the Grafana sidecar watches (default grafana_dashboard)."
+            },
+            "labelValue": {
+              "type": "string",
+              "description": "The label value the Grafana sidecar matches (default \"1\")."
+            },
+            "folder": {
+              "type": "string",
+              "description": "Optional Grafana folder (via the grafana_folder annotation); empty = sidecar default."
+            }
+          }
         }
       }
     },

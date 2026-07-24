@@ -141,6 +141,18 @@ metrics:
   serviceMonitor:
     enabled: false
     interval: 30s
+  # Auto-provision the IronCache Grafana dashboard as a sidecar-discoverable ConfigMap.
+  # The Grafana dashboard sidecar (kube-prometheus-stack / the grafana chart) loads any
+  # ConfigMap carrying `label: labelValue` into Grafana. Requires that sidecar enabled +
+  # watching this namespace. Off by default; the dashboard JSON also ships at
+  # dashboards/ironcache-dashboard.json for a manual import.
+  grafanaDashboard:
+    enabled: false
+    # The label + value the Grafana sidecar watches for (kube-prometheus-stack default).
+    label: grafana_dashboard
+    labelValue: "1"
+    # Optional Grafana folder to file the dashboard under (empty = the sidecar default).
+    folder: ""
 
 # --- NetworkPolicy (cache pods) -----------------------------------------------
 # A NetworkPolicy for the CACHE StatefulSet (distinct from console.networkPolicy).
