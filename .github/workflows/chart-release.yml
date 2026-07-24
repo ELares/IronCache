@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Publish the Helm chart to GHCR as an OCI artifact and keyless-sign it with cosign
+# (Sigstore/Fulcio via GitHub OIDC -- no long-lived keys). The chart VERSION comes from
+# Chart.yaml (independent of the app version), so consumers install a specific, immutable
+# chart release:
+#
+#   helm install ic oci://ghcr.io/elares/charts/ironcache --version <chart-version>
+#   cosign verify ghcr.io/elares/charts/ironcache:<chart-version> \
+#     --certificate-identity-regexp 'https://github.com/ELares/IronCache/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Runs on a `v*` release tag (publishes the current Chart.yaml version) and on manual dispatch.
+# On a pull request it PACKAGES + lints only (validates the release path without publishing).
+name: chart-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "deploy/helm/ironcache/**"
+      - ".github/workflows/chart-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: package + push + sign the chart (GHCR OCI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # push the chart to ghcr.io/<owner>/charts
+      id-token: write # keyless cosign signing via OIDC
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.15.4"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+      - name: helm lint + package
+        id: pkg
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/ironcache
+          helm package deploy/helm/ironcache -d "${RUNNER_TEMP}/chart"
+          tgz="$(ls "${RUNNER_TEMP}/chart"/ironcache-*.tgz)"
+          echo "tgz=${tgz}" >> "$GITHUB_OUTPUT"
+          echo "Packaged: ${tgz}"
+      # Everything below PUBLISHES -- skip it on pull_request (validate the path only).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: helm push + cosign sign (keyless)
+        if: github.event_name != 'pull_request'
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          repo="ghcr.io/${owner_lc}/charts"
+          # helm push reads the docker config credentials set by docker/login-action above.
+          helm push "${{ steps.pkg.outputs.tgz }}" "oci://${repo}" 2>&1 | tee "${RUNNER_TEMP}/push.log"
+          # helm push prints `Digest: sha256:...`; sign the immutable by-digest ref so the
+          # signature binds the exact bytes, not a mutable tag.
+          digest="$(grep -oE 'sha256:[a-f0-9]{64}' "${RUNNER_TEMP}/push.log" | head -1)"
+          [ -n "$digest" ] || { echo "ERROR: could not parse the pushed digest"; exit 1; }
+          echo "Signing ${repo}/ironcache@${digest}"
+          cosign sign --yes "${repo}/ironcache@${digest}"

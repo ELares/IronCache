@@ -24,10 +24,23 @@ chart-local summary.
 - Optionally (`console.enabled=true`) a separate STATELESS console Deployment
   with its own Service, PDB, and an egress-allowlisting NetworkPolicy.
 
-## Install (from a git checkout)
+## Install
 
-The chart is NOT published to any Helm registry; installing from a repo checkout
-is the supported path:
+### From the GHCR OCI registry (published + cosign-signed)
+
+Each release is packaged and pushed to GHCR as an OCI artifact and keyless-signed
+with cosign (Sigstore/Fulcio via GitHub OIDC):
+
+```sh
+helm install ironcache oci://ghcr.io/elares/charts/ironcache --version 0.3.0
+
+# (optional) verify the signature before installing:
+cosign verify ghcr.io/elares/charts/ironcache:0.3.0 \
+  --certificate-identity-regexp 'https://github.com/ELares/IronCache/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+### From a git checkout
 
 ```sh
 git clone https://github.com/ELares/IronCache
@@ -35,9 +48,9 @@ cd IronCache
 helm install ironcache deploy/helm/ironcache
 ```
 
-Upgrades are `helm upgrade ironcache deploy/helm/ironcache` from a newer
-checkout. `NOTES.txt` prints the endpoints and loud warnings (auto-generated
-cluster secret, auth off, cleartext bus without `clusterTls`) after install.
+Upgrades are `helm upgrade ironcache <chart-ref>` with a newer `--version` (OCI) or
+checkout. `NOTES.txt` prints the endpoints and loud warnings (auto-generated cluster
+secret, auth off, cleartext bus without `clusterTls`) after install.
 
 ## Key values
 
