@@ -18,6 +18,11 @@ Quick checks:
 {{- if .Values.cluster.enabled }}
 
 Raft cluster mode is ON ({{ int .Values.replicas }} nodes, 16384 slots split evenly).
+
+IMPORTANT -- scaling: do NOT resize this cluster with `kubectl scale`, HPA, or a bare
+`helm upgrade --set replicas=N`. Slot ownership is static at bootstrap and membership is
+a Raft quorum, so a blunt replica change orphans slots or splits the quorum. Read the
+runbook (drain/decommission + reshard procedures) before resizing: deploy/SCALING.md.
 {{- if not .Values.clusterSecret.existingSecret }}
 {{- if not .Values.clusterSecret.value }}
 
