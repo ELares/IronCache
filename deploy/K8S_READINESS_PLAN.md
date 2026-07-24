@@ -29,7 +29,7 @@ Bottom line: **the data-plane and cluster mechanisms are production-grade; the g
 
 ---
 
-## 1a. Implementation status (P0 + P1 COMPLETE)
+## 1a. Implementation status (P0 + P1 + P2 COMPLETE)
 
 The P0 and the full P1 tier below have SHIPPED. The inline `MISSING`/`PARTIAL` markers in the
 tables that follow describe the pre-work baseline and are kept for context; this block is the
@@ -53,9 +53,16 @@ polish and the day-2-scaling Operator remain.
   REBALANCE APPLY` IS implemented (arms the slot copies) -- only the auto ownership-flip is the
   tracked follow-up; scale-in remains manual per-slot because APPLY spreads evenly and cannot
   drain a node.
-- **Remaining (P2 polish, non-blocking):** `values.schema.json`, `helm test` + `ct` on kind/k3d,
-  OCI chart publish + sign, `appVersion`/`image.tag` off `latest`, Grafana auto-provision, and a
-  k3s values overlay (local-path / ARM / Traefik / servicelb / air-gapped).
+- **P2 packaging polish (SHIPPED, 6/6):** `appVersion`/`image.tag` pinned off `latest` (#755);
+  `values.schema.json` typed values + fail-early invariants (#756); the `values-k3s.yaml` overlay
+  + `K3S.md` (local-path / ARM / Traefik / servicelb / air-gapped) (#757); Grafana dashboard
+  auto-provision as a sidecar ConfigMap (#758); `helm test` connectivity hook + a kind e2e CI gate
+  -- which on its first run caught + fixed a real shipped preStop-gate bug (SleepAction is
+  beta/default-on only from 1.30, not 1.29) (#759); OCI chart publish to GHCR + keyless cosign
+  signing (#760). The chart is now 0.3.0.
+- **Remaining: only the day-2 scaling Operator** (Section 5) -- a deliberate non-goal for now; the
+  chart + the #392 upgrade driver cover fixed-size clusters. The whole P0/P1/P2 line was 18 PRs
+  (#743-760).
 
 ---
 
