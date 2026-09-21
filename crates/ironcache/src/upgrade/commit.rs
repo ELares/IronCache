@@ -964,9 +964,25 @@ mod tests {
     ///   (3) there is no instant where a write is acked by BOTH: the OLD is permanently quiesced from
     ///       the release (`is_shard_loading()` stays true across the flip), and the NEW begins acking
     ///       writes only at the flip, which is STRICTLY after that release.
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[allow(clippy::too_many_lines)]
-    async fn hero_e_client_continuity_across_the_serve_flip() {
+    fn hero_e_client_continuity_across_the_serve_flip() {
+        // THE SHARED GATE LOCK (see `serve_shard_state`): this test mutates the
+        // PROCESS-GLOBAL `SERVING` gate and asserts its exact transitions, so it must not
+        // interleave with ANY other test that flips the same global, in this module or in
+        // the orchestrator suite. The async body is driven on a current-thread runtime so
+        // the lock is held for the whole body.
+        let _guard = crate::serve::SERVING_GATE_TEST_LOCK.blocking_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(hero_e_client_continuity_inner())
+    }
+
+    /// The body of [`hero_e_client_continuity_across_the_serve_flip`], async for the
+    /// concurrent reader/flipper pair.
+    async fn hero_e_client_continuity_inner() {
         use std::cell::Cell;
 
         /// The modeled NEW client reply -- exactly the top-of-`route_and_dispatch` gate decision.
@@ -1543,15 +1559,15 @@ mod tests {
     /// than cascaded. These are plain `#[test]`s (no `.await`), so a `std` mutex guard is never held
     /// across an await. Each test ALSO restores `SERVING` to the default (`true`) on the way out,
     /// matching the slice-2 discipline so the other modules' hero tests are not perturbed.
-    static FLIP_BARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The barrier tests now serialize on the SHARED `SERVING_GATE_TEST_LOCK` (they flip the
+    // same process-global gate the hero tests do), rather than a module-local lock that
+    // the sibling suites could not see.
 
     /// N=3: the flip WAITS for ALL shards. After 2 reports the gate is STILL false; the 3rd (Nth)
     /// report flips it to serving -- EXACTLY on the Nth, not before.
     #[test]
     fn receiver_flip_waits_for_all_shards() {
-        let _guard = FLIP_BARRIER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::serve::SERVING_GATE_TEST_LOCK.blocking_lock();
         crate::serve::set_serving(false); // model the NEW receiver boot (gate closed until commit).
 
         let barrier = ReceiverFlipBarrier::new(3);
@@ -1578,9 +1594,7 @@ mod tests {
     /// count never reaches N, so the gate STAYS false -- the sibling never serves a partial keyspace.
     #[test]
     fn receiver_flip_never_serves_on_abort() {
-        let _guard = FLIP_BARRIER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::serve::SERVING_GATE_TEST_LOCK.blocking_lock();
         crate::serve::set_serving(false);
 
         let barrier = ReceiverFlipBarrier::new(3);
@@ -1599,9 +1613,7 @@ mod tests {
     /// commit exactly as the direct pre-barrier flip did.
     #[test]
     fn receiver_flip_single_shard_flips_on_its_commit() {
-        let _guard = FLIP_BARRIER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::serve::SERVING_GATE_TEST_LOCK.blocking_lock();
         crate::serve::set_serving(false);
 
         let barrier = ReceiverFlipBarrier::new(1);
@@ -1623,9 +1635,7 @@ mod tests {
     /// STAYS closed -- so the flip fires EXACTLY ONCE (on the Nth), never again.
     #[test]
     fn receiver_flip_is_idempotent_after_all_committed() {
-        let _guard = FLIP_BARRIER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::serve::SERVING_GATE_TEST_LOCK.blocking_lock();
         crate::serve::set_serving(false);
 
         let barrier = ReceiverFlipBarrier::new(3);

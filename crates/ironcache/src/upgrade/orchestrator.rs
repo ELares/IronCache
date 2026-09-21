@@ -523,6 +523,7 @@ mod tests {
     /// store equals EXACTLY its OLD store, staging is promoted, and the OLD's quiesce is permanent.
     #[tokio::test(flavor = "current_thread")]
     async fn multi_shard_cutover_commits_and_adopts_every_shard() {
+        let _gate = crate::serve::SERVING_GATE_TEST_LOCK.lock().await;
         const SHARDS: u32 = 3;
         const PER: u32 = 400;
         crate::serve::unquiesce_shard();
@@ -615,6 +616,7 @@ mod tests {
     /// nothing (no promote).
     #[tokio::test(flavor = "current_thread")]
     async fn one_shard_failure_aborts_the_whole_flip_and_old_resumes() {
+        let _gate = crate::serve::SERVING_GATE_TEST_LOCK.lock().await;
         const SHARDS: u32 = 3;
         const PER: u32 = 120;
         crate::serve::unquiesce_shard();
@@ -703,6 +705,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::too_many_lines)]
     async fn cutover_write_stall_is_sub_second_and_zero_acked_loss() {
+        let _gate = crate::serve::SERVING_GATE_TEST_LOCK.lock().await;
         use ironcache_env::Clock;
         use std::cell::Cell;
 
@@ -880,6 +883,7 @@ mod tests {
     /// state@E. Closes W2 end to end.
     #[tokio::test(flavor = "current_thread")]
     async fn post_commit_crash_recovers_state_at_e_from_promoted_data_dir() {
+        let _gate = crate::serve::SERVING_GATE_TEST_LOCK.lock().await;
         crate::serve::unquiesce_shard();
         crate::serve::set_serving(false);
 

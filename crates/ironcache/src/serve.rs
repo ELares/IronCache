@@ -143,6 +143,8 @@ pub(crate) use serve_classify::{
 // #625: the per-shard core-local state accessors + lifecycle flags. `pub(crate)` re-export so the
 // spine still in `serve` (serve loops, routing), every sibling submodule, and external callers
 // (`crate::coordinator`, `crate::replica_attach`, `crate::upgrade`, INFO) resolve them unchanged.
+#[cfg(test)]
+pub(crate) use serve_shard_state::SERVING_GATE_TEST_LOCK;
 pub(crate) use serve_shard_state::{
     STORE_SLOTS_PER_DB, TRACKING, adopt_metrics_cell, adopt_process_memory_gauge,
     ensure_shard_ring, ensure_shard_started, fresh_shard_store, install_receiver_flip_barrier,
