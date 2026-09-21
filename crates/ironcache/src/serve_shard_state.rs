@@ -578,6 +578,17 @@ pub(crate) static STORE_SLOTS_PER_DB: std::sync::atomic::AtomicUsize =
 /// happens-before every shard spawn, and the commit flip is a single monotonic `false -> true` edge
 /// gating a RETRYABLE `-LOADING`, not a data dependency (the durable store was promoted BEFORE the
 /// flip, so a stale read racing the flip at worst returns one more retryable `-LOADING`).
+
+/// The test-only serialization for PROCESS-GLOBAL gate mutations (#391 PR-5): `SERVING`
+/// is one bool per process, so tests in DIFFERENT modules that flip it (the upgrade hero
+/// suites in `commit.rs` and `orchestrator.rs`) must not interleave with one another --
+/// a test asserting the exact `false -> true` transition would otherwise observe a
+/// sibling test's flip. `#[cfg(test)]`, so production pays nothing; sync tests use
+/// `blocking_lock`, async tests `.lock().await`.
+#[cfg(test)]
+pub(crate) static SERVING_GATE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether THIS process may serve client commands yet (#391 PR-5): the HOT-PATH read the global serve
